@@ -1,0 +1,16 @@
+Metadata-Version: 2.1
+Name: jaxstar
+Version: 0.0.1
+Summary: stellar parameter estimation with jax
+Home-page: none
+Author: Kento Masuda
+Author-email: 
+Maintainer: Kento Masuda
+Maintainer-email: 
+License: MIT
+Description: # jaxstar
+        
+        tools for estimating stellar parameters
+Platform: UNKNOWN
+Classifier: Programming Language :: Python
+Description-Content-Type: text/markdown
