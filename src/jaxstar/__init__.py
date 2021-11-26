@@ -6,3 +6,6 @@ __author__ = "Kento Masuda"
 __email__ = ""
 __license__ = "MIT"
 __description__ = "stellar parameter estimation with jax"
+
+from . import mistfit
+#from .mistfit import *
