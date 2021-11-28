@@ -1,8 +1,0 @@
-README.md
-setup.py
-src/jaxstar/__init__.py
-src/jaxstar.egg-info/PKG-INFO
-src/jaxstar.egg-info/SOURCES.txt
-src/jaxstar.egg-info/dependency_links.txt
-src/jaxstar.egg-info/not-zip-safe
-src/jaxstar.egg-info/top_level.txt
