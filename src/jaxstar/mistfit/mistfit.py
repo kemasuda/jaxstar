@@ -1,5 +1,7 @@
 __all__ = ["MistGridIso", "MistFit"]
 
+GRIDPATH = "/Users/k_masuda/Dropbox/repos/jaxstar/src/jaxstar/mistgrid/mistgrid_iso.npz"
+
 #%%
 import numpy as np
 import pandas as pd
@@ -41,8 +43,9 @@ def smbound(x, low, upp, s=20, depth=30):
     return -depth*(1./(jnp.exp(s*(x-low))+1)+1./(jnp.exp(-s*(x-upp))+1))
 
 #%%
+import os
 class MistFit:
-    def __init__(self, path="mistgrid_iso.npz"):
+    def __init__(self, path=GRIDPATH):
         self.mg = MistGridIso(path)
 
     def set_data(self, keys, vals, errs):
