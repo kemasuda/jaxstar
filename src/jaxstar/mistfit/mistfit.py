@@ -128,31 +128,3 @@ class MistFit:
         self.mcmc.run(rng_key, **kwargs)
         self.mcmc.print_summary()
         self.samples = pd.DataFrame(data=self.mcmc.get_samples())
-
-"""
-#%%
-d = pd.read_csv("../../nnstar/isoinput_hall.csv")
-mf = MistFit()
-#mf.set_data(['kmag', 'jmag', 'teff', 'feh', 'parallax'], [2, 1, 5000, 0, 30], jnp.array([0.02, 0.02, 100, 0.1, 0.01]))
-#mf.set_data(['kmag', 'teff', 'feh', 'parallax'], [2, 5000, 0, 30], jnp.array([0.02, 100, 0.1, 0.01]))
-
-#%%
-_d = d.iloc[0]
-kmag_obs, kmag_err, teff_obs, feh_obs, parallax_obs, parallax_err = np.array(_d[['kmagcorr', 'kmagcorr_err', 'teff', 'feh', 'parallax', 'parallax_err']]).astype(float)
-teff_err, feh_err = 110, 0.1
-mf.set_data(['kmag', 'teff', 'feh', 'parallax'], [kmag_obs, teff_obs, feh_obs, parallax_obs], [kmag_err, teff_err, feh_err, parallax_err])
-
-#%%
-ns = 20000
-mf.setup_hmc(num_warmup=ns, num_samples=ns)
-
-#%%
-rng_key = random.PRNGKey(0)
-mf.run_hmc(rng_key, linear_age=True, flat_age_marginal=False, nodata=True*0)
-
-#%%
-samples = mf.samples
-
-#%%
-fig = corner.corner(samples[mf.obskeys+['mass', 'radius', 'age', 'eep']], show_titles='.2f', truths=mf.obsvals+[None]*4)
-"""
