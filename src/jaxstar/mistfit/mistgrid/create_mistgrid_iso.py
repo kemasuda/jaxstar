@@ -7,7 +7,26 @@ from scipy.interpolate import interp1d
 logg_sun = np.log10((G * M_sun / R_sun**2).cgs.value)
 
 #%%
-filenames = glob.glob("/Users/k_masuda/Dropbox/astrodata/MIST_v1.2_vvcrit0.4_UBVRIplus/*.cmd")
+url_cmd = "http://waps.cfa.harvard.edu/MIST/data/tarballs_v1.2/MIST_v1.2_vvcrit0.4_UBVRIplus.txz"
+
+#%%
+import urllib.error
+import urllib.request
+try:
+    with urllib.request.urlopen(url_cmd) as download_file:
+        data = download_file.read()
+        with open("./MIST_v1.2_vvcrit0.4_UBVRIplus.txz", mode='wb') as save_file:
+            save_file.write(data)
+except urllib.error.URLError as errormsg:
+    print (errormsg)
+
+#%%
+import tarfile
+with tarfile.open('MIST_v1.2_vvcrit0.4_UBVRIplus.txz', 'r:xz') as t:
+    t.extractall(path='./')
+
+#%%
+filenames = glob.glob("MIST_v1.2_vvcrit0.4_UBVRIplus/*.cmd")
 print (filenames)
 
 #%%
@@ -50,6 +69,7 @@ keys += ['Gaia_G_DR2Rev', 'Gaia_BP_DR2Rev', 'Gaia_RP_DR2Rev']
 keys += ['Gaia_G_EDR3', 'Gaia_BP_EDR3', 'Gaia_RP_EDR3']
 #keys = list(df_all.keys())
 print (keys)
+print (df_all.keys())
 
 #%%
 pgrids2d = []
