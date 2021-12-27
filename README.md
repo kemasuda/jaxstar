@@ -8,7 +8,9 @@ tools for estimating stellar parameters
 
 ```python setup.py install```
 
-requirements: jax, numpyro, ...
+* requirements: jax, numpyro, ...
+
+* first run ``create_mistgrid_iso.py`` in src/jaxstar/mistfit/mistgrid/ to create mistgrid_iso.npz file 
 
 
 
