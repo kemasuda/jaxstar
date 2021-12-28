@@ -37,7 +37,7 @@ def correct_kmag(d):
     d.distpc[d['distpc']<0] = 8e3
     d['kmag_err'] = d['kmag_err'].fillna(np.nanmedian(d.kmag_err))
 
-    bayestar = bquery(version='bayestar2017')
+    bayestar = bquery(version='bayestar2019')
     coords = SkyCoord(l=d['l']*units.deg, b=d['b']*units.deg, distance=d['distpc']*units.pc, frame='galactic')
     reddening = bayestar(coords, mode='median')
     ak = reddening * Rvect_b19[-1]
