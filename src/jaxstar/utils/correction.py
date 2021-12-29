@@ -52,7 +52,7 @@ def correct_kmag(d, version='2019'):
     ak = reddening * Rvect[-1]
     d['ak'] = ak
     d['ak_err'] = 0.3 * ak # Fulton & Petigura
-    d['kmag_corrrected'] = d.kmag - ak
+    d['kmag_corrected'] = d.kmag - ak
     d['kmag_err_corrected'] = np.sqrt(d.kmag_err**2 + d.ak_err**2)
 
     return d
