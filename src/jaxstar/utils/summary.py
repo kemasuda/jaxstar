@@ -39,7 +39,7 @@ def summary_stats(postdir, names, keys, stat='pct', **kwargs):
 
 def summarize_results(postdir, dinput, keys, obskeys, stat='pct', **kwargs):
     d = summary_stats(postdir, dinput.kepid, keys, stat=stat, **kwargs).rename({"name": "kepid"}, axis='columns')
-    d = pd.merge(d, dinput[["kepid"]+obskeys+[_k+"_err" for _k in obskeys]], on='kepid')
+    d = pd.merge(d, dinput[["kepid"]+obskeys+[_k+"_err" for _k in obskeys]+["binflag"]], on='kepid')
     for key in obskeys:
         d["d"+key] = d["iso_"+key] - d[key]
         d["dsigma"+key] = d["d"+key] / d[key+"_err"]
