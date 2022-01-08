@@ -10,7 +10,7 @@ from jax import (random, jit)
 from numpyro.infer import init_to_value
 from jax.scipy.ndimage import map_coordinates as mapc
 from functools import partial
-from .gyrolike_angus19 import loglike_gyro
+from .gyrochrone_likelihood import loglike_gyro
 
 #%% here age is logage
 class MistGridIso:
@@ -68,7 +68,8 @@ class MistFit:
         self.outkeys = outkeys
         self.mg.set_keys(outkeys)
 
-    def model(self, nodata=False, linear_age=True, flat_age_marginal=False, logamin=8, logamax=10.14, fmin=-1, fmax=0.5, eepmin=0, eepmax=600, massmin=0.1, massmax=2.5, dist_scale=1.35, prot=None):
+    def model(self, nodata=False, linear_age=True, flat_age_marginal=False, logamin=8, logamax=10.14,
+            fmin=-1, fmax=0.5, eepmin=0, eepmax=600, massmin=0.1, massmax=2.5, dist_scale=1.35, prot=None, prot_err=0.05):
         if linear_age:
             age = numpyro.sample("age", dist.Uniform(10**logamin/1e9, 10**logamax/1e9))
             logage = jnp.log10(age * 1e9)
@@ -111,7 +112,7 @@ class MistFit:
 
         if prot is not None:
             bprp = params['bpmag'] - params['rpmag']
-            numpyro.factor("loglike_gyro", loglike_gyro(prot, bprp, params['mass'], eep, logage, feh, sigma=0.1))
+            numpyro.factor("loglike_gyro", loglike_gyro(prot, bprp, params['mass'], eep, logage, feh, sigma=prot_err))
 
     def setup_hmc(self, target_accept_prob=0.95, num_warmup=1000, num_samples=1000, init_logage=9.3, init_feh=0, init_eep=300):
         _parallax_obs = float(np.array(self.obsvals)[np.array(self.obskeys)=='parallax'])
