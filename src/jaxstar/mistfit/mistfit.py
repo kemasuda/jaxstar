@@ -14,7 +14,9 @@ from .gyrochrone_likelihood import loglike_gyro
 
 #%% here age is logage
 class MistGridIso:
-    def __init__(self, path):
+    def __init__(self, path=None):
+        if path is None:
+            path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'mistgrid/mistgrid_iso.npz')
         self.dgrid = np.load(path)
         self.a0, self.da = self.dgrid['logagrid'][0], np.diff(self.dgrid['logagrid'])[0]
         self.f0, self.df = self.dgrid['fgrid'][0], np.diff(self.dgrid['fgrid'])[0]
