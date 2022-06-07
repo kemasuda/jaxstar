@@ -1,9 +1,11 @@
+""" gyrochrone likelihood from Angus et al. (2019), AJ 158, 173
+
+* the following code has been adapted from https://github.com/RuthAngus/stardate
+* here gyro models for stars with BP-RP>2.7 have not yet been implemented
+"""
+
 import jax.numpy as jnp
 from jax import jit
-
-# gyrochrone likelihood from Angus et al. (2019), AJ 158, 173
-# the following code has been adapted from https://github.com/RuthAngus/stardate
-# here gyro models for stars with BP-RP>2.7 have not yet been implemented
 
 #%%
 @jit
