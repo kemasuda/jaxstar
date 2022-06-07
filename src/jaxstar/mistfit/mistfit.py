@@ -87,8 +87,9 @@ class MistFit:
 
         #distance = 10**numpyro.sample("distance", dist.Uniform(-2, 1)) # kpc
         distance = numpyro.sample("distance", dist.Gamma(3, rate=1./dist_scale)) # BJ18, kpc
-        parallax = 1. / distance # mas
-        numpyro.deterministic("parallax", parallax)
+        #parallax = 1. / distance # mas
+        #numpyro.deterministic("parallax", parallax)
+        parallax = numpyro.deterministic("parallax", 1. / distance) # mas
 
         params = dict(zip(self.outkeys, self.mg.values(logage, feh, eep)))
         for key in self.outkeys:
@@ -117,12 +118,16 @@ class MistFit:
             numpyro.factor("loglike_gyro", loglike_gyro(prot, bprp, params['mass'], eep, logage, feh, sigma=prot_err))
 
     def setup_hmc(self, target_accept_prob=0.95, num_warmup=1000, num_samples=1000, init_logage=9.3, init_feh=0, init_eep=300):
-        _parallax_obs = float(np.array(self.obsvals)[np.array(self.obskeys)=='parallax'])
-        init_dist = np.where(_parallax_obs > 0, 1./_parallax_obs, 8)
-        #init_strategy = init_to_value(values={"logage": init_logage, "feh": init_feh, "eep": init_eep, "distance": np.log10(init_dist)})
-        #init_strategy = init_to_value(values={"feh": init_feh, "distance": np.log10(init_dist)})
-        #init_strategy = init_to_value(values={"distance": np.log10(init_dist)})
-        init_strategy = init_to_value(values={"distance": init_dist})
+        # initialize parameters for HMC
+        _parallax_obs = np.array(self.obsvals)[np.array(self.obskeys)=='parallax']
+        init_dist = float(np.where(_parallax_obs > 0, 1./_parallax_obs, 8))
+        initdict = {"distance": init_dist}
+        for key, val in zip(self.obskeys, self.obsvals):
+            if key=="parallax":
+                continue
+            initdict[key] = val
+        init_strategy = init_to_value(values=initdict)
+
         kernel = numpyro.infer.NUTS(self.model, target_accept_prob=target_accept_prob, init_strategy=init_strategy)
         mcmc = numpyro.infer.MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples)
         self.mcmc = mcmc
