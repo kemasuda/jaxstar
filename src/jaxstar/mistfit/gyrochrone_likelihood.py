@@ -2,8 +2,8 @@ import jax.numpy as jnp
 from jax import jit
 
 # gyrochrone likelihood from Angus et al. (2019), AJ 158, 173
-# see https://github.com/RuthAngus/stardate
-# model for stars with BP-RP>2.7 has not yet been implemented
+# the following code has been adapted from https://github.com/RuthAngus/stardate
+# here gyro models for stars with BP-RP>2.7 have not yet been implemented
 
 #%%
 @jit
@@ -15,14 +15,14 @@ def loglike_gyro(prot, bprp, mass, eep, logage, feh, sigma=0.05):
     return -0.5 * ((jnp.log10(prot) - logp_model)**2 / var + jnp.log(var))
 
 #%%
-# bprp > 2.7 mpt yet supported!
+# bprp > 2.7 not yet supported!
 @jit
 def gyro_model_praesepe(logage, bprp, mass, Ro_cutoff=2):
     # Angus+19 table 1
     # c4, c3, c2, c1, c0, cA, b1, b0
-    p = [-38.957586198640314, 28.709418579540294, -4.919056437046026,
+    p = jnp.array([-38.957586198640314, 28.709418579540294, -4.919056437046026,
          0.7161114835620975, -4.716819674578521, 0.6470950862322454,
-         -13.558898318835137, 0.9359250478865809]
+         -13.558898318835137, 0.9359250478865809])
     logprot = jnp.where(bprp < 0.56, 0.56, jnp.polyval(p[:5], jnp.log10(bprp)) + p[5]*logage)
 
     tau = convective_overturn_time(mass)
