@@ -1,6 +1,6 @@
 # jaxstar
 
-tools for estimating stellar parameters
+fast isochrone fitting using HMC-NUTS
 
 
 
@@ -16,5 +16,5 @@ tools for estimating stellar parameters
 
 ## Examples
 
-see notebooks in demos
+see [isochrone fitting example.ipynb](https://github.com/kemasuda/jaxstar/blob/main/demos/isochrone fitting example.ipynb) in demos
 
