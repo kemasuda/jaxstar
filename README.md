@@ -16,5 +16,5 @@ fast isochrone fitting using HMC-NUTS
 
 ## Examples
 
-see [isochrone fitting example.ipynb](https://github.com/kemasuda/jaxstar/blob/main/demos/isochrone\ fitting\ example.ipynb) in demos
+see [isochrone fitting example.ipynb](https://github.com/kemasuda/jaxstar/blob/main/demos/isochrone%20fitting%20example.ipynb) in demos
 
