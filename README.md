@@ -1,6 +1,6 @@
 # jaxstar
 
-fast isochrone fitting using HMC-NUTS
+Fast isochrone fitting using HMC-NUTS. The code is described in https://arxiv.org/abs/2209.03279
 
 
 
