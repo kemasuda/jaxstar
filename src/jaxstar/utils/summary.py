@@ -1,4 +1,4 @@
-__all__ = ["summary_hdi", "summary_pct", "summary_stats", "summarize_results"]
+__all__ = ["summary_hdi", "summary_pct", "summary_stats", "summary_mean", "summarize_results"]
 
 #%%
 import numpy as np
@@ -16,9 +16,15 @@ def summary_pct(varr, pcts=[16, 50, 84]):
     low, val, upp = np.percentile(varr, pcts)
     return val, upp-val, val-low
 
+def summary_mean(varr, pcts=[16, 50, 84]):
+    mu, sigma = np.mean(varr), np.std(varr)
+    return mu, sigma, sigma
+
 def summary_stats(postdir, names, keys, stat='pct', **kwargs):
     if stat=='pct':
         summary = summary_pct
+    elif stat=='mean':
+        summary = summary_mean
     else:
         summary = summary_hdi
 
