@@ -11,12 +11,26 @@ from numpyro.infer import init_to_value
 from jax.scipy.ndimage import map_coordinates as mapc
 from functools import partial
 from .gyrochrone_likelihood import loglike_gyro
+import os
+from jaxstar.mistfit.mistgrid.create_grid import *
+
+def check_mistgrid_path():
+    """ check the existence of mistgrid_iso.npz
+    if the file does not exist, download CMD files and create the file by calling create_mistgrid()
+    """
+    gridfile_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'mistgrid/mistgrid_iso.npz')
+    script_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'mistgrid/create_grid.py')
+    if not os.path.exists(gridfile_path):
+        print ("mistgrid_iso.npz not found.")
+        create_mistgrid()
+    return gridfile_path
 
 #%% here age is logage
 class MistGridIso:
     def __init__(self, path=None):
         if path is None:
-            path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'mistgrid/mistgrid_iso.npz')
+            #path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'mistgrid/mistgrid_iso.npz')
+            path = check_mistgrid_path()
         self.dgrid = np.load(path)
         self.a0, self.da = self.dgrid['logagrid'][0], np.diff(self.dgrid['logagrid'])[0]
         self.f0, self.df = self.dgrid['fgrid'][0], np.diff(self.dgrid['fgrid'])[0]
@@ -47,7 +61,8 @@ import os
 class MistFit:
     def __init__(self, path=None):
         if path is None:
-            path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'mistgrid/mistgrid_iso.npz')
+            #path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'mistgrid/mistgrid_iso.npz')
+            path = check_mistgrid_path()
         self.mg = MistGridIso(path)
 
     def set_data(self, keys, vals, errs):
