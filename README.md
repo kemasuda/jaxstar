@@ -8,11 +8,9 @@ Fast isochrone fitting using HMC-NUTS. The code is described in https://arxiv.or
 
 ```python setup.py install```
 
-* requirements: jax, numpyro, ...
+* requirements: jax, numpyro, [dustmaps](https://dustmaps.readthedocs.io/en/latest/) for extinction correction, [gaiadr3-zeropoint](https://pypi.org/project/gaiadr3-zeropoint/) for zero-point correction for the Gaia parallax
 
-* first run ``create_mistgrid_iso.py`` in src/jaxstar/mistfit/mistgrid/ to create mistgrid_iso.npz file 
-
-
+* synthetic CMDs are downloaded from http://waps.cfa.harvard.edu/MIST/model_grids.html#synthetic under mistgrid directory when the ``MistGridIso`` or ``MistFit`` class is instantiated for the first time. 
 
 ## Examples
 
