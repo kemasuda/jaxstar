@@ -10,6 +10,14 @@ from scipy.interpolate import interp1d
 logg_sun = np.log10((G * M_sun / R_sun**2).cgs.value)
 
 #%%
+keys = ['2MASS_J', '2MASS_H', '2MASS_Ks', 'logT', 'logg', 'teff', 'logage', 'mass', 'dmdeep', 'logL', 'radius', 'mmin', 'mmax', 'eepmin', 'eepmax']
+keys += ['Gaia_G_DR2Rev', 'Gaia_BP_DR2Rev', 'Gaia_RP_DR2Rev']
+keys += ['Gaia_G_EDR3', 'Gaia_BP_EDR3', 'Gaia_RP_EDR3']
+#keys = list(df_all.keys())
+#print (keys)
+#print (df_all.keys())
+
+#%%
 def create_mistgrid():
     """ function to create mistgrid_iso.npz for jaxstar.mistfit
     """
@@ -79,14 +87,6 @@ def create_mistgrid():
 
     #%%
     d = d.rename({"log_Teff": 'logT', "log_L": "logL", "log_g": "logg"}, axis='columns')
-
-    #%%
-    keys = ['2MASS_J', '2MASS_H', '2MASS_Ks', 'logT', 'logg', 'teff', 'logage', 'mass', 'dmdeep', 'logL', 'radius', 'mmin', 'mmax', 'eepmin', 'eepmax']
-    keys += ['Gaia_G_DR2Rev', 'Gaia_BP_DR2Rev', 'Gaia_RP_DR2Rev']
-    keys += ['Gaia_G_EDR3', 'Gaia_BP_EDR3', 'Gaia_RP_EDR3']
-    #keys = list(df_all.keys())
-    print (keys)
-    print (df_all.keys())
 
     #%%
     pgrids2d = []
