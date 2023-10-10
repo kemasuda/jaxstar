@@ -143,7 +143,7 @@ class MistFit:
         self.mg.set_keys(outkeys)
 
     def model(self, nodata=False, linear_age=True, flat_age_marginal=False, logamin=8, logamax=10.14,
-            fmin=-1, fmax=0.5, eepmin=0, eepmax=600, massmin=0.1, massmax=2.5, dist_scale=1.35, prot=None, prot_err=0.05, rho=None, rho_err=None):
+            fmin=-1, fmax=0.5, eepmin=0, eepmax=600, massmin=0.1, massmax=2.5, dist_scale=1.35, prot=None, prot_err=0.05, rho_obs=None, rho_err=None, age_obs=None, age_err=None):
         """ model for NumPyro HMC
 
             Args:
@@ -163,11 +163,12 @@ class MistFit:
         """
         if linear_age:
             age = numpyro.sample("age", dist.Uniform(10**logamin/1e9, 10**logamax/1e9))
-            logage = jnp.log10(age * 1e9)
-            numpyro.deterministic("logage", logage)
+            #logage = jnp.log10(age * 1e9)
+            #numpyro.deterministic("logage", logage)
+            logage = numpyro.deterministic("logage", jnp.log10(age * 1e9))
         else:
-            logage= numpyro.sample("logage", dist.Uniform(logamin, logamax))
-            numpyro.deterministic("age", 10**logage/1e9)
+            logage = numpyro.sample("logage", dist.Uniform(logamin, logamax))
+            age = numpyro.deterministic("age", 10**logage/1e9)
 
         feh = numpyro.sample("feh", dist.Uniform(fmin, fmax))
         eep = numpyro.sample("eep", dist.Uniform(eepmin, eepmax))
@@ -201,9 +202,13 @@ class MistFit:
             bprp = params['bpmag'] - params['rpmag']
             numpyro.factor("loglike_gyro", loglike_gyro(prot, bprp, params['mass'], eep, logage, feh, sigma=prot_err))
 
-        if rho is not None and rho_err is not None:
+        if rho_obs is not None and rho_err is not None:
             rho_model = params['mass'] / params['radius']**3
-            numpyro.factor("loglike_rho", -0.5 * (rho - rho_model)**2 / rho_err**2)
+            numpyro.factor("loglike_rho", -0.5 * (rho_obs - rho_model)**2 / rho_err**2)
+
+        if age_obs is not None and age_err is not None:
+            age_model = age
+            numpyro.factor("loglike_age", -0.5 * (age_obs - age_model)**2 / age_err**2)
 
     def setup_hmc(self, target_accept_prob=0.95, num_warmup=1000, num_samples=1000, init_logage=9.3, init_feh=0, init_eep=300):
         """ setup NumPyro HMC
