@@ -78,7 +78,7 @@ def create_mistgrid():
     eepgrid = np.sort(list(set(d.EEP)))
     print ("logage(yr) grid:", agrid)
     print ("feh grid:", fgrid)
-    print ("EEP grid":, eepgrid)
+    print ("EEP grid:", eepgrid)
 
     #%%
     def eepderivative(y):
