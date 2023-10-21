@@ -51,7 +51,7 @@ def create_mistgrid():
     if os.path.exists(mistdir_path):
         print ("CMD files found in %s"%str(mistdir_path))
         filenames = glob.glob(str(mistdir_path/'*.cmd'))
-        print (filenames)
+        #print (filenames)
         print ("creating grid for mistfit...")
 
     #%%
@@ -76,9 +76,9 @@ def create_mistgrid():
     agrid = np.sort(list(set(d.logage)))
     fgrid = np.sort(list(set(d.feh)))[6:]
     eepgrid = np.sort(list(set(d.EEP)))
-    print (agrid, len(agrid))
-    print (fgrid, len(fgrid))
-    print (eepgrid, len(eepgrid))
+    print ("logage(yr) grid:", agrid)
+    print ("feh grid:", fgrid)
+    print ("EEP grid":, eepgrid)
 
     #%%
     def eepderivative(y):
