@@ -10,8 +10,6 @@ import numpyro.distributions as dist
 from jax import (random, jit)
 from numpyro.infer import init_to_value
 from jax.scipy.ndimage import map_coordinates as mapc
-from scipy.optimize import minimize
-#from jax.scipy.optimize import minimize
 from functools import partial
 from .gyrochrone_likelihood import loglike_gyro
 from jaxstar.mistfit.mistgrid.create_grid import *
@@ -77,48 +75,6 @@ class MistGridIso:
         idxs = [aidx, fidx, eepidx]
         return [mapc(self.dgrid[key], idxs, order=1, cval=-jnp.inf) for key in self.keys]
 
-    def values2(self, age, feh, mass, keys):
-        """ compute stellar parameters for given age, feh, and mass
-
-            Args:
-                age:  log10(stellar age in yr)
-                feh:  metallicity (dex)
-                mass: stellar mass (Msun)
-
-            Returns:
-                interpolated values for the parameters in self.keys
-
-        """
-        eep_new = self.find_eep(age, feh, mass)
-        self.set_keys(keys)
-        return self.values(age,feh,eep_new)[0]
-
-    def _mass_res(self, eep, age, feh, mass):
-        self.set_keys(["mass"])
-        mass_guess = self.values(age, feh, eep)
-        return (mass - np.array(mass_guess)) ** 2
- 
-    def find_eep(self, age, feh, mass):
-        """ find eep value given age, feh, and mass
-
-            Args:
-                age:  log10(stellar age in yr)
-                feh:  metallicity (dex)
-                mass: stellar mass (Msun)
-
-            Returns:
-                eep value given age, feh, and mass
-
-        """
-        eep0=300
-        resid_tol=0.001
-        aidx   = (age - self.a0) / self.da
-        fidx   = (feh - self.f0) / self.df
-        result = minimize(self._mass_res, eep0, args=(age, feh, mass), method="Nelder-Mead",tol=resid_tol)
-        if result.success and result.fun < resid_tol:
-            return float(result.x)
-        else:
-            return np.nan
 
 @jit
 def smbound(x, low, upp, s=20, depth=30):
