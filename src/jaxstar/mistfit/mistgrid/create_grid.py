@@ -68,7 +68,7 @@ def create_mistgrid():
         d['radius'] = np.sqrt(d['star_mass'] / 10 ** (d['log_g'] - logg_sun))
         d['logage'] = d['log10_isochrone_age_yr']
         d['age'] = 10**(d.logage) / 1e9
-        df_all = df_all.append(d)
+        df_all = pd.concat([df_all, d], ignore_index=True)
     df_all = df_all.reset_index(drop=True)
 
     #%% Fe/H grid cut at -1.5
