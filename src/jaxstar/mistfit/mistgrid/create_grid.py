@@ -26,7 +26,7 @@ def create_mistgrid():
     mistgriddir_path = pathlib.Path(os.path.dirname(os.path.realpath(__file__)))
     mistgrid_path = mistgriddir_path/'mistgrid_iso.npz'
     mistdir_path = mistgriddir_path/'MIST_v1.2_vvcrit0.4_UBVRIplus'
-    print (mistdir_path)
+    #print (mistdir_path)
 
     #%%
     if not os.path.exists(mistdir_path):

@@ -27,6 +27,27 @@ def check_mistgrid_path():
     return gridfile_path
 
 
+def interp(x, xp, fp):
+    """ 1D interpolation
+
+        Args:
+            x: x-coordinates at which interpolated values are evaluated
+            xp: x-coordinates of the data
+            fp: y-coordinates of the data
+
+        Returns:
+            linearly interpolated values
+
+    """
+    idx_min = jnp.nanargmin(jnp.abs(xp - x))
+    idx_add = jnp.where(x < xp[idx_min], 0, 1)
+    idx_low, idx_upp = idx_min - 1 + idx_add, idx_min + idx_add
+    weight_low = (xp[idx_upp] - x) / (xp[idx_upp] - xp[idx_low])
+    weight_upp = 1. - weight_low
+    return weight_low * fp[idx_low] + weight_upp * fp[idx_upp]
+
+
+
 class MistGridIso:
     """ class to store model grid """
     def __init__(self, path=None):
@@ -75,6 +96,47 @@ class MistGridIso:
         idxs = [aidx, fidx, eepidx]
         return [mapc(self.dgrid[key], idxs, order=1, cval=-jnp.inf) for key in self.keys]
 
+    @partial(jit, static_argnums=(0,))
+    def eep_given_mass(self, age, feh, mass):
+        """ compute EEP for given age, feh, mass
+
+            Args:
+                age: log10(stellar age in yr)
+                feh: metallicity (dex)
+                mass: stellar mass (solar unit)
+
+            Returns:
+                 equivalent evolutionary point, age index, feh index
+
+        """
+        aidx = (age - self.a0) / self.da
+        fidx = (feh - self.f0) / self.df
+        eepidx_grid = (self.dgrid['eepgrid'] - self.eep0) / self.deep
+        idxs_grid = [aidx, fidx, eepidx_grid]
+
+        mass_grid = mapc(self.dgrid['mass'], idxs_grid, order=1, cval=-jnp.inf)
+        eep = interp(mass, mass_grid, jnp.array(self.dgrid['eepgrid'])) # jnp.interp fails
+        return eep, aidx, fidx
+
+
+    @partial(jit, static_argnums=(0,))
+    def values_given_mass(self, age, feh, mass):
+        """ compute stellar parameters for given age, feh, and mass
+
+            Args:
+                age: log10(stellar age in yr)
+                feh: metallicity (dex)
+                mass: stellar mass (solar unit)
+
+            Returns:
+                interpolated values for the parameters in self.keys
+
+        """
+        eep, aidx, fidx = self.eep_given_mass(age, feh, mass)
+        eepidx = (eep - self.eep0) / self.deep
+        idxs = [aidx, fidx, eepidx]
+
+        return [mapc(self.dgrid[key], idxs, order=1, cval=-jnp.inf) for key in self.keys]
 
 @jit
 def smbound(x, low, upp, s=20, depth=30):
