@@ -18,6 +18,7 @@ keys = ['2MASS_J', '2MASS_H', '2MASS_Ks', 'logT', 'logg', 'teff', 'logage',
 keys += ['Gaia_G_DR2Rev', 'Gaia_BP_DR2Rev', 'Gaia_RP_DR2Rev']
 keys += ['Gaia_G_EDR3', 'Gaia_BP_EDR3', 'Gaia_RP_EDR3']
 keys += ['star_mass', 'feh_photosphere']
+keys += ['Bessell_U',  'Bessell_B', 'Bessell_V', 'Bessell_R', 'Bessell_I']
 
 
 def create_mistgrid():
@@ -131,4 +132,5 @@ def create_mistgrid():
              logt=pgrids2d[3], logg=pgrids2d[4], teff=pgrids2d[5], logage=pgrids2d[6], mass=pgrids2d[7],
              dmdeep=pgrids2d[8], logl=pgrids2d[9], radius=pgrids2d[10], mmin=pgrids2d[11], mmax=pgrids2d[
                  12], eepmin=pgrids2d[13], eepmax=pgrids2d[14], gmag=pgrids2d[15], bpmag=pgrids2d[16], rpmag=pgrids2d[17],
-             gmag3=pgrids2d[18], bpmag3=pgrids2d[19], rpmag3=pgrids2d[20], star_mass=pgrids2d[21], feh_photosphere=pgrids2d[22])
+             gmag3=pgrids2d[18], bpmag3=pgrids2d[19], rpmag3=pgrids2d[20], star_mass=pgrids2d[21], feh_photosphere=pgrids2d[22],
+             umag=pgrids2d[23], bmag=pgrids2d[24], vmag=pgrids2d[25], rmag=pgrids2d[26], imag=pgrids2d[27])
