@@ -192,7 +192,7 @@ class MistFit:
         self.obsvals = vals
         self.obserrs = errs
         outkeys = ['kmag', 'teff', 'logg', 'mass', 'radius', 'feh_photosphere', 'star_mass',
-                   'dmdeep', 'mmin', 'mmax', 'bpmag', 'rpmag']
+                   'dmdeep', 'mmin', 'mmax', 'bpmag2', 'rpmag2']  # DR2 BP-RP needed for gyro likelihood
         # outkeys = ['eepmin', 'eepmax', 'kmag', 'teff', 'logg', 'mass', 'radius', 'dmdeep', 'mmin', 'mmax']
         for k in keys:
             if k not in outkeys and k != 'parallax' and k != 'feh':
@@ -281,9 +281,9 @@ class MistFit:
         numpyro.factor("logjac", logjac)
 
         if prot is not None:
-            bprp = params['bpmag'] - params['rpmag']
+            bprp = params['bpmag2'] - params['rpmag2']
             numpyro.factor("loglike_gyro", loglike_gyro(
-                prot, bprp, params['mass'], eep, logage, feh, sigma=prot_err))
+                prot, bprp, params['mass'], eep, logage, params['feh'], sigma=prot_err))
 
         if rho_obs is not None and rho_err is not None:
             rho_model = params['mass'] / params['radius']**3
@@ -295,7 +295,7 @@ class MistFit:
             numpyro.factor("loglike_age", -0.5 *
                            (age_obs - age_model)**2 / age_err**2)
 
-    def setup_hmc(self, target_accept_prob=0.95, num_warmup=1000, num_samples=1000, init_logage=9.3, init_feh=0, init_eep=300, dense_mass=True):
+    def setup_hmc(self, target_accept_prob=0.95, num_chains=1, max_tree_depth=10, num_warmup=1000, num_samples=1000, init_logage=9.3, init_feh=0, init_eep=300, dense_mass=True):
         """ setup NumPyro HMC
 
             Args:
@@ -319,9 +319,9 @@ class MistFit:
         init_strategy = init_to_value(values=initdict)
 
         kernel = numpyro.infer.NUTS(
-            self.model, target_accept_prob=target_accept_prob, init_strategy=init_strategy, dense_mass=dense_mass)
+            self.model, target_accept_prob=target_accept_prob, init_strategy=init_strategy, dense_mass=dense_mass, max_tree_depth=max_tree_depth)
         mcmc = numpyro.infer.MCMC(
-            kernel, num_warmup=num_warmup, num_samples=num_samples)
+            kernel, num_warmup=num_warmup, num_samples=num_samples, num_chains=num_chains)
         self.mcmc = mcmc
 
     def run_hmc(self, rng_key, **kwargs):
