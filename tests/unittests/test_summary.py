@@ -34,19 +34,12 @@ def test_summary_hdi_matches_interval_width():
     assert low > 0
 
 
-def test_summary_stats_and_summarize_results(tmp_path, monkeypatch):
+def test_summary_stats_and_summarize_results(tmp_path):
     postdir = tmp_path / "post"
     postdir.mkdir()
     filename = postdir / "123_samples.csv"
     df = pd.DataFrame({"kmag": [9.5, 10.5, 11.5], "teff": [5800, 5850, 5900]})
     df.to_csv(filename, index=False)
-
-    monkeypatch.setattr(
-        pd.DataFrame,
-        "append",
-        lambda self, other: pd.concat([self, pd.DataFrame(other)]),
-        raising=False,
-    )
 
     summary = summary_stats(
         postdir=str(postdir) + "/",
@@ -82,7 +75,10 @@ def test_summary_stats_and_summarize_results(tmp_path, monkeypatch):
         obskeys=["kmag", "teff"],
         stat="pct",
     )
-    # Ensure residuals are computed and columns exist
-    assert "dkmag" in merged.columns
-    assert "dsigmateff" in merged.columns
+    # Ensure residuals are computed and columns exist with expected values
     assert merged.shape[0] == 1
+    assert np.isclose(merged.loc[0, "dkmag"], summary.loc[0, "iso_kmag"] - 10.0)
+    assert np.isclose(merged.loc[0, "dsigmakmag"], merged.loc[0, "dkmag"] / 0.2)
+    assert np.isclose(merged.loc[0, "dteff"], summary.loc[0, "iso_teff"] - 5850)
+    assert np.isclose(merged.loc[0, "dsigmateff"], 0.0)
+    assert np.isclose(merged.loc[0, "dsigmaobs"], merged.loc[0, "dsigmakmag"])

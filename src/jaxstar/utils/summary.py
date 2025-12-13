@@ -28,7 +28,7 @@ def summary_stats(postdir, names, keys, stat='pct', **kwargs):
     else:
         summary = summary_hdi
 
-    dout = pd.DataFrame({})
+    rows = []
     for i,name in enumerate(names):
         filename = postdir + str(name) + '_samples.csv'
         if not os.path.exists(filename):
@@ -39,8 +39,9 @@ def summary_stats(postdir, names, keys, stat='pct', **kwargs):
         for k in keys:
             _k = 'iso_' + k
             _dic[_k], _dic[_k+"_upp"], _dic[_k+"_low"] = summary(np.array(dp[k]), **kwargs)
-        dout = dout.append([_dic])
+        rows.append(_dic)
 
+    dout = pd.DataFrame(rows)
     return dout.reset_index(drop=True)
 
 def summarize_results(postdir, dinput, keys, obskeys, stat='pct', **kwargs):
