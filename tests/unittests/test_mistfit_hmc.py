@@ -75,3 +75,20 @@ def test_check_mistgrid_path_skips_download(monkeypatch, synthetic_mistgrid):
     # Should return the default path without calling the downloader
     path = check_mistgrid_path()
     assert path.endswith("mistgrid_iso.npz")
+
+
+def test_check_mistgrid_path_triggers_download_when_missing(monkeypatch):
+    calls = {}
+
+    def fake_exists(path):
+        return False
+
+    def fake_create():
+        calls["create"] = True
+
+    monkeypatch.setattr("jaxstar.mistfit.mistfit.os.path.exists", fake_exists)
+    monkeypatch.setattr("jaxstar.mistfit.mistfit.create_mistgrid", fake_create)
+
+    path = check_mistgrid_path()
+    assert calls.get("create") is True
+    assert path.endswith("mistgrid_iso.npz")

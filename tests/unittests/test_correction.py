@@ -25,15 +25,22 @@ class FakeSkyCoord:
 
 
 class FakeBayestarQuery:
-    def __init__(self, version):
+    def __init__(self, version, reddening=0.1, vector=False):
         self.version = version
         self.calls = []
+        self.reddening = reddening
+        self.vector = vector
 
     def __call__(self, coords, mode="median"):
         self.calls.append((coords, mode))
-        # Return small reddening matching the shape of distance array
         dist = getattr(coords.distance, "value", coords.distance)
-        return units.Quantity(np.ones_like(dist) * 0.1)
+        dist = np.asarray(dist)
+        if self.vector:
+            # Shape (N, 1) so it broadcasts with Rvect (len=8)
+            reddening = np.ones(dist.shape + (1,)) * self.reddening
+        else:
+            reddening = np.ones(dist.shape) * self.reddening
+        return units.Quantity(reddening)
 
 
 def test_ensure_quantity_numeric_input():
@@ -74,7 +81,7 @@ def test_correct_gedr3_parallax_zeropoint(monkeypatch):
 
 
 def test_correct_kmag_handles_negative_parallax_and_units(monkeypatch):
-    fake_query = FakeBayestarQuery(version="bayestar2019")
+    fake_query = FakeBayestarQuery(version="bayestar2019", vector=False)
     monkeypatch.setattr("dustmaps.bayestar.BayestarQuery", lambda version: fake_query)
     monkeypatch.setattr("astropy.coordinates.SkyCoord", FakeSkyCoord)
 
@@ -97,3 +104,26 @@ def test_correct_kmag_handles_negative_parallax_and_units(monkeypatch):
     # ak computed with reddening=0.1 and Rvect[-1] for version 2019 (0.3026)
     expected_ak = 0.1 * correction.Rvect_b19[-1]
     assert np.allclose(corrected["ak"], expected_ak)
+    # Dustmaps called once with median mode
+    assert len(fake_query.calls) == 1
+    _, mode = fake_query.calls[0]
+    assert mode == "median"
+
+
+def test_extinction_mag_vector_uses_units_and_reddening(monkeypatch):
+    fake_query = FakeBayestarQuery(version="bayestar2019", reddening=0.2, vector=True)
+    monkeypatch.setattr("dustmaps.bayestar.BayestarQuery", lambda version: fake_query)
+    monkeypatch.setattr("astropy.coordinates.SkyCoord", FakeSkyCoord)
+
+    l = pd.Series([1.0, 2.0])
+    b = units.Quantity([3.0, 4.0], unit=units.deg)
+    distpc = [100.0, 200.0]
+
+    ak, ak_err = correction.extinction_mag_vector(l, b, distpc, version="2019")
+    # Returned shapes align with input
+    assert ak.shape[1] == len(correction.Rvect_b19)
+    assert ak.shape[0] == 2
+    # Reddening 0.2 * Rvect_b19
+    assert np.allclose(ak.value, 0.2 * correction.Rvect_b19)
+    # Error is 30% of ak
+    assert np.allclose(ak_err.value, 0.3 * ak.value)
