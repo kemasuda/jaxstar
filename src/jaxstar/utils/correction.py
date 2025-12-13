@@ -3,7 +3,6 @@ __all__ = ["correct_gedr3_parallax", "correct_kmag", "correct_gedr3_parallax_err
 
 import numpy as np
 import pandas as pd
-import astropy.units as units
 
 
 def parallax_error_correction_gedr3(gmags, a=0.21, g0=12.65, b=0.90, p=[-0.00062, 0.0040, 1.141]):
@@ -38,8 +37,9 @@ def _first_non_missing(values):
     return None
 
 
-def _ensure_quantity(values, default_unit):
+def _ensure_quantity(values, default_unit, units_module):
     """Ensure scalars/arrays/Series carry the required astropy unit."""
+    units = units_module
     if isinstance(values, pd.Series):
         series = values
     else:
@@ -89,6 +89,7 @@ def extinction_mag_vector(l, b, distpc, version='2019'):
     """
     from dustmaps.bayestar import BayestarQuery as bquery
     from astropy.coordinates import SkyCoord
+    import astropy.units as units
     # extinction vector from Table 1 of Green et al. (2019) https://ui.adsabs.harvard.edu/abs/2019ApJ...887...93G/abstract
     # Pan-STARRS 1 grizy, 2MASS JHKs
     Rvect_b19 = np.array([3.518, 2.617, 1.971, 1.549, 1.263, 0.7927, 0.4690, 0.3026])
@@ -102,9 +103,9 @@ def extinction_mag_vector(l, b, distpc, version='2019'):
         Rvect = Rvect_b17
     print ("# bayestar%s is used."%version)
 
-    l_vals = _ensure_quantity(l, units.deg)
-    b_vals = _ensure_quantity(b, units.deg)
-    distance_vals = _ensure_quantity(distpc, units.pc)
+    l_vals = _ensure_quantity(l, units.deg, units)
+    b_vals = _ensure_quantity(b, units.deg, units)
+    distance_vals = _ensure_quantity(distpc, units.pc, units)
     coords = SkyCoord(l=l_vals, b=b_vals, distance=distance_vals, frame='galactic')
     reddening = bayestar(coords, mode='median')
     ak = reddening * Rvect
@@ -137,6 +138,7 @@ Rvect_b17 = np.array([3.384, 2.483, 1.838, 1.414, 1.126, 0.650, 0.327, 0.161])
 def correct_kmag(d, version='2019'):
     from dustmaps.bayestar import BayestarQuery as bquery
     from astropy.coordinates import SkyCoord
+    import astropy.units as units
 
     print ("# %d stars include nan."%np.sum((d.kmag_err!=d.kmag_err)&(d.parallax!=d.parallax)))
 
@@ -153,9 +155,9 @@ def correct_kmag(d, version='2019'):
         version = '2017'
         Rvect = Rvect_b17
     print ("# bayestar%s is used."%version)
-    l_vals = _ensure_quantity(d['l'], units.deg)
-    b_vals = _ensure_quantity(d['b'], units.deg)
-    dist_vals = _ensure_quantity(d['distpc'], units.pc)
+    l_vals = _ensure_quantity(d['l'], units.deg, units)
+    b_vals = _ensure_quantity(d['b'], units.deg, units)
+    dist_vals = _ensure_quantity(d['distpc'], units.pc, units)
     coords = SkyCoord(l=l_vals, b=b_vals, distance=dist_vals, frame='galactic')
     reddening = bayestar(coords, mode='median')
     ak = reddening * Rvect[-1]
