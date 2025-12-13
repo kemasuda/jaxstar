@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Bytecode caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test and coverage outputs
+.pytest_cache/
+.mypy_cache/
+.coverage*
+htmlcov/
+
+# Virtualenvs
+.env/
+.venv/
+venv/
+
+# OS/editor clutter
+.DS_Store
+*.swp
