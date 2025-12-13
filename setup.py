@@ -11,7 +11,16 @@ META_PATH = os.path.join("src", "jaxstar", "__init__.py")
 CLASSIFIERS = [
     "Programming Language :: Python",
 ]
-INSTALL_REQUIRES = []
+INSTALL_REQUIRES = [
+    "numpy>=1.22",
+    "pandas>=1.5",
+    "jax>=0.4",
+    "jaxlib>=0.4",
+    "numpyro>=0.13",
+    "astropy>=5.0",
+    "dustmaps>=1.0",
+    "gaiadr3-zeropoint>=0.1.0",
+]
 
 # END PROJECT SPECIFIC
 HERE = os.path.dirname(os.path.realpath(__file__))
