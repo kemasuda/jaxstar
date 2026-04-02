@@ -77,7 +77,7 @@ class MistGridIso:
         self.keys = None
 
     def set_keys(self, keys):
-        """set keys for the stellar parameters to be evaluated
+        """Set keys for the stellar parameters to be evaluated
 
             Args:
                 keys: list of strings, should be one of those listed in mistgrid/create_grid.py
@@ -87,7 +87,7 @@ class MistGridIso:
 
     @partial(jit, static_argnums=(0,))
     def values(self, age, feh, eep):
-        """ compute stellar parameters for given age, feh, and eep
+        """Compute stellar parameters for given age, feh, and eep
 
             Args:
                 age: log10(stellar age in yr)
@@ -106,7 +106,7 @@ class MistGridIso:
 
     @partial(jit, static_argnums=(0,))
     def eep_given_mass(self, age, feh, mass):
-        """compute EEP for given age, feh, mass
+        """Compute EEP for given age, feh, mass
 
             Args:
                 age: log10(stellar age in yr)
@@ -129,7 +129,7 @@ class MistGridIso:
 
     @partial(jit, static_argnums=(0,))
     def values_given_mass(self, age, feh, mass):
-        """ compute stellar parameters for given age, feh, and mass
+        """Compute stellar parameters for given age, feh, and mass
 
             Args:
                 age: log10(stellar age in yr)
@@ -145,6 +145,33 @@ class MistGridIso:
         idxs = [aidx, fidx, eepidx]
 
         return [mapc(self.dgrid[key], idxs, order=1, cval=-jnp.inf) for key in self.keys]
+
+    @partial(jit, static_argnums=(0,))
+    def age_given_eep_mass(self, eep, mass, feh):
+        """Compute age for given EEP, mass, and Fe/H.
+
+        Args:
+            eep: Equivalent evolutionary point.
+            mass: Stellar mass in solar units.
+            feh: Metallicity in dex.
+
+        Returns:
+            age: log10(stellar age in yr).
+        """
+        fidx = (feh - self.f0) / self.df
+        eepidx = (eep - self.eep0) / self.deep
+
+        age_grid = jnp.array(self.dgrid["logagrid"])
+        aidx_grid = (age_grid - self.a0) / self.da
+        idxs_grid = [aidx_grid, fidx, eepidx]
+
+        mass_grid = mapc(self.dgrid["mass"], idxs_grid, order=1, cval=-jnp.inf)
+
+        # interp assumes xp is in ascending order, so reverse both arrays
+        # if mass decreases with age along this slice.
+        age = interp(mass, mass_grid[::-1], age_grid[::-1])
+
+        return age
 
 
 @jit

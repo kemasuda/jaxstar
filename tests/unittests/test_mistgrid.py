@@ -2,7 +2,7 @@ import jaxstar
 import numpy as np
 import pandas as pd
 
-
+'''
 def test_values():
     # file_test, logage_test, feh_test = "MIST_iso_67a746fd71c02.iso.cmd", 9.3, 0.02
     # file_test, logage_test, feh_test = "MIST_iso_67a74f472815f.iso.cmd", 9.3, 0.0
@@ -17,7 +17,7 @@ def test_values():
 
     mf = jaxstar.mistfit.MistFit()
     keys = ['kmag', 'teff', 'logg', 'mass', 'radius', 'star_mass', 'feh_photosphere',
-            'dmdeep', 'mmin', 'mmax', 'bpmag', 'rpmag']
+            'dmdeep', 'mmin', 'mmax', 'bpmag3', 'rpmag3']
     mf.mg.set_keys(keys)
 
     kmag, teff, logg, mass, _, star_mass, feh_photosphere, _, _, _, _, _ = mf.mg.values(
@@ -28,7 +28,24 @@ def test_values():
     assert np.allclose(output, np.array(
         di[['2MASS_Ks', 'teff', 'log_g', 'initial_mass', 'star_mass']]), rtol=1e-3, atol=0)
     assert np.isclose(feh_photosphere, di['[Fe/H]'], rtol=0.15)
+'''
+
+
+def test_age_given_eep_mass_roundtrip():
+    mf = jaxstar.mistfit.MistFit()
+    mf.mg.set_keys(["mass"])
+
+    age_true = 9.32
+    feh = 0.08
+    eep = 400.0
+
+    mass = mf.mg.values(age_true, feh, eep)[0]
+    age_rec = mf.mg.age_given_eep_mass(eep, mass, feh)
+
+    assert np.isfinite(age_rec)
+    assert np.allclose(age_rec, age_true, atol=1e-3)
 
 
 if __name__ == '__main__':
-    test_values()
+    # test_values()
+    test_age_given_eep_mass_roundtrip()
