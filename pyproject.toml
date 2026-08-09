@@ -4,4 +4,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
+markers = [
+    "full_grid: requires JAXSTAR_MISTGRID_PATH and checks the full MIST grid",
+]

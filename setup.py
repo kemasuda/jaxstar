@@ -19,6 +19,7 @@ INSTALL_REQUIRES = [
     "numpy>=1.23",
     "numpyro>=0.15",
     "pandas>=1.5",
+    "platformdirs>=3",
     "scipy>=1.9",
 ]
 TEST_REQUIRES = ["pytest>=7"]
