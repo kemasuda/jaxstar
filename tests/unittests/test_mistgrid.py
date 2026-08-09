@@ -1,34 +1,42 @@
-import jaxstar
 import numpy as np
-import pandas as pd
+import pytest
+
+from jaxstar.mistfit import MistFit, MistGridIso
 
 
-def test_values():
-    # file_test, logage_test, feh_test = "MIST_iso_67a746fd71c02.iso.cmd", 9.3, 0.02
-    # file_test, logage_test, feh_test = "MIST_iso_67a74f472815f.iso.cmd", 9.3, 0.0
-    # file_test, logage_test, feh_test = "MIST_iso_67a74fd255b6e.iso.cmd", 9.3, 0.05
-    # file_test, logage_test, feh_test = "MIST_iso_67a751c050e0e.iso.cmd", 9.3, 0.1
-    # d = pd.read_csv(file_test, comment='#', sep='\s+')
-    # d['teff'] = 10**d['log_Teff']
-    # di = d.iloc[300:700]
-    # di.to_csv("test_data.txt", index=False)
-    di = pd.read_csv("test_data.txt").iloc[300]
-    logage_test, feh_test, eep_test = 9.3, 0.1, di.EEP
+@pytest.fixture
+def tiny_grid_path(tmp_path):
+    """Create a deterministic grid small enough for unit tests."""
+    logage = np.array([8.0, 9.0])
+    feh = np.array([-0.5, 0.5])
+    eep = np.array([100.0, 200.0])
 
-    mf = jaxstar.mistfit.MistFit()
-    keys = ['kmag', 'teff', 'logg', 'mass', 'radius', 'star_mass', 'feh_photosphere',
-            'dmdeep', 'mmin', 'mmax', 'bpmag', 'rpmag']
-    mf.mg.set_keys(keys)
+    age_index, feh_index, eep_index = np.indices((2, 2, 2))
+    mass = 1.0 + age_index + 2.0 * feh_index + 4.0 * eep_index
+    teff = 5000.0 + 100.0 * mass
 
-    kmag, teff, logg, mass, _, star_mass, feh_photosphere, _, _, _, _, _ = mf.mg.values(
-        logage_test, feh_test, eep_test)
-    output = np.array([kmag, teff, logg, mass, star_mass])
-    print(output, feh_photosphere)
-    print(di[['2MASS_Ks', 'teff', 'log_g', 'initial_mass', 'star_mass', '[Fe/H]']])
-    assert np.allclose(output, np.array(
-        di[['2MASS_Ks', 'teff', 'log_g', 'initial_mass', 'star_mass']]), rtol=1e-3, atol=0)
-    assert np.isclose(feh_photosphere, di['[Fe/H]'], rtol=0.15)
+    path = tmp_path / "tiny_mistgrid.npz"
+    np.savez(
+        path,
+        logagrid=logage,
+        fgrid=feh,
+        eepgrid=eep,
+        mass=mass,
+        teff=teff,
+    )
+    return path
 
 
-if __name__ == '__main__':
-    test_values()
+def test_values_from_explicit_grid(tiny_grid_path):
+    grid = MistGridIso(path=tiny_grid_path)
+    grid.set_keys(["mass", "teff"])
+
+    values = np.asarray(grid.values(age=8.5, feh=0.0, eep=150.0))
+
+    np.testing.assert_allclose(values, [4.5, 5450.0])
+
+
+def test_mistfit_accepts_explicit_grid_path(tiny_grid_path):
+    fit = MistFit(path=tiny_grid_path)
+
+    np.testing.assert_array_equal(fit.mg.dgrid["logagrid"], [8.0, 9.0])

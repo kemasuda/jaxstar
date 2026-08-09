@@ -2,16 +2,26 @@
 import codecs
 import os
 import re
-from setuptools import find_packages, setup
+from setuptools import find_namespace_packages, setup
 
 # PROJECT SPECIFIC
 NAME = "jaxstar"
-PACKAGES = find_packages(where="src")
+PACKAGES = find_namespace_packages(where="src")
 META_PATH = os.path.join("src", "jaxstar", "__init__.py")
 CLASSIFIERS = [
     "Programming Language :: Python",
 ]
-INSTALL_REQUIRES = []
+INSTALL_REQUIRES = [
+    "arviz>=0.15",
+    "astropy>=5",
+    "jax>=0.4.30",
+    "jaxlib>=0.4.30",
+    "numpy>=1.23",
+    "numpyro>=0.15",
+    "pandas>=1.5",
+    "scipy>=1.9",
+]
+TEST_REQUIRES = ["pytest>=7"]
 
 # END PROJECT SPECIFIC
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -34,13 +44,7 @@ def find_meta(meta, meta_file=read(META_PATH)):
 if __name__ == "__main__":
     setup(
         name=NAME,
-        use_scm_version={
-            "write_to": os.path.join(
-                "src", "jaxstar", "{0}_version.py".format(NAME)
-            ),
-            "write_to_template": '__version__ = "{version}"\n',
-        },
-        version='0.1.0',
+        version="0.1.0",
         author=find_meta("author"),
         author_email=find_meta("email"),
         maintainer=find_meta("author"),
@@ -54,7 +58,8 @@ if __name__ == "__main__":
         package_dir={"": "src"},
         include_package_data=True,
         install_requires=INSTALL_REQUIRES,
+        extras_require={"test": TEST_REQUIRES},
+        python_requires=">=3.10",
         classifiers=CLASSIFIERS,
         zip_safe=False,
-        options={"bdist_wheel": {"universal": "1"}},
     )
