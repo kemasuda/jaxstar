@@ -1,6 +1,8 @@
+from importlib.metadata import version
+
 __all__ = []
 
-__version__ = "0.1.0"
+__version__ = version("jaxstar")
 __uri__ = "none"
 __author__ = "Kento Masuda"
 __email__ = ""
