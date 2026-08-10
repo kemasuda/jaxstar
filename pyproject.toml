@@ -1,7 +1,70 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jaxstar"
+dynamic = ["version"]
+description = "Stellar parameter estimation with JAX"
+readme = "README.md"
+authors = [
+    { name = "Kento Masuda" },
+]
+maintainers = [
+    { name = "Kento Masuda" },
+]
+license = { text = "MIT" }
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python",
+]
+dependencies = [
+    "arviz>=0.15",
+    "astropy>=5",
+    "jax>=0.4.30",
+    "jaxlib>=0.4.30",
+    "numpy>=1.23",
+    "numpyro>=0.15",
+    "pandas>=1.5",
+    "platformdirs>=3",
+    "scipy>=1.9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/kemasuda/jaxstar"
+Source = "https://github.com/kemasuda/jaxstar"
+Issues = "https://github.com/kemasuda/jaxstar/issues"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+version_scheme = "no-guess-dev"
+local_scheme = "no-local-version"
+
+[tool.hatch.build]
+exclude = [
+    "/src/jaxstar/jaxstar_version.py",
+    "/src/jaxstar/mistfit/mistfit_estimate_magerr.py",
+    "/src/jaxstar/mistfit/mistgrid/__init__.py",
+    "/tests/unittests/MIST_iso_*.iso.cmd",
+    "/tests/unittests/check_track.ipynb",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jaxstar"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/jaxstar/**",
+    "tests/**",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
+markers = [
+    "full_grid: requires JAXSTAR_MISTGRID_PATH and checks the full MIST grid",
+]

@@ -4,12 +4,11 @@ __all__ = ["create_mistgrid"]
 # %%
 import numpy as np
 import pandas as pd
-import sys
 import os
 import glob
-import pathlib
 from astropy.constants import M_sun, R_sun, G
 from scipy.interpolate import interp1d
+from .paths import resolve_mistgrid_path
 logg_sun = np.log10((G * M_sun / R_sun**2).cgs.value)
 
 # %%
@@ -21,14 +20,21 @@ keys += ['star_mass', 'feh_photosphere']
 keys += ['Bessell_U',  'Bessell_B', 'Bessell_V', 'Bessell_R', 'Bessell_I']
 
 
-def create_mistgrid():
-    """ function to create mistgrid_iso.npz for jaxstar.mistfit
+def create_mistgrid(path=None):
+    """Download the source CMDs and create a MIST grid.
+
+    Args:
+        path: output path for the generated grid. If omitted, use the
+            environment override or the platform-specific user cache.
+
+    Returns:
+        Path: path to the generated grid
     """
     url_cmd = "http://waps.cfa.harvard.edu/MIST/data/tarballs_v1.2/MIST_v1.2_vvcrit0.4_UBVRIplus.txz"
     filename_cmd = "MIST_v1.2_vvcrit0.4_UBVRIplus.txz"
-    mistgriddir_path = pathlib.Path(
-        os.path.dirname(os.path.realpath(__file__)))
-    mistgrid_path = mistgriddir_path/'mistgrid_iso.npz'
+    mistgrid_path = resolve_mistgrid_path(path)
+    mistgriddir_path = mistgrid_path.parent
+    mistgriddir_path.mkdir(parents=True, exist_ok=True)
     mistdir_path = mistgriddir_path/'MIST_v1.2_vvcrit0.4_UBVRIplus'
     # print (mistdir_path)
 
@@ -68,7 +74,7 @@ def create_mistgrid():
     for filename in filenames:
         feh = float(filename.split('/')[-1].split("_")
                     [3].replace("m", "-").replace("p", "+"))
-        d = pd.read_csv(filename, sep='\s+',
+        d = pd.read_csv(filename, sep=r'\s+',
                         comment='#', header=None, names=header)
         d['mass'] = d['initial_mass']
         d['feh'] = d['[Fe/H]_init']
@@ -134,3 +140,4 @@ def create_mistgrid():
                  12], eepmin=pgrids2d[13], eepmax=pgrids2d[14], gmag2=pgrids2d[15], bpmag2=pgrids2d[16], rpmag2=pgrids2d[17],
              gmag3=pgrids2d[18], bpmag3=pgrids2d[19], rpmag3=pgrids2d[20], star_mass=pgrids2d[21], feh_photosphere=pgrids2d[22],
              umag=pgrids2d[23], bmag=pgrids2d[24], vmag=pgrids2d[25], rmag=pgrids2d[26], imag=pgrids2d[27])
+    return mistgrid_path

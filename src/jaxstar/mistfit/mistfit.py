@@ -3,7 +3,6 @@ __all__ = ["MistGridIso", "MistFit"]
 # %%
 import numpy as np
 import pandas as pd
-import os
 import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
@@ -12,20 +11,20 @@ from numpyro.infer import init_to_value
 from jax.scipy.ndimage import map_coordinates as mapc
 from functools import partial
 from .gyrochrone_likelihood import loglike_gyro
-from jaxstar.mistfit.mistgrid.create_grid import *
+from jaxstar.mistfit.mistgrid.create_grid import create_mistgrid
+from jaxstar.mistfit.mistgrid.paths import resolve_mistgrid_path
 
 
 def check_mistgrid_path():
-    """check the existence of mistgrid_iso.npz
-    if the file does not exist, download CMD files and create the file by calling create_mistgrid()
+    """Return a usable grid path, creating the cached grid on first use.
+
+    An environment override is honored before the platform-specific cache.
+    If the resolved grid does not exist, it is downloaded and generated there.
     """
-    gridfile_path = os.path.join(os.path.dirname(
-        os.path.realpath(__file__)), 'mistgrid/mistgrid_iso.npz')
-    script_path = os.path.join(os.path.dirname(
-        os.path.realpath(__file__)), 'mistgrid/create_grid.py')
-    if not os.path.exists(gridfile_path):
-        print("mistgrid_iso.npz not found.")
-        create_mistgrid()
+    gridfile_path = resolve_mistgrid_path()
+    if not gridfile_path.is_file():
+        print(f"{gridfile_path} not found.")
+        create_mistgrid(path=gridfile_path)
     return gridfile_path
 
 
@@ -56,7 +55,8 @@ class MistGridIso:
         """initialization
 
             Args:
-                path: path to npz grid file, if not specified, defaults to gridfile_path
+                path: path to an existing npz grid file. If omitted, use the
+                    environment override or user cache, downloading on first use.
 
         """
         if path is None:
@@ -172,7 +172,8 @@ class MistFit:
         """initialization
 
             Args:
-                path: path to npz grid file, if not specified, defaults to gridfile_path
+                path: path to an existing npz grid file. If omitted, use the
+                    environment override or user cache, downloading on first use.
 
         """
         if path is None:
