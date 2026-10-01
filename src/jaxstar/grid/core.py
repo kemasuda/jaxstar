@@ -1,13 +1,13 @@
 """Pure numerical building blocks for named rectilinear grids.
 
 This module deliberately has no MIST, spectrum, file-I/O, or NumPyro
-dependencies.  The first implementation supports scalar fields defined over
-all grid axes.  Additional field layouts can be added without changing the
-coordinate or selection API.
+dependencies. Fields are defined over all grid axes and may carry explicitly
+named trailing payload dimensions that are not interpolated.
 """
 
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import product
 from typing import Any
 
 import jax
@@ -36,14 +36,28 @@ class Axis:
 
 @dataclass(frozen=True, eq=False)
 class Field:
-    """A scalar field and the named grid dimensions of its array."""
+    """A field with named interpolation dimensions and optional trailing payload.
+
+    ``dims`` names every grid axis exactly once, in array order. ``payload_dims``
+    names the remaining trailing dimensions, whose lengths come from ``values``.
+    Payload names are distinct from grid axes; they have no coordinates and are
+    never interpolated. An empty ``payload_dims`` preserves scalar fields.
+    """
 
     values: ArrayLike
     dims: tuple[str, ...]
+    payload_dims: tuple[str, ...]
 
-    def __init__(self, values: ArrayLike, dims: Sequence[str]):
+    def __init__(
+        self,
+        values: ArrayLike,
+        dims: Sequence[str],
+        *,
+        payload_dims: Sequence[str] = (),
+    ):
         object.__setattr__(self, "values", values)
         object.__setattr__(self, "dims", tuple(dims))
+        object.__setattr__(self, "payload_dims", tuple(payload_dims))
 
 
 @jax.tree_util.register_pytree_node_class
@@ -87,7 +101,7 @@ class GridResult(Mapping[str, Any]):
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True, eq=False, init=False)
 class RectilinearGrid:
-    """Immutable collection of named axes and scalar fields.
+    """Immutable collection of named axes and fields with optional payload.
 
     Construct a grid from mappings so their insertion order defines the schema
     order.  Field arrays may use a different dimension order as long as
@@ -103,6 +117,7 @@ class RectilinearGrid:
     axis_kinds: tuple[str, ...]
     field_names: tuple[str, ...]
     field_dims: tuple[tuple[str, ...], ...]
+    field_payload_dims: tuple[tuple[str, ...], ...]
     boundary: str
     _axis_values: tuple[Any, ...]
     _field_values: tuple[Any, ...]
@@ -131,6 +146,7 @@ class RectilinearGrid:
         axis_kinds,
         field_names,
         field_dims,
+        field_payload_dims,
         boundary,
         axis_values,
         field_values,
@@ -140,6 +156,7 @@ class RectilinearGrid:
         object.__setattr__(self, "axis_kinds", tuple(axis_kinds))
         object.__setattr__(self, "field_names", tuple(field_names))
         object.__setattr__(self, "field_dims", tuple(field_dims))
+        object.__setattr__(self, "field_payload_dims", tuple(field_payload_dims))
         object.__setattr__(self, "boundary", boundary)
         object.__setattr__(self, "_axis_values", tuple(axis_values))
         object.__setattr__(self, "_field_values", tuple(field_values))
@@ -159,7 +176,11 @@ class RectilinearGrid:
             index = self.field_names.index(name)
         except ValueError as error:
             raise KeyError(name) from error
-        return Field(self._field_values[index], self.field_dims[index])
+        return Field(
+            self._field_values[index],
+            self.field_dims[index],
+            payload_dims=self.field_payload_dims[index],
+        )
 
     def interpolate(
         self,
@@ -178,8 +199,16 @@ class RectilinearGrid:
 
         Returns:
             An immutable ordered mapping from selected names to JAX arrays.
+            For broadcast query shape ``B`` and trailing payload shape ``P``,
+            each field has shape ``B + P``. Scalars use ``P = ()``.
+
+        Payload weights are computed in coordinate precision, then cast to the
+        field dtype before accumulation. Payload storage, arithmetic and output
+        therefore retain the field dtype even with higher-precision queries.
+        Scalar fields retain the existing ``map_coordinates`` dtype behavior.
         """
         selected_names = _normalize_selected_names(keys, self.field_names)
+        selected_indices = tuple(self.field_names.index(name) for name in selected_names)
         query_values = _coordinates_in_schema_order(coordinates, self.axis_names)
 
         try:
@@ -207,19 +236,35 @@ class RectilinearGrid:
         for name in self.axis_names[1:]:
             all_valid = jnp.logical_and(all_valid, valid_by_name[name])
 
-        outputs = []
-        for name in selected_names:
-            index = self.field_names.index(name)
-            dims = self.field_dims[index]
-            field_coordinates = [fractional_by_name[dim] for dim in dims]
-            interpolated = map_coordinates(
-                self._field_values[index],
-                field_coordinates,
-                order=1,
-                mode="nearest",
+        # Only small index/weight arrays are shared across payload fields. Never
+        # build a (query, corner, ...payload) stack or interpolate payload axes.
+        stencil = None
+        if any(self.field_payload_dims[index] for index in selected_indices):
+            stencil = _payload_stencil(
+                [fractional_by_name[name] for name in self.axis_names],
+                [values.size for values in self._axis_values],
             )
+
+        outputs = []
+        for index in selected_indices:
+            dims = self.field_dims[index]
+            payload_ndim = len(self.field_payload_dims[index])
+            if payload_ndim:
+                axis_order = tuple(self.axis_names.index(dim) for dim in dims)
+                interpolated = _interpolate_payload(
+                    self._field_values[index], axis_order, stencil, payload_ndim
+                )
+            else:
+                field_coordinates = [fractional_by_name[dim] for dim in dims]
+                interpolated = map_coordinates(
+                    self._field_values[index],
+                    field_coordinates,
+                    order=1,
+                    mode="nearest",
+                )
             fill = jnp.asarray(self.fill_value, dtype=interpolated.dtype)
-            outputs.append(jnp.where(all_valid, interpolated, fill))
+            valid = all_valid.reshape(all_valid.shape + (1,) * payload_ndim)
+            outputs.append(jnp.where(valid, interpolated, fill))
 
         return GridResult(names=selected_names, arrays=tuple(outputs))
 
@@ -230,13 +275,21 @@ class RectilinearGrid:
             self.axis_kinds,
             self.field_names,
             self.field_dims,
+            self.field_payload_dims,
             self.boundary,
         )
         return children, metadata
 
     @classmethod
     def tree_unflatten(cls, metadata, children):
-        axis_names, axis_kinds, field_names, field_dims, boundary = metadata
+        (
+            axis_names,
+            axis_kinds,
+            field_names,
+            field_dims,
+            field_payload_dims,
+            boundary,
+        ) = metadata
         axis_values, field_values, fill_value = children
         grid = object.__new__(cls)
         grid._set_components(
@@ -244,6 +297,7 @@ class RectilinearGrid:
             axis_kinds=axis_kinds,
             field_names=field_names,
             field_dims=field_dims,
+            field_payload_dims=field_payload_dims,
             boundary=boundary,
             axis_values=axis_values,
             field_values=field_values,
@@ -278,6 +332,7 @@ def _normalize_grid(*, axes, fields, fill_value, boundary):
 
     field_values = []
     field_dims = []
+    field_payload_dims = []
     expected_axis_set = set(axis_names)
     for name, field in fields.items():
         if not isinstance(field, Field):
@@ -293,21 +348,34 @@ def _normalize_grid(*, axes, fields, fill_value, boundary):
             raise ValueError(
                 f"field {name!r} must contain every grid axis exactly once"
             )
+        payload_dims = tuple(field.payload_dims)
+        _validate_names(payload_dims, f"payload dimensions for field {name!r}")
+        if set(payload_dims) & expected_axis_set:
+            raise ValueError(
+                f"payload dimensions for field {name!r} must be distinct from grid axes"
+            )
 
         input_values = np.array(field.values, copy=True)
         jax_values = jnp.asarray(input_values)
         host_values = np.asarray(jax_values)
-        expected_shape = tuple(axis_sizes[dim] for dim in dims)
-        if host_values.shape != expected_shape:
+        expected_prefix = tuple(axis_sizes[dim] for dim in dims)
+        expected_ndim = len(dims) + len(payload_dims)
+        if (
+            host_values.ndim != expected_ndim
+            or host_values.shape[:len(dims)] != expected_prefix
+        ):
             raise ValueError(
                 f"field {name!r} has shape {host_values.shape}, "
-                f"expected {expected_shape} for dimensions {dims}"
+                f"expected {expected_ndim} dimensions with leading shape "
+                f"{expected_prefix} for grid dimensions {dims} "
+                f"and trailing payload dimensions {payload_dims}"
             )
         if not np.issubdtype(host_values.dtype, np.floating):
             raise TypeError(f"field {name!r} must have a floating-point dtype")
 
         field_values.append(jax_values)
         field_dims.append(dims)
+        field_payload_dims.append(payload_dims)
 
     input_fill = np.array(fill_value, copy=True)
     is_real_fill = np.issubdtype(
@@ -325,6 +393,7 @@ def _normalize_grid(*, axes, fields, fill_value, boundary):
         "axis_kinds": tuple(axis_kinds),
         "field_names": field_names,
         "field_dims": tuple(field_dims),
+        "field_payload_dims": tuple(field_payload_dims),
         "boundary": boundary,
         "axis_values": tuple(axis_values),
         "field_values": tuple(field_values),
@@ -457,6 +526,45 @@ def _coordinates_in_schema_order(coordinates, axis_names):
         raise KeyError(f"coordinate keys do not match grid axes ({detail_text})")
 
     return tuple(coordinates[name] for name in axis_names)
+
+
+def _payload_stencil(fractional_coordinates, axis_sizes):
+    """Build indices and corner weights once, without touching payload arrays."""
+    brackets = []
+    for fractional, size in zip(fractional_coordinates, axis_sizes):
+        if size == 1:
+            index = jnp.zeros_like(fractional, dtype=jnp.int32)
+            brackets.append(((index, jnp.ones_like(fractional)),))
+        else:
+            lower = jnp.floor(fractional)
+            upper_weight = fractional - lower
+            index = lower.astype(jnp.int32)
+            # Match the scalar path's nearest-index rule at inclusive endpoints.
+            brackets.append((
+                (jnp.clip(index, 0, size - 1), 1 - upper_weight),
+                (jnp.clip(index + 1, 0, size - 1), upper_weight),
+            ))
+
+    corners = []
+    for corner in product(*brackets):
+        indices, weights = zip(*corner)
+        weight = weights[0]
+        for axis_weight in weights[1:]:
+            weight = weight * axis_weight
+        corners.append((indices, weight))
+    return tuple(corners)
+
+
+def _interpolate_payload(values, axis_order, stencil, payload_ndim):
+    """Accumulate whole trailing blocks; the Python loop only traces corners."""
+    result = None
+    for schema_indices, weight in stencil:
+        indices = tuple(schema_indices[index] for index in axis_order)
+        weight = weight.astype(values.dtype)
+        weight = weight.reshape(weight.shape + (1,) * payload_ndim)
+        contribution = weight * values[indices]
+        result = contribution if result is None else result + contribution
+    return result
 
 
 def _fractional_coordinate(axis_values, kind, query):
