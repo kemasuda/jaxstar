@@ -11,8 +11,8 @@ from jaxstar.specfit.sampling import _C_KMS, _sampling_mode, _target_wavelengths
 
 
 @pytest.fixture(autouse=True)
-def precision():
-    with jax.experimental.enable_x64():
+def precision(x64_context):
+    with x64_context():
         yield
 
 
@@ -153,7 +153,7 @@ def test_validation_uses_actual_samples_and_precision(dtype):
     assert not is_log_uniform(library(perturbed, dtype=dtype))
 
 
-def test_log_and_arbitrary_wavelength_storage_remain_supported(tmp_path):
+def test_log_and_arbitrary_wavelength_storage_remain_supported(tmp_path, x64_context):
     original = library([5000., 5000.2, 5001.4, 5005., 5100.])
     for name, spectra in (("arbitrary", original), ("log", resample_spectral_grid(original, pixels=201))):
         path = save_spectral_grid(tmp_path / f"{name}.npz", spectra)
@@ -161,7 +161,7 @@ def test_log_and_arbitrary_wavelength_storage_remain_supported(tmp_path):
         np.testing.assert_array_equal(restored.wavelength, spectra.wavelength)
         np.testing.assert_array_equal(restored.grid.field("flux").values, spectra.grid.field("flux").values)
         assert is_log_uniform(restored) == (name == "log")
-    with jax.experimental.disable_x64():
+    with x64_context(False):
         converted = resample_spectral_grid(load_spectral_grid(path), pixels=151)
         assert converted.wavelength.dtype == np.float32
         assert converted.grid.field("flux").values.dtype == np.float32
@@ -184,14 +184,14 @@ def test_ambiguous_or_invalid_sampling_fails(kwargs, message):
         resample_spectral_grid(library(np.linspace(5000, 5010, 21)), **kwargs)
 
 
-def test_native_linear_backwards_compatibility_and_too_fine_precision():
+def test_native_linear_backwards_compatibility_and_too_fine_precision(x64_context):
     assert _sampling_mode(None, None, None) == "native"
     assert _sampling_mode(None, 5, None) == "linear"
     with pytest.raises(ValueError, match="does not accept pixels"):
         _sampling_mode("native", 5, None)
     with pytest.raises(ValueError, match="requires pixels"):
         _sampling_mode("linear", None, None)
-    with jax.experimental.disable_x64(), pytest.raises(ValueError, match="too fine"):
+    with x64_context(False), pytest.raises(ValueError, match="too fine"):
         resample_spectral_grid(library([5000., 5001.]), pixels=10000)
 
 

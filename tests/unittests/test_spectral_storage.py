@@ -12,8 +12,8 @@ from jaxstar.specfit._data import _SpectralLibrary
 
 
 @pytest.fixture
-def artifact(tmp_path):
-    with jax.experimental.enable_x64():
+def artifact(tmp_path, x64_context):
+    with x64_context():
         # Arbitrary producer/axes, field axis order distinct from grid order,
         # an explicitly nonuniform kernel and a nondefault boundary fill.
         grid = RectilinearGrid(
@@ -120,9 +120,9 @@ def test_malformed_common_artifact_fails(artifact, tmp_path, problem, message):
         load_spectral_grid(bad)
 
 
-def test_common_loading_follows_jax_precision_setting(artifact):
+def test_common_loading_follows_jax_precision_setting(artifact, x64_context):
     path, _ = artifact
-    with jax.experimental.disable_x64():
+    with x64_context(False):
         spectra = load_spectral_grid(path)
         assert spectra.grid.field("flux").values.dtype == np.float32
         assert spectra.wavelength.dtype == np.float32
