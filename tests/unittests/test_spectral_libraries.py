@@ -20,6 +20,7 @@ from jaxstar.specfit import (
     load_bosz, load_coelho, load_tlusty,
     prepare_bosz, prepare_coelho, prepare_tlusty,
     load_spectral_grid, save_spectral_grid,
+    is_log_uniform, resample_spectral_grid,
 )
 
 
@@ -511,3 +512,159 @@ np.savez(sys.argv[2], metadata=json.dumps(metadata), result=np.asarray(result),
         assert data["wavelength"].dtype == spectra.wavelength.dtype
         np.testing.assert_array_equal(data["result"], jax.jit(lambda s: s.grid.interpolate(point)["flux"])(spectra))
     assert_same_spectra(spectra, load_spectral_grid(artifact))
+
+
+@pytest.mark.parametrize("name,kind", [
+    ("coelho", "normalized"), ("coelho", "unnormalized"),
+    ("bosz", "normalized"), ("bosz", "unnormalized"),
+    ("tlusty", "normalized"), ("tlusty", "unnormalized"), ("tlusty", "median_scaled"),
+])
+@pytest.mark.parametrize("control", ["pixels", "velocity_step"])
+def test_direct_raw_log_sampling_products_nodes_and_queries(tmp_path, name, kind, control):
+    bounds = np.array([[5000.15, 5001.2], [5001.4, 5002.6]])
+    options = dict(sampling="log", regions=(8, "red"))
+    if control == "pixels":
+        options["pixels"] = 9
+    else:
+        # The same physical velocity spacing applies to both regions. Equal
+        # log spans permit rectangular packing without changing the requested dv.
+        bounds[1, 1] = bounds[1, 0] * bounds[0, 1] / bounds[0, 0]
+        options["velocity_step"] = 1.0
+    natives = []
+    if name == "coelho":
+        axes = dict(teff=[5000., 5500.], logg=[4.], feh=[0.], alpha=[0.])
+        for i, t in enumerate(axes["teff"]):
+            wav = 5000 + np.arange(7) * (0.5 + 0.1 * i)
+            flux = 0.7 + 0.02 * (wav - 5000) + 0.1 * i
+            path = tmp_path / f"{int(t)}_40_p00p00.ms.fits"
+            write_coelho(path, flux)
+            with fits.open(path, mode="update") as hdus:
+                hdus[0].header["CD1_1"] = 0.5 + 0.1 * i
+            natives.append((wav, flux * (1 if kind == "normalized" else 100)))
+        spectra = prepare_coelho(tmp_path, axes=axes, wavelength_ranges=bounds,
+                                 wavelength_medium="air", normalized=kind == "normalized", **options)
+    elif name == "bosz":
+        axes = dict(teff=[5000., 5500.], logg=[4.], mh=[0.], alpha=[0.], carbon=[0.], vmic=[2.])
+        for i, t in enumerate(axes["teff"]):
+            wav = np.array([5000., 5000.2, 5000.7, 5001.8, 5003.]) + 0.03 * i
+            flux = 0.7 + 0.02 * (wav - 5000) + 0.1 * i
+            path = tmp_path / "m+0.00" / f"bosz2024_mp_t{int(t)}_g+4.0_m+0.00_a+0.00_c+0.00_v2_rorig_noresam.txt.gz"
+            write_gzip(path, np.stack((wav, flux * 2, np.full(len(wav), 2)), axis=1))
+            natives.append((wav, flux * (1 if kind == "normalized" else 2)))
+        spectra = prepare_bosz(tmp_path, axes=axes, wavelength_ranges=bounds,
+                               wavelength_medium="air", normalized=kind == "normalized", **options)
+    else:
+        for i, t in enumerate([30000, 32500]):
+            base = np.linspace(0.7, 1, 7) + i * 0.1
+            _, _, wav, continuum = write_tlusty(tmp_path / f"Z1.0_{'vt2' if i == 0 else 'ostar'}",
+                                               t, 3.5, base, ostar=i > 0)
+            natives.append((wav, base if kind == "normalized" else base * continuum))
+        spectra = prepare_tlusty(tmp_path, wavelength_ranges=bounds, flux_kind=kind,
+                                 wavelength_medium="air", **options)
+
+    assert is_log_uniform(spectra)
+    expected_count = (9 if control == "pixels" else
+                      int(np.floor(np.log(bounds[0, 1] / bounds[0, 0]) * 299792.458)) + 1)
+    assert spectra.wavelength.shape == (2, expected_count)
+    assert spectra.wavelength.dtype == np.float64
+    assert spectra.grid.field("flux").values.dtype == np.float32
+    assert spectra.regions == (8, "red")
+    assert spectra.flux_kind == kind
+    assert spectra.wavelength_medium == "air"
+    step = np.diff(np.log(spectra.wavelength), axis=-1)
+    np.testing.assert_allclose(step, np.broadcast_to(step[:, :1], step.shape), rtol=1e-8)
+    if control == "velocity_step":
+        np.testing.assert_allclose(step * 299792.458, options["velocity_step"], rtol=1e-8)
+    expected_nodes = []
+    for i, (wav, values) in enumerate(natives):
+        rows = []
+        for r, (lo, hi) in enumerate(bounds):
+            scaling = np.median(values[(wav > lo) & (wav < hi)]) if kind == "median_scaled" else 1
+            rows.append(np.interp(spectra.wavelength[r], wav, values / scaling))
+        expected = np.array(rows).astype(np.float32)
+        expected_nodes.append(expected)
+        point = {axis: spectra.grid.axis(axis)[i if axis == "teff" else 0] for axis in spectra.grid.axis_names}
+        np.testing.assert_array_equal(spectra.grid.interpolate(point)["flux"], expected)
+
+    def evaluate(lib, teff):
+        point = {axis: lib.grid.axis(axis)[0] for axis in lib.grid.axis_names}
+        return lib.grid.interpolate({**point, "teff": teff})["flux"]
+
+    temperatures = spectra.grid.axis("teff")
+    midpoint = temperatures[0] + 0.3 * (temperatures[-1] - temperatures[0])
+    expected = 0.7 * expected_nodes[0] + 0.3 * expected_nodes[1]
+    np.testing.assert_allclose(jax.jit(evaluate)(spectra, midpoint), expected, rtol=2e-6)
+    batch = jax.jit(evaluate)(spectra, jnp.array([temperatures[0], midpoint]))
+    np.testing.assert_allclose(batch, np.stack((expected_nodes[0], expected)), rtol=2e-6)
+    gradient = jax.grad(lambda temperature: evaluate(spectra, temperature).sum())(midpoint)
+    span = temperatures[-1] - temperatures[0]
+    expected_gradient = (expected_nodes[1].astype(np.float64) - expected_nodes[0]).sum() / span
+    # Median-scaled nodes can have almost equal integrated flux. Account for
+    # cancellation of float32 corner reductions as the sample count grows.
+    reduction_roundoff = (2 * np.finfo(np.float32).eps
+                          * np.maximum(np.abs(expected_nodes[0]), np.abs(expected_nodes[1])).sum(dtype=np.float64)
+                          / span)
+    np.testing.assert_allclose(gradient, expected_gradient, rtol=2e-6, atol=reduction_roundoff)
+    artifact = save_spectral_grid(tmp_path / "log.npz", spectra)
+    assert_same_spectra(spectra, load_spectral_grid(artifact))
+    assert is_log_uniform(load_spectral_grid(artifact))
+
+
+def test_log_preparation_preserves_vacuum_conversion_and_requires_coverage(tmp_path):
+    axes = dict(teff=[5000.], logg=[4.], feh=[0.], alpha=[0.])
+    write_coelho(tmp_path / "5000_40_p00p00.ms.fits", np.ones(7))
+    vacuum = prepare_coelho(tmp_path, axes=axes, wavelength_ranges=[(5001.5, 5004.1)],
+                            sampling="log", velocity_step=1.0)
+    assert vacuum.wavelength_medium == "vacuum"
+    assert is_log_uniform(vacuum)
+    np.testing.assert_allclose(vacuum.wavelength[0, 0], 5001.5, rtol=0, atol=1e-12)
+    assert 0 <= np.log(5004.1 / vacuum.wavelength[0, -1]) < 1 / 299792.458
+    np.testing.assert_allclose(np.diff(np.log(vacuum.wavelength[0])) * 299792.458, 1.0, rtol=1e-8)
+    np.testing.assert_array_equal(vacuum.grid.field("flux").values, 1)
+    with pytest.raises(ValueError, match="does not cover requested log range"):
+        prepare_coelho(tmp_path, axes=axes, wavelength_ranges=[(4999, 5003)],
+                        sampling="log", velocity_step=1.0, wavelength_medium="air")
+
+
+@pytest.mark.parametrize("control", ["velocity_step", "pixels"])
+def test_legacy_conversion_and_fresh_process_loading(prepared, tmp_path, control):
+    name, _, paths, _, _ = prepared
+    # Unequal legacy log spans yield unequal counts at one dv. Convert one
+    # region for normal fitting use; count mode separately exercises packing.
+    selected_paths = paths[:1] if control == "velocity_step" else paths
+    regions = (8,) if control == "velocity_step" else (8, "red")
+    legacy = LOADERS[name](selected_paths, regions=regions, wavelength_medium="vacuum", flux_kind="unnormalized")
+    options = {"velocity_step": 1.0} if control == "velocity_step" else {"pixels": 11}
+    converted = resample_spectral_grid(legacy, **options)
+    assert is_log_uniform(converted)
+    for attribute in ("regions", "library", "wavelength_medium", "flux_kind", "sources", "wavelength_unit"):
+        assert getattr(converted, attribute) == getattr(legacy, attribute)
+    assert converted.grid.axis_names == legacy.grid.axis_names
+    for axis in legacy.grid.axis_names:
+        np.testing.assert_array_equal(converted.grid.axis(axis), legacy.grid.axis(axis))
+    values = np.asarray(legacy.grid.field("flux").values)
+    for index in np.ndindex(values.shape[:-2]):
+        for r in range(len(regions)):
+            expected = np.interp(converted.wavelength[r], legacy.wavelength[r], values[index + (r,)])
+            np.testing.assert_allclose(converted.grid.field("flux").values[index + (r,)], expected, rtol=1e-7)
+    artifact = save_spectral_grid(tmp_path / "converted.npz", converted)
+    script = """
+import sys
+import numpy as np
+from jaxstar.specfit import load_spectral_grid, is_log_uniform
+spectra = load_spectral_grid(sys.argv[1])
+assert is_log_uniform(spectra)
+point = {n: (spectra.grid.axis(n)[0] + spectra.grid.axis(n)[-1]) / 2 for n in spectra.grid.axis_names}
+np.savez(sys.argv[2], wavelength=np.asarray(spectra.wavelength),
+         flux=np.asarray(spectra.grid.field('flux').values), result=np.asarray(spectra.grid.interpolate(point)['flux']))
+"""
+    environment = dict(os.environ, JAX_ENABLE_X64="1", PYTHONPATH=str(Path(__file__).resolve().parents[2] / "src"))
+    output = tmp_path / "fresh.npz"
+    process = subprocess.run([sys.executable, "-c", script, str(artifact), str(output)],
+                             env=environment, cwd=tmp_path, capture_output=True, text=True, timeout=60)
+    assert process.returncode == 0, process.stdout + process.stderr
+    with np.load(output, allow_pickle=False) as data:
+        np.testing.assert_array_equal(data["wavelength"], converted.wavelength)
+        np.testing.assert_array_equal(data["flux"], converted.grid.field("flux").values)
+        point = {n: (converted.grid.axis(n)[0] + converted.grid.axis(n)[-1]) / 2 for n in converted.grid.axis_names}
+        np.testing.assert_array_equal(data["result"], converted.grid.interpolate(point)["flux"])

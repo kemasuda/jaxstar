@@ -16,6 +16,7 @@ import numpy as np
 
 from jaxstar.grid import Field, RectilinearGrid
 from ._data import _SpectralLibrary, _validate_wavelength
+from .sampling import _sampling_mode, _target_wavelengths
 
 
 _SCHEMAS = {
@@ -146,15 +147,26 @@ def _assemble(library, axes, wavelength, flux, regions, medium, flux_kind, sourc
 
 def prepare_coelho(data_dir, *, axes, wavelength_ranges, pixels=None,
                    regions=None, wavelength_medium="vacuum", normalized=True,
-                   source_overrides=None):
+                   source_overrides=None, sampling=None, velocity_step=None):
     """Prepare Coelho FITS nodes directly into a common spectral library.
 
     ``axes`` maps teff/logg/feh/alpha to increasing coordinate arrays.
     ``wavelength_ranges`` is a sequence of open (lower, upper) Angstrom bounds
-    in the output medium. Native samples are kept when ``pixels=None``; each
-    region must then have equal length and identical samples across all nodes.
-    An integer ``pixels`` explicitly prepares common linear sampling over the
-    intersection of the selected node coverages, as in the old preparer.
+    in the output medium. When sampling is omitted, ``pixels=None`` keeps native
+    samples; each region must then have equal length and identical samples across
+    all nodes. An integer ``pixels`` instead prepares common linear sampling over
+    the intersection of selected node coverages, as in the old preparer.
+
+    Fitting grids use ``sampling='log', velocity_step=dv`` (positive finite km/s,
+    scalar or per-region), with dlnlambda = velocity_step / 299792.458. This is
+    numerical model sampling, not instrumental resolving power or detector pixel
+    spacing; dv must be supplied explicitly. ``pixels`` remains a mutually
+    exclusive alternative for compatibility/tests/special-purpose count control.
+    Log mode directly interpolates native spectra over the requested
+    bounds, including bracketing source samples; every node must cover those
+    bounds. Count mode includes both endpoints; fixed-step mode retains complete
+    intervals inside the upper bound. Regions must have a common pixel count.
+    Omitted sampling retains M2 behavior; explicit 'native'/'linear' are allowed.
 
     Row 0 is normalized flux; row 1 is unnormalized flux. Raw output is float32,
     matching frozen preparation. ``source_overrides`` maps atmosphere tuples
@@ -191,16 +203,22 @@ def prepare_coelho(data_dir, *, axes, wavelength_ranges, pixels=None,
         return wav, flux
 
     return _prepare_nodes("coelho", axes, reader, wavelength_ranges, pixels,
-                          regions, wavelength_medium, kind, tuple(paths.values()))
+                          regions, wavelength_medium, kind, tuple(paths.values()),
+                          sampling=sampling, velocity_step=velocity_step)
 
 
 def prepare_bosz(data_dir, *, axes, wavelength_ranges, pixels=None,
                  regions=None, wavelength_medium="vacuum", normalized=True,
-                 source_overrides=None):
+                 source_overrides=None, sampling=None, velocity_step=None):
     """Prepare BOSZ-2024 gzip ASCII nodes (wavelength, H, continuum).
 
     Axes are teff/logg/mh/alpha/carbon/vmic. Normalized flux is H/continuum;
-    ``normalized=False`` retains H. See prepare_coelho for region/pixel options.
+    ``normalized=False`` retains H. For fitting use ``sampling='log',
+    velocity_step=dv`` in km/s: dlnlambda = dv / 299792.458. Supply dv explicitly
+    as numerical model sampling, independent of instrumental resolving power
+    and detector pixels. ``pixels`` is a mutually exclusive count-controlled
+    alternative for compatibility/tests/special purposes. See prepare_coelho
+    for region coverage and native/linear options.
     Filenames use mp for logg > 3, ms otherwise, and m±X.XX subdirectories.
     Missing files fail; source_overrides explicitly supports deliberate
     replacements instead of the old automatic logg=4 fallback.
@@ -240,12 +258,12 @@ def prepare_bosz(data_dir, *, axes, wavelength_ranges, pixels=None,
 
     return _prepare_nodes("bosz", axes, reader, bounds, pixels, regions,
                           wavelength_medium, "normalized" if normalized else "unnormalized",
-                          tuple(paths.values()))
+                          tuple(paths.values()), sampling=sampling, velocity_step=velocity_step)
 
 
 def prepare_tlusty(data_dir, *, wavelength_ranges, axes=None, pixels=None,
                    regions=None, flux_kind="normalized", wavelength_medium="unknown",
-                   source_overrides=None):
+                   source_overrides=None, sampling=None, velocity_step=None):
     """Prepare matched TLUSTY .7.gz spectra and .17.gz continua.
 
     Discover Z*_vt2/Z*_ostar directories, logZ=log10(Z/Z_sun), and teff/logg
@@ -257,7 +275,11 @@ def prepare_tlusty(data_dir, *, wavelength_ranges, axes=None, pixels=None,
     flux_kind is normalized (continuum division), median_scaled (the legacy
     'absolute' option, scaled per selected region), or unnormalized (native H).
     No wavelength-medium conversion is performed; callers may declare a known
-    medium. See prepare_coelho for native sampling versus explicit pixels.
+    medium. For fitting use ``sampling='log', velocity_step=dv`` in km/s:
+    dlnlambda = dv / 299792.458. Supply dv explicitly as numerical model sampling,
+    independent of instrumental resolving power and detector pixels. ``pixels``
+    is a mutually exclusive alternative for compatibility/tests/special-purpose
+    count control. See prepare_coelho for region coverage and native/linear options.
     Returns an in-memory private spectral carrier for save_spectral_grid.
     """
     if flux_kind not in {"normalized", "median_scaled", "unnormalized"}:
@@ -312,7 +334,8 @@ def prepare_tlusty(data_dir, *, wavelength_ranges, axes=None, pixels=None,
 
     sources = tuple(str(path) for node in nodes for path in paths[node])
     return _prepare_nodes("tlusty", axes, reader, wavelength_ranges, pixels,
-                          regions, wavelength_medium, flux_kind, sources)
+                          regions, wavelength_medium, flux_kind, sources,
+                          sampling=sampling, velocity_step=velocity_step)
 
 
 def _preparation_axes(library, axes):
@@ -367,7 +390,7 @@ def _region_bounds(bounds):
     return bounds
 
 
-def _selected_regions(reader, node, bounds, *, bounds_only=False, median_scaled=False):
+def _selected_regions(reader, node, bounds, *, bounds_only=False, median_scaled=False, bracket=False):
     wav, flux = reader(node, bounds_only=bounds_only)
     wav = np.asarray(wav, dtype=np.float64)
     if wav.ndim != 1:
@@ -385,15 +408,27 @@ def _selected_regions(reader, node, bounds, *, bounds_only=False, median_scaled=
     result = []
     for lower, upper in bounds:
         keep = (wav > lower) & (wav < upper)
-        selected = wav[keep]
+        if bracket:
+            if lower < wav[0] or upper > wav[-1]:
+                raise ValueError(f"node {node}: native wavelength does not cover requested log range {(lower, upper)}")
+            selection = slice(max(0, np.searchsorted(wav, lower, side="right") - 1),
+                              np.searchsorted(wav, upper, side="left") + 1)
+        else:
+            selection = keep
+        selected = wav[selection]
         if selected.size == 0:
             raise ValueError(f"node {node}: empty wavelength region {(lower, upper)}")
-        values = None if bounds_only else flux[keep]
+        values = None if bounds_only else flux[selection]
         if not bounds_only:
             if not np.all(np.isfinite(values)):
                 raise ValueError(f"node {node}: nonfinite flux or missing continuum coverage")
             if median_scaled:
-                median = np.median(values)
+                # Keep the existing per-region intrinsic scaling convention;
+                # extra bracketing samples must not change the median.
+                scaling_values = flux[keep]
+                if scaling_values.size == 0:
+                    raise ValueError(f"node {node}: empty region for median scaling")
+                median = np.median(scaling_values)
                 if not np.isfinite(median) or median == 0:
                     raise ValueError(f"node {node}: invalid median for flux scaling")
                 values = values / median
@@ -401,13 +436,18 @@ def _selected_regions(reader, node, bounds, *, bounds_only=False, median_scaled=
     return result
 
 
-def _prepare_nodes(library, axes, reader, bounds, pixels, regions, medium, kind, sources):
+def _prepare_nodes(library, axes, reader, bounds, pixels, regions, medium, kind, sources,
+                   *, sampling=None, velocity_step=None):
+    mode = _sampling_mode(sampling, pixels, velocity_step)
     bounds = _region_bounds(bounds)
     nodes = tuple(product(*axes.values()))
     wavelength, flux = None, None
-    if pixels is not None:
-        if not isinstance(pixels, (int, np.integer)) or isinstance(pixels, bool) or pixels < 2:
-            raise ValueError("pixels must be an integer >= 2, or None for native samples")
+    if mode == "log":
+        # Requested bounds determine the target once; each raw node is read
+        # only once and interpolated straight to this grid, without a linear
+        # prepared intermediate or an extra coverage-discovery pass.
+        wavelength = _target_wavelengths(bounds, mode, pixels, velocity_step)
+    elif mode == "linear":
         # A bounds-only pass avoids retaining every native spectrum or building
         # large DataFrames. The second pass streams one node into the output.
         lower = np.full(len(bounds), -np.inf)
@@ -421,7 +461,8 @@ def _prepare_nodes(library, axes, reader, bounds, pixels, regions, medium, kind,
         wavelength = np.stack([np.linspace(lo, hi, pixels) for lo, hi in zip(lower, upper)])
 
     for flat_index, node in enumerate(nodes):
-        samples = _selected_regions(reader, node, bounds, median_scaled=kind == "median_scaled")
+        samples = _selected_regions(reader, node, bounds, median_scaled=kind == "median_scaled",
+                                    bracket=mode == "log")
         if wavelength is None:
             sizes = {wav.size for wav, _ in samples}
             if len(sizes) != 1:
@@ -432,7 +473,7 @@ def _prepare_nodes(library, axes, reader, bounds, pixels, regions, medium, kind,
                             dtype=np.float32)
         index = np.unravel_index(flat_index, flux.shape[:len(axes)])
         for region, (wav, values) in enumerate(samples):
-            if pixels is None:
+            if mode == "native":
                 if not np.array_equal(wav, wavelength[region]):
                     raise ValueError("native wavelength samples differ across nodes; specify pixels")
                 flux[index + (region,)] = values

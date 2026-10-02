@@ -1,7 +1,8 @@
-# Milestone 2: spectral-library adapters
+# Spectral preparation: Milestones 2 and 2.5
 
 Implemented scope, 2026-10-02: offline raw-file preparation for Coelho, BOSZ
-and TLUSTY, common prepared NPZ storage/runtime loading, and compatibility
+and TLUSTY, optional log-uniform fitting-grid preparation, common prepared NPZ
+storage/runtime loading, and compatibility
 loading of existing jaxspec NPZs. Interpolation remains exclusively in
 `jaxstar.grid`. No deterministic forward model or inference is implemented.
 The frozen reference is the sibling `jaxspec` scientific source at `3b4ab913`
@@ -33,11 +34,13 @@ flux = library.grid.interpolate(
 # flux.shape == library.wavelength.shape == (n_region, n_pixel)
 ```
 
-The eight exported functions are:
+The ten exported functions are:
 
 ```text
 save_spectral_grid(path, spectra, *, overwrite=False)
 load_spectral_grid(path)
+resample_spectral_grid(spectra, *, sampling="log", pixels=None, velocity_step=None)
+is_log_uniform(spectra, *, rtol=1e-5)
 
 load_coelho / load_bosz / load_tlusty(
     paths, *, pixel_slices=None, regions=None,
@@ -45,13 +48,13 @@ load_coelho / load_bosz / load_tlusty(
 
 prepare_coelho(data_dir, *, axes, wavelength_ranges, pixels=None,
     regions=None, wavelength_medium="vacuum", normalized=True,
-    source_overrides=None)
+    source_overrides=None, sampling=None, velocity_step=None)
 prepare_bosz(data_dir, *, axes, wavelength_ranges, pixels=None,
     regions=None, wavelength_medium="vacuum", normalized=True,
-    source_overrides=None)
+    source_overrides=None, sampling=None, velocity_step=None)
 prepare_tlusty(data_dir, *, wavelength_ranges, axes=None, pixels=None,
     regions=None, flux_kind="normalized", wavelength_medium="unknown",
-    source_overrides=None)
+    source_overrides=None, sampling=None, velocity_step=None)
 ```
 
 For the legacy adapters, `paths` accepts a single jaxspec NPZ path or an ordered
@@ -72,10 +75,12 @@ now closed within Milestone 2, rather than deferred to a later milestone.
 from jaxstar.specfit import prepare_bosz, save_spectral_grid, load_spectral_grid
 
 # Offline, once: node reading, medium conversion, continuum division and
-# optional common sampling belong to this library-specific preparation step.
+# log-uniform model sampling belong to this library-specific preparation step.
+# These two ranges have the same log span and can share one rectangular payload.
 prepared = prepare_bosz(
     raw_directory, axes=atmosphere_axes,
-    wavelength_ranges=[(5000, 5100), (6000, 6100)], pixels=4000,
+    wavelength_ranges=[(5000, 5100), (6000, 6120)],
+    sampling="log", velocity_step=1.0,  # km/s; illustrative, not a default
     regions=[8, 9], wavelength_medium="vacuum", normalized=True,
 )
 save_spectral_grid("prepared.npz", prepared)
@@ -199,7 +204,8 @@ Nonuniform wavelength samples are metadata and are equally valid. No spacing
 check, wavelength-as-axis interpolation, or mandatory equal-spacing step is
 added to loaders.
 
-Raw preparation uses open output-medium wavelength bounds, as frozen code does.
+When `sampling` is omitted, raw preparation uses open output-medium wavelength
+bounds, as frozen code does.
 With `pixels=None`, selected native wavelength samples must match across nodes
 and regions must have a common pixel count. With an explicit integer `pixels`,
 the preparer uses each region's common node-coverage intersection and linear
@@ -212,6 +218,118 @@ Different-length regions or regions on different atmosphere grids can be loaded
 separately into multiple carriers. No padding or ragged-array machinery is
 needed for the supplied samples or the frozen rectangular usage. The same
 constraint holds for native raw preparation when no explicit sampling is chosen.
+
+## Milestone 2.5: log-uniform fitting-grid preparation
+
+The future fitting contract is log-uniform wavelength within each region.
+Preparing this offline removes native/linear-to-log resampling from each future
+model evaluation. Common storage itself is not restricted to fitting grids.
+
+The canonical fitting-grid control for all three raw preparers and the common
+converter is `sampling="log", velocity_step=dv`. Supply a positive finite dv
+in km/s explicitly, as a scalar for the same spacing in every region or as one
+value per region. The exact numerical convention is
+`dlnlambda=velocity_step/299792.458`, using natural logs. Samples start at the
+lower bound and retain all complete steps inside the upper bound, leaving less
+than one step unused at the upper edge (apart from floating roundoff).
+
+`velocity_step` describes numerical model wavelength sampling. It is independent
+of instrumental resolving power and observed detector pixel spacing; no control
+is inferred from observations. No `R`, `resolving_power` or `sampling_resolution`
+alias is introduced, and no default dv is chosen. The roughly 4000 model samples
+of historical IRD/BOSZ orders corresponded to a numerical sampling resolution
+of order `3e5`, or about 1 km/s. This is a useful reference, not a universally
+optimal value or package default. Milestone 3 can validate accuracy/performance
+choices for the intended model calculations.
+
+```text
+requested fitting wavelength range
+    -> choose numerical model velocity sampling (e.g. dv ~ 1 km/s)
+    -> prepare log-uniform spectral grid offline
+    -> save common spectral-grid artifact
+    -> future SpecModel
+```
+
+`pixels=N` remains a secondary option for compatibility, tests and special-purpose
+count-controlled preparation. It includes each region's bounds and gives
+`dlnlambda=ln(upper/lower)/(N-1)`, which may differ between regions. It should not
+be chosen simply to match the number of observed detector pixels. Exactly one
+of `velocity_step` or `pixels` is required for log sampling; specifying both is
+rejected. Counts must be integers >= 2.
+
+Fixed dv changes sample counts with the requested log span, not wavelength
+location. The existing rectangular payload requires common counts. If regions
+yield different counts, prepare them separately to retain the same dv. Explicit
+per-region dv or the special-purpose `pixels` option can instead make counts
+equal when that is the intended numerical choice. No padding, silent change to
+dv or truncation of longer regions is added. Sampling must provide at least two
+distinct wavelengths per region at the stored dtype precision.
+
+Log raw preparation constructs the requested wavelength samples once, then
+reads each atmosphere node once and linearly interpolates its native flux
+directly onto those samples. There is no intermediate linear prepared grid.
+Each node must cover the full requested range, after the existing medium
+conversion. Bracketing source points outside the requested range allow accurate
+edge interpolation; missing coverage raises an error rather than shrinking the
+request or extrapolating. Native normalized/unnormalized products remain as in
+Milestone 2. TLUSTY median scaling uses only the old strict-interior native
+samples; added bracketing points do not change that scale.
+
+For backwards compatibility, omitted `sampling` keeps M2's `pixels=None` native
+and explicit `pixels` linear preparation. Explicit `sampling="native"` accepts
+neither count nor velocity; explicit `sampling="linear"` requires a count.
+The previous linear common-coverage intersection remains unchanged. Log fitting
+preparation is explicit, rather than changing existing users' saved data.
+
+Existing legacy or common prepared grids can be converted without raw files:
+
+```python
+legacy = load_bosz("legacy_order8.npz", regions=[8], wavelength_medium="vacuum",
+                   flux_kind="normalized")
+fitting = resample_spectral_grid(legacy, sampling="log", velocity_step=1.0)
+assert is_log_uniform(fitting)
+save_spectral_grid("bosz_log.npz", fitting)
+# Later process: load_spectral_grid("bosz_log.npz")
+```
+
+The converter is library-agnostic and applies the same sampling choices over
+the stored coverage. It performs one linear point interpolation in wavelength,
+preserving all atmosphere axes/kinds, field order/flux dtype, region identifiers,
+medium/product/provenance and grid boundary settings. No extra normalization,
+flux scaling, flux-conserving rebinning or higher-order interpolation is added.
+Conversion is an offline operation, not observed-wavelength evaluation.
+
+Generated target wavelengths use the effective JAX dtype before flux
+interpolation, so spectra are evaluated at the samples actually stored.
+Conversion preserves wavelength dtype subject to canonicalization; raw
+preparation retains M2's float32 flux and configured wavelength precision.
+Endpoints may move inward by floating roundoff to stay inside source coverage.
+Sampling too fine to produce distinct representable wavelengths fails clearly.
+Callers choose sufficiently wide requested bounds; no future RV, vsini,
+macroturbulence or instrumental padding is inferred here.
+
+`is_log_uniform` is a setup-time host check over all regions, requiring at least
+two samples per region. For each row it compares natural logs against the affine
+grid defined by its endpoints. Maximum residual must be at most
+`rtol*dlnlambda + 2*eps(wavelength_dtype) + 8*eps(float64)*max(abs(lnlambda))`,
+with default `rtol=1e-5`. This bounds global departure instead of accumulating
+roundoff per pixel. Float32 quantization is accounted for; very short linear and
+log ranges can be numerically indistinguishable at that precision. M3 can use
+this check once at setup and reject unsuitable fitting grids.
+
+Storage schema/version and carrier metadata are unchanged. Wavelength arrays
+retain everything needed to check sampling and infer each region's effective
+`dv=c*dlnlambda`; no sampling label or source-specific storage field is needed.
+Arbitrary valid wavelength arrays still round-trip as version-1 common NPZs.
+
+Frozen `SpecModel` built `logspace(log10(wavmin),log10(wavmax),Nwav)[1:-1]`.
+Thus its working count was `Nwav-2`, with step
+`ln(wavmax/wavmin)/(Nwav-1)`; `varr_for_kernels` used `c*dlnlambda`. Our full
+endpoint/count mode reproduces that untrimmed grid, and matching its trimmed
+bounds plus `pixels=Nwav-2` reproduces the working samples within floating
+precision. We deliberately do not discard endpoints automatically or impose
+the old dependence on observed arrays. No forward model or broadening code is
+implemented in this milestone.
 
 ## Intentional differences and later migration items
 
@@ -262,12 +380,27 @@ tests cover legacy-to-common conversion, arbitrary producer/axis names, distinct
 field/grid dimension orders, axis kinds, boundary fill, version/schema rejection
 and JAX dtype canonicalization.
 
-Verified on 2026-10-02: the full default suite passed with `213 passed,
+Milestone 2 baseline, verified on 2026-10-02: the full default suite passed with `213 passed,
 13 skipped, 2 xfailed`; the separate frozen-reference suite passed all 12 tests.
 The default skips are the 12 opt-in spectral reference cases and one full-MIST
 case; the two existing legacy xfails are unchanged.
 
-Validation TODO (not a blocker for merging Milestone 2): full integration/smoke
+Milestone 2.5 final verification on 2026-10-02: the full suite with frozen
+references enabled passed with `280 passed, 1 skipped, 2 xfailed`. The one skip
+requires a full MIST grid; the existing legacy xfails remain unchanged. There
+are 55 added cases covering direct log raw preparation/products, count/velocity
+controls, varying native node samples, scalar/batch/gradient queries, dtypes,
+legacy conversion and fresh-process loading, arbitrary sampling storage,
+validation, frozen logspace equivalence and an endpoint-roundoff regression.
+The canonical velocity API is exercised with one scalar dv across raw regions,
+the same spacing over different wavelength intervals, float32/float64 round trips
+and legacy conversion followed by fresh-process loading. Positive finite dv and
+mutual exclusion with count control are tested. The median-scaled flux gradient
+oracle uses float64 differences and a float32 reduction-roundoff allowance.
+Smooth and line-like analytic spectra agree within absolute flux errors of
+`2e-8` and `1e-5`, respectively, for the tested dense native sampling.
+
+Validation TODO (not a blocker for merging Milestone 2 or 2.5): full integration/smoke
 testing against the actual raw Coelho, BOSZ and TLUSTY libraries remains to be
 performed on a machine where those raw libraries are available. Exercise raw
 preparation, common artifact saving, loading in a fresh process and representative
