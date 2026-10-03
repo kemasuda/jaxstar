@@ -70,6 +70,14 @@ value must satisfy `abs(rv)<c`. The frozen relativistic factor is
 features redward. Systemic/orbital RV and wavelength-zero-point interpretations
 remain outside this layer.
 
+The numerical sampling uses centered coordinates to avoid rounding small RV
+shifts away when absolute wavelengths are float32. With a region's middle
+source wavelength `L`, Doppler factor `D` and `beta=rv/c`, it interpolates
+`(wav_obs-L)-L*(D-1)` on `D*(wav_source-L)`. The stable identity
+`D-1 = 2*beta / ((1-beta)*(D+1))` avoids subtracting two near-unit numbers.
+This is algebraically the same relativistic shift, with unchanged linear
+interpolation and coverage checks; it requires neither float64 nor regridding.
+
 Requested wavelength is dynamic evaluation input with `(n_region,n_pixel)`
 shape, finite positive strictly increasing samples and at least one pixel.
 Single-region 1D input returns 1D output. Rows correspond positionally to the
@@ -139,6 +147,38 @@ test-only reconstruction is not a continuum implementation. Intermediate
 stages, generalized per-region broadening and BOSZ full/gradients use read-only
 frozen numerical source because matching saved stage/BOSZ forward artifacts do
 not exist. No generator or sibling bytecode-cache writes are performed.
+
+Eager/JIT/vmap agreement is a separate check from scientific-reference parity.
+Develop CI run #26 on Linux reported float32-native flux differences up to
+`3.77e-5` and float64 vmap differences up to `9.38e-14`, exceeding the original
+Mac-only agreement thresholds. Mac JAX 0.6.2 did not reproduce those failures,
+including with CPU fast math enabled; the exact Linux operation responsible
+is not isolated. A tolerance-only proposal was withdrawn after finding an
+independent accuracy problem in the absolute float32 Doppler coordinates.
+
+For the two-region synthetic line fixture at RV `(+0.43,-0.43) km/s`, the old
+absolute-coordinate path differs from an independent float64 NumPy/SciPy
+forward calculation by up to `2.99e-4` in flux. With x64 disabled, centered
+sampling reduces that error to `1.57e-7` eager / `1.55e-7` JIT. Across tested
+RV pairs `(+/-0.001,+/-0.43,+/-12) km/s`, the corrected error is below `1.86e-7`
+and eager/JIT differences below `1.79e-7`. These are fixture measurements, not
+universal bounds. The oracle preserves the exact stored float32 nodes, wavelength
+values and parameters, so it isolates arithmetic error from offline wavelength
+quantization; centering cannot recover precision already lost in stored data.
+
+Float32 agreement retains rtol=2e-6/atol=2e-7 for all stages. Float64 agreement
+uses rtol=1e-12/atol=2e-13, permitting the reported vmap roundoff;
+[JAX documents](https://docs.jax.dev/en/latest/faq.html#jit-changes-the-exact-numerics-of-outputs)
+that compiler rearrangements can change floating-point results. Independent
+float64 NumPy/SciPy quadrature with true Bessel J0 checks both broadening and
+the full shifted spectrum, including small-RV derivatives with x64 on/off.
+The full-spectrum oracle threshold is absolute flux error `5e-7`. Frozen
+flux/gradient parity, finite-difference, domain and coverage thresholds remain
+unchanged. The Doppler convention and public API are unchanged. Linux CI has
+not yet been rerun, so its reported discrepancy is not claimed resolved.
+Local M3a backport verification (Mac CPU, JAX/jaxlib 0.6.2, frozen reference
+enabled): **346 passed, 1 skipped, 2 xfailed in 127.72 s**. The one warning is
+an existing invalid docstring escape in `utils/correction.py`.
 
 ```bash
 MPLCONFIGDIR=/private/tmp/jaxstar-mpl-cache JAXSPEC_REFERENCE_ROOT=../jaxspec \

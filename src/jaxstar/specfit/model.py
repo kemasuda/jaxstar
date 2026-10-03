@@ -55,6 +55,22 @@ def _sample(wavelength, source_wave, flux):
         wavelength, source_wave, flux)
 
 
+def _sample_with_rv(wavelength, source_wave, flux, rv):
+    """Apply the relativistic shift in centered interpolation coordinates.
+
+    Multiplying absolute float32 wavelengths by a factor close to one loses
+    small RV shifts. Relative to a reference wavelength L, interpolate at
+    (wavelength - L) - L*(D-1) on D*(source_wave - L). This is exactly the
+    same Doppler convention, with D-1 rationalized to avoid cancellation.
+    """
+    beta = rv / _C_KMS
+    factor = _doppler_factor(rv)
+    delta = 2 * beta / ((1 - beta) * (factor + 1))
+    reference = source_wave[:, source_wave.shape[-1] // 2:source_wave.shape[-1] // 2 + 1]
+    return _sample((wavelength - reference) - reference * delta[:, None],
+                   (source_wave - reference) * factor[:, None], flux)
+
+
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True, eq=False, init=False)
 class SpecModel:
@@ -201,7 +217,7 @@ class SpecModel:
             raise ValueError("full requires component.rv (effective line-of-sight km/s)")
         rv = _region_parameter(component["rv"], "rv", wave.shape[0])
         _require(jnp.all(jnp.isfinite(rv) & (jnp.abs(rv) < _C_KMS)), "rv must be finite with abs(rv) < c")
-        result = _sample(wavelength, wave * _doppler_factor(rv)[:, None], flux)
+        result = _sample_with_rv(wavelength, wave, flux, rv)
         return result[0] if single else result
 
     __call__ = full
