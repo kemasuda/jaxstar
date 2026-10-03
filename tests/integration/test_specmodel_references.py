@@ -64,6 +64,19 @@ def test_region_parameters_match_equivalent_frozen_low_level_mapping(case):
         np.testing.assert_allclose(actual, expected[stage], rtol=5e-6, atol=1e-6)
 
 
+def test_single_star_dilution_matches_frozen_model(case):
+    component = case.params["components"][0]
+    broad = component["broadening"]
+    params = {**case.params, "dilution": .23}
+    old_params = {**component["atmosphere"], "vsini": broad["vsini"], "zeta": broad["vmacro"],
+                  "u1": broad["u1"], "u2": broad["u2"], "rv": component["rv"],
+                  "wavres": params["instrument"]["resolving_power"], "dilution": .23,
+                  "norm": jnp.ones(len(case.wave)), "slope": jnp.zeros(len(case.wave))}
+    expected = case.old.fluxmodel_multiorder(old_params)
+    actual = SpecModel(case.spectra, vmax=case.vmax)(params, case.wave)
+    np.testing.assert_allclose(actual, expected, rtol=5e-6, atol=1e-6)
+
+
 def test_saved_objective_physical_gradients(case):
     if case.name == "bosz":
         # No saved full-forward gradient oracle exists for BOSZ. Compare its

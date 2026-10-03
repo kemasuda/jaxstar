@@ -1,13 +1,13 @@
 # Provisional spectral-model migration design
 
-Status: provisional engineering direction, 2026-10-02 (Asia/Tokyo).
+Status: provisional engineering direction, 2026-10-03 (Asia/Tokyo).
 This note guides staged migration from frozen `jaxspec` into `jaxstar`; it is
 not a frozen public API or final specification. Revisit higher-level choices
 as each consumer is migrated and benchmarked. Settle only the decisions needed
-for the current milestone. Milestones 1, 2 and 2.5 are complete. Milestone 3a
-implements only the deterministic single-component forward model; Milestone
-3b composition and later fitting/inference remain out of scope. See the
-[SpecModel note](specmodel-core.md) for the implemented API and validation.
+for the current milestone. Milestones 1, 2, 2.5, 3a and 3b are implemented.
+The deterministic model now supports generic fixed-count SB-N composition and
+decomposition; later fitting/inference remains out of scope. See the
+[physics note](specmodel-core.md) and [SB-N note](specmodel-sbn.md) for the API and validation.
 
 ## 1. Context
 
@@ -100,10 +100,10 @@ continuum and likelihood helpers directly, including in joint MIST/spectral
 models. Diagnostics and optional preparation/GP dependencies should not be
 eager runtime requirements for the deterministic core.
 
-### Milestone 3 assumptions and the M3a boundary
+### Milestone 3 assumptions and the deterministic boundary
 
 These assumptions guide the deterministic implementation without authorizing
-M3b composition or later fitting layers:
+later fitting layers:
 
 - Fitting grids are prepared on log-uniform wavelength sampling. Common NPZ
   storage still supports arbitrary valid arrays. Offline raw preparation or a
@@ -147,12 +147,15 @@ accuracy/performance in Milestone 3. Never infer it from detector pixel counts,
 and do not use `R`/`resolving_power` as an alias for numerical sampling. The
 instrumental resolving power remains a separate future model parameter.
 
-### Explicit parity inventory after Milestone 3a
+### Explicit parity inventory after Milestones 3a and 3b
 
-Milestone 3b must retain dilution, generic SB-N combination (including current
-SB2 through the same component path), component spectra and flux ratios. M3a
-requires exactly one component; removing that count restriction later must
-reuse the component physics, rather than introduce `SpecModel2` or duplicate it.
+Milestone 3b implements dilution, generic SB-N combination (including current
+SB2 through the same component path), component spectra and relative flux weights.
+It reuses the M3a component physics; no `SpecModel2` or duplicate pipeline exists.
+Weights are nonnegative relative stellar continuum fluxes, normalized among stars;
+dilution remains the featureless fraction of total light. Both can be region-specific.
+All components use one library; heterogeneous libraries and pixel-dependent light
+ratios are deferred. The tuple length is static under JIT and numerical values dynamic.
 
 Later SpecFit/fitting layers must preserve:
 
@@ -171,7 +174,7 @@ Later SpecFit/fitting layers must preserve:
 - Default NumPyro single/binary models, custom user-written NumPyro models and
   SVI/initialization helpers.
 
-None of these capabilities is implemented in M3a. The intentional omission of
+None of these fitting capabilities is implemented in M3a/M3b. The intentional omission of
 legacy norm/slope from the physical model does not remove the requirement to
 recover and plot continuum-corrected fitted spectra in later SpecFit.
 
@@ -289,11 +292,12 @@ well as residuals, and expose conditional coefficient recovery for predictions.
    validation, common artifact round trips and synthetic accuracy tests.
    Actual full raw-library integration/smoke testing remains a later validation
    TODO on a machine with those libraries, not a blocker for this merge.
-- **Milestone 3a — deterministic single-component model (current scope):** symmetric
+- **Milestone 3a — deterministic single-component model (complete):** symmetric
    intrinsic/broadened/full outputs, combined broadening, relativistic RV,
    dynamic requested wavelength, JIT/gradients, coverage and frozen parity.
-- **Milestone 3b — deterministic composition (not started):** generic SB-N,
-   existing SB2 capability, dilution, component spectra and flux ratios.
+- **Milestone 3b — deterministic composition (implemented):** generic fixed-count SB-N,
+   existing SB2 capability, dilution, component/decomposition spectra and relative
+   stellar flux weights; shared physics, frozen parity and N-scaling benchmark.
 - **Milestone 4 — fit bridge/probabilistic compatibility:** simple construction, masks,
    custom composition, optional GP and default model functions.
 - **Milestone 5 — intentional statistical defaults:** Gaussian/jitter and marginalized

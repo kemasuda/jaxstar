@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -71,10 +72,28 @@ def _sample_with_rv(wavelength, source_wave, flux, rv):
                    (source_wave - reference) * factor[:, None], flux)
 
 
+class SpectralDecomposition(NamedTuple):
+    """JAX PyTree of component spectra and continuum-light accounting.
+
+    Spectra always retain the region axis, including for 1D wavelength input.
+    ``components`` and ``weighted_components`` have shape (N, region, pixel);
+    ``total`` has shape (region, pixel). Weights/fractions have shape (N, region)
+    and dilution has shape (region,). No observational or fitted-continuum state.
+    """
+
+    total: object
+    components: object
+    flux_weights: object
+    stellar_fractions: object
+    light_fractions: object
+    dilution: object
+    weighted_components: object
+
+
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True, eq=False, init=False)
 class SpecModel:
-    """Single-component physical spectrum, independent of observation/fit state.
+    """Deterministic stellar composition, independent of observation/fit state.
 
     ``intrinsic(params, wavelength)``, ``broadened(...)`` and ``full(...)``
     respectively evaluate atmosphere only, atmosphere plus combined broadening,
@@ -82,11 +101,21 @@ class SpecModel:
     Wavelengths are in the prepared library's Angstrom/medium convention, with
     shape (region, pixel); 1D input/output is allowed for one region only.
 
-    Parameters are nested ordinary dict/PyTree data: one entry in ``components``
+    Parameters are nested ordinary dict/PyTree data: each entry in ``components``
     contains scalar ``atmosphere`` coordinates, ``broadening`` with vsini/vmacro/
     u1/u2, and effective ``rv`` in km/s. ``instrument.resolving_power`` specifies
     Gaussian IP resolving power. Post-atmosphere parameters are scalar or one
     per region. Stages only require the parameters they physically use.
+
+    All components use the same library. ``flux_weights`` are finite nonnegative
+    relative stellar continuum fluxes, shape (N,) or (N, region), with a positive
+    sum in every region. A tuple/list may mix scalar and per-region entries.
+    They need not sum to one. ``dilution`` is scalar or per region, in [0, 1),
+    and is the featureless fraction of TOTAL continuum light. Each stage returns
+    ``d + (1-d) * sum(a_i*f_i) / sum(a_i)`` for normalized component spectra.
+    One component defaults to weight 1; multiple components require weights.
+    Dilution defaults to zero. ``decompose`` exposes the individual spectra and
+    fractions. Component count is static under JIT; numerical values are dynamic.
 
     ``vmax`` controls finite kernel support, as in frozen jaxspec. Prepared
     coverage must include that support and the requested RV. No model regridding
@@ -125,13 +154,15 @@ class SpecModel:
                             ("vmax", float(vmax)), ("broadening_operator", operator)):
             object.__setattr__(self, name, value)
 
-    def _atmosphere(self, params):
+    def _components(self, params):
         if not isinstance(params, Mapping) or "components" not in params:
             raise ValueError("params must contain a components tuple/list")
         components = params["components"]
-        if not isinstance(components, (tuple, list)) or len(components) != 1:
-            raise ValueError("Milestone 3a requires exactly one component")
-        component = components[0]
+        if not isinstance(components, (tuple, list)) or not components:
+            raise ValueError("components must be a nonempty tuple/list")
+        return components
+
+    def _atmosphere(self, component):
         if not isinstance(component, Mapping) or "atmosphere" not in component:
             raise ValueError("the component must contain an atmosphere dict")
         atmosphere = component["atmosphere"]
@@ -149,7 +180,7 @@ class SpecModel:
         _require(valid, "atmosphere coordinates must be finite and inside the prepared grid")
         flux = self.spectra.grid.interpolate(coordinates)["flux"]
         _require(jnp.all(jnp.isfinite(flux)), "atmosphere interpolation produced nonfinite flux")
-        return component, flux
+        return flux
 
     def _wavelength(self, wavelength):
         wavelength = jnp.asarray(wavelength)
@@ -193,34 +224,93 @@ class SpecModel:
                  & jnp.all(jnp.isfinite(values)), "broadening operator returned invalid wavelength or flux")
         return wave, values
 
-    def intrinsic(self, params, wavelength):
-        """Atmosphere interpolation and requested-wavelength sampling only."""
+    def _component_spectrum(self, component, params, wavelength, stage):
+        """The common physical path, evaluated once per component."""
+        flux = self._atmosphere(component)
+        wave = self.spectra.wavelength
+        if stage != "intrinsic":
+            wave, flux = self._broaden(component, params, flux)
+        if stage == "full":
+            if "rv" not in component:
+                raise ValueError("full requires component.rv (effective line-of-sight km/s)")
+            rv = _region_parameter(component["rv"], "rv", wave.shape[0])
+            _require(jnp.all(jnp.isfinite(rv) & (jnp.abs(rv) < _C_KMS)), "rv must be finite with abs(rv) < c")
+            return _sample_with_rv(wavelength, wave, flux, rv)
+        return _sample(wavelength, wave, flux)
+
+    def _fractions(self, params, count, dtype):
+        regions = self.spectra.wavelength.shape[0]
+        if "flux_weights" not in params:
+            if count != 1:
+                raise ValueError("multiple components require explicit flux_weights")
+            weights = jnp.ones((1, regions), dtype=dtype)
+        else:
+            value = params["flux_weights"]
+            if isinstance(value, (tuple, list)):
+                if len(value) != count:
+                    raise ValueError(f"flux_weights must have one entry per component ({count})")
+                weights = jnp.stack([_region_parameter(item, "flux_weights entry", regions) for item in value])
+            else:
+                weights = jnp.asarray(value)
+                if weights.shape == (count,):
+                    weights = jnp.broadcast_to(weights[:, None], (count, regions))
+                elif weights.shape != (count, regions):
+                    raise ValueError(f"flux_weights must have shape ({count},) or ({count}, {regions})")
+        sums = jnp.sum(weights, axis=0)
+        _require(jnp.all(jnp.isfinite(weights) & (weights >= 0))
+                 & jnp.all(jnp.isfinite(sums) & (sums > 0)),
+                 "flux_weights must be finite nonnegative with positive finite sum in every region")
+        dilution = _region_parameter(params.get("dilution", jnp.asarray(0, dtype=dtype)), "dilution", regions)
+        _require(jnp.all(jnp.isfinite(dilution) & (dilution >= 0) & (dilution < 1)),
+                 "dilution must be finite with 0 <= dilution < 1")
+        fractions = weights / sums[None, :]
+        return weights, fractions, (1 - dilution)[None, :] * fractions, dilution
+
+    def _evaluate(self, params, wavelength, stage):
         wavelength, single = self._wavelength(wavelength)
-        _, flux = self._atmosphere(params)
-        result = _sample(wavelength, self.spectra.wavelength, flux)
+        components = self._components(params)
+        # Preserve the ordinary M3a path without composition allocations/checks.
+        if len(components) == 1 and "flux_weights" not in params and "dilution" not in params:
+            result = self._component_spectrum(components[0], params, wavelength, stage)
+        else:
+            _, _, fractions, dilution = self._fractions(params, len(components), self.spectra.wavelength.dtype)
+            values = jnp.stack([self._component_spectrum(component, params, wavelength, stage)
+                                for component in components])
+            result = dilution[:, None] + jnp.sum(fractions[:, :, None] * values, axis=0)
         return result[0] if single else result
+
+    def intrinsic(self, params, wavelength):
+        """Compose atmosphere spectra sampled at wavelength; no broadening/RV."""
+        return self._evaluate(params, wavelength, "intrinsic")
 
     def broadened(self, params, wavelength):
-        """Combined stellar/Gaussian broadening and sampling; no RV."""
-        wavelength, single = self._wavelength(wavelength)
-        component, flux = self._atmosphere(params)
-        wave, flux = self._broaden(component, params, flux)
-        result = _sample(wavelength, wave, flux)
-        return result[0] if single else result
+        """Compose combined stellar/Gaussian-broadened spectra; no RV."""
+        return self._evaluate(params, wavelength, "broadened")
 
     def full(self, params, wavelength):
-        """Combined broadening, effective relativistic RV and sampling."""
-        wavelength, single = self._wavelength(wavelength)
-        component, flux = self._atmosphere(params)
-        wave, flux = self._broaden(component, params, flux)
-        if "rv" not in component:
-            raise ValueError("full requires component.rv (effective line-of-sight km/s)")
-        rv = _region_parameter(component["rv"], "rv", wave.shape[0])
-        _require(jnp.all(jnp.isfinite(rv) & (jnp.abs(rv) < _C_KMS)), "rv must be finite with abs(rv) < c")
-        result = _sample_with_rv(wavelength, wave, flux, rv)
-        return result[0] if single else result
+        """Compose combined-broadened, relativistic-RV-shifted spectra."""
+        return self._evaluate(params, wavelength, "full")
 
     __call__ = full
+
+    def decompose(self, params, wavelength, *, stage="full"):
+        """Return component spectra and light accounting, retaining region axes.
+
+        ``stage`` is one of intrinsic/broadened/full, and is static under JIT.
+        ``total = dilution[:, None] + weighted_components.sum(axis=0)``.
+        This shares the same per-component physical implementation as the stage
+        methods; no broadening, interpolation or RV physics is duplicated.
+        """
+        if stage not in ("intrinsic", "broadened", "full"):
+            raise ValueError("stage must be intrinsic, broadened or full")
+        wavelength, _ = self._wavelength(wavelength)
+        components = self._components(params)
+        weights, stellar, light, dilution = self._fractions(params, len(components), self.spectra.wavelength.dtype)
+        values = jnp.stack([self._component_spectrum(component, params, wavelength, stage)
+                            for component in components])
+        weighted = light[:, :, None] * values
+        total = dilution[:, None] + jnp.sum(weighted, axis=0)
+        return SpectralDecomposition(total, values, weights, stellar, light, dilution, weighted)
 
     def tree_flatten(self):
         return (self.spectra, self.velocity_grid), (self.vmax, self.broadening_operator)

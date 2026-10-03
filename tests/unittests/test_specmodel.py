@@ -162,11 +162,13 @@ def test_invalid_post_parameter_shapes(control):
         SpecModel(library)(params, observations(library))
 
 
-@pytest.mark.parametrize("components", [(), ({}, {}), {"atmosphere": {}}])
-def test_component_count_contract(components):
+@pytest.mark.parametrize("components,message", [
+    ((), "nonempty tuple/list"), (({}, {}), "atmosphere dict"),
+    ({"atmosphere": {}}, "nonempty tuple/list")])
+def test_component_count_contract(components, message):
     library = make_library()
-    with pytest.raises(ValueError, match="exactly one component"):
-        SpecModel(library).intrinsic({"components": components}, observations(library))
+    with pytest.raises(ValueError, match=message):
+        SpecModel(library).intrinsic({"components": components, "flux_weights": (1., 1.)}, observations(library))
 
 
 @pytest.mark.parametrize("coordinate", [np.ones(2), np.ones(1)])

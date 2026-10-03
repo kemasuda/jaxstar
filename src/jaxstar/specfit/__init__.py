@@ -10,12 +10,12 @@ from .libraries import (
 )
 from .storage import load_spectral_grid, save_spectral_grid
 from .sampling import is_log_uniform, resample_spectral_grid
-from .model import SpecModel
+from .model import SpecModel, SpectralDecomposition
 
 __all__ = [
     "load_coelho", "load_bosz", "load_tlusty",
     "prepare_coelho", "prepare_bosz", "prepare_tlusty",
     "load_spectral_grid", "save_spectral_grid",
     "is_log_uniform", "resample_spectral_grid",
-    "SpecModel",
+    "SpecModel", "SpectralDecomposition",
 ]
