@@ -313,6 +313,12 @@ these same helpers. A package inference wrapper is optional.
 
 ## 6. Regularized multiplicative Chebyshev continuum (implemented)
 
+The subsequent minimal single-star NumPyro milestone is documented in
+[spectral-inference.md](spectral-inference.md). It uses the same marginalized
+continuum and additive jitter with `model_single` for SVI and NUTS, without
+SpecFit, CCF, iterative masking or GP. GP and empirical/physical convenience
+constraints remain explicit later compatibility work.
+
 After stellar component composition, apply one continuum per observed region:
 `f_pred = f_model * C(wavelength)`, with `C(x) = sum(a_k*T_k(x), k=0..degree)`.
 The free constant term is included once; there is no additional normalization.

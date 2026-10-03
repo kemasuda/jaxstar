@@ -12,6 +12,7 @@ from .storage import load_spectral_grid, save_spectral_grid
 from .sampling import is_log_uniform, resample_spectral_grid
 from .model import SpecModel, SpectralDecomposition
 from .observation import Observation
+from .numpyro_model import model_single, single_star_params
 from .continuum import (
     ContinuumPrior,
     ContinuumPosterior,
@@ -31,6 +32,7 @@ __all__ = [
     "is_log_uniform", "resample_spectral_grid",
     "SpecModel", "SpectralDecomposition",
     "Observation",
+    "model_single", "single_star_params",
     "ContinuumPrior", "ContinuumPosterior",
     "chebyshev_basis", "continuum_design_matrix", "evaluate_continuum",
     "apply_continuum", "continuum_prior",
