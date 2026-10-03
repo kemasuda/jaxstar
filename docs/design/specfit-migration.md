@@ -337,11 +337,11 @@ prior = continuum_prior(sigma_constant=s0, sigma_continuum=sc,
                         degree=4, n_regions=obs.n_regions if obs.ndim == 2 else None)
 logp = marginalized_continuum_log_likelihood(
     obs, model_flux, basis=basis, degree=4,
-    sigma_constant=s0, sigma_continuum=sc,
+    sigma_constant=s0, sigma_continuum=sc, jitter=jitter,
 )
 posterior = continuum_posterior(
     obs, model_flux, basis=basis, degree=4,
-    sigma_constant=s0, sigma_continuum=sc,
+    sigma_constant=s0, sigma_continuum=sc, jitter=jitter,
 )
 continuum = evaluate_continuum(basis, posterior.mean)
 prediction = apply_continuum(model_flux, basis, posterior.mean)
@@ -367,6 +367,15 @@ recurrence `T0=1`, `T1=x`, `Tk=2*x*T(k-1)-T(k-2)` and has shape
 even for one region. Ambiguous coefficient/flux broadcasting is rejected.
 Independent coefficients belong to observed regions, never individual stars.
 
+Both density and posterior functions accept optional `jitter=0.0`, scalar or
+`(n_region,)` (including a length-one region vector for 1D data). It is additive
+absolute Gaussian noise in the same flux units as observation uncertainty:
+`D[i,i]=sigma_obs[i]**2+jitter[region]**2`. Finite nonnegative values are required;
+per-pixel arrays, fractional/model-scaled jitter and arbitrary broadcasting are
+not supported. Jitter is a likelihood nuisance argument, never stored in
+Observation or SpecModel. `jaxstar.specfit` imposes no prior on it; a later
+user-written NumPyro model can choose an appropriate positive prior.
+
 For one region, let `X=f_model[:,None]*basis`, `D=diag(error**2)` on usable
 pixels, and `S=diag(prior.scale)`. Standardize to `Z=D^(-1/2)*X*S`,
 `r=D^(-1/2)*(y-X*mu)` and `H=I+Z.T*Z`. Cholesky solves yield
@@ -380,6 +389,11 @@ logp = sum(logp_region)
 ```
 
 The non-subtractive expression for q avoids Woodbury cancellation. The
+`error` above is always the effective `sqrt(sigma_obs**2+jitter[region]**2)`,
+evaluated with stable `hypot`. It enters both whitening and the Gaussian
+variance determinant, so increasing jitter incurs the full normalization
+penalty. The conditional posterior uses exactly the same effective covariance.
+Default zero jitter reproduces the previous formulation. The
 standardized determinant includes the full continuum-prior determinant
 contribution, equivalent to `logdet(D)+logdet(Lambda)+logdet(Lambda^-1+X.T*D^-1*X)`.
 No normalization terms are dropped, so prior-scale gradients are meaningful.
@@ -393,7 +407,8 @@ data-space spectrum to be reconstructed and plotted after fitting.
 
 Masked entries are neutralized **before** any division, multiplication, square
 or log: excluded y/model flux become zero, and excluded uncertainty becomes
-one. They have zero design/residual weight and do not count toward N or the
+one, with their jitter contribution set to zero before computing effective
+errors. They have zero design/residual weight and do not count toward N or the
 variance determinant. Masked NaN/Inf flux/error values therefore cannot poison
 values or gradients. Fully masked regions contribute zero likelihood and
 return the prior. This does not introduce a separate adjustable fitting mask.
@@ -404,8 +419,21 @@ Degree and optional region-count setup are static; flux, observations and
 scales remain numerical inputs. Tests compare against dense Gaussian references,
 posterior linear algebra, finite differences, masked-NaN gradients and the SB-N
 physical path. `benchmarks/benchmark_continuum.py` provides a synchronized CPU/GPU
-sanity check for ten regions and ~2000 pixels with coefficient/HLO shape checks.
-There is no SpecFit, jitter, GP, inference, or change to SpecModel/Observation.
+sanity check for ten regions and ~2000 pixels with coefficient/HLO shape checks;
+run with `--jitter 0` and `--jitter 0.01` to compare noise choices and include
+jitter differentiation. There is no SpecFit, GP, inference, or change to
+SpecModel/Observation.
+
+The self-contained [synthetic continuum notebook](../../examples/tutorials/continuum.ipynb)
+uses a fixed seed and `model_flux=1`: degree-2 truth, degree-4 analysis, masked
+NaN/Inf data and known additive jitter. Three figures show conditional continuum
+recovery, all coefficient means/uncertainties (including unused a3/a4), and
+separate marginal-likelihood curves for prior scale and jitter. Higher-order
+coefficients may be compatible with zero without being exactly zero. The
+curves retain Gaussian normalization and integrate all five coefficients
+analytically, illustrating possible future hyperparameter inference without
+adding NumPyro or an optimization workflow. Generated figures and executed
+notebook outputs stay in ignored `benchmark-results/continuum-demo/`.
 
 ## 7. Milestones
 

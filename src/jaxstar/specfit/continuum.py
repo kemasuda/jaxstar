@@ -142,7 +142,17 @@ def continuum_prior(*, sigma_constant, sigma_continuum, degree=4, n_regions=None
     return ContinuumPrior(mean[0], scales[0]) if n_regions is None else ContinuumPrior(mean, scales)
 
 
-def _conditional_system(observation, model_flux, sigma_constant, sigma_continuum, degree, basis):
+def _region_jitter(value, count):
+    value = _real_array(value, "jitter")
+    if value.ndim == 0:
+        value = jnp.broadcast_to(value, (count,))
+    elif value.shape != (count,):
+        raise ValueError(f"jitter must be scalar or shape ({count},), got {value.shape}")
+    _require(jnp.all(jnp.isfinite(value) & (value >= 0)), "jitter must be finite and nonnegative")
+    return value
+
+
+def _conditional_system(observation, model_flux, sigma_constant, sigma_continuum, degree, basis, jitter):
     if not isinstance(observation, Observation):
         raise TypeError("observation must be an Observation")
     degree = _degree(degree)
@@ -154,9 +164,10 @@ def _conditional_system(observation, model_flux, sigma_constant, sigma_continuum
         raise ValueError("basis shape must be Observation.shape + (degree + 1,)")
     # Normal JAX promotion, including weak Python scalar prior scales. Do not
     # promote float32 observations merely because the scales are Python floats.
+    jitter = _region_jitter(jitter, observation.n_regions)
     dtype = jnp.result_type(flux, basis, observation.flux, observation.uncertainty,
                             _real_array(sigma_constant, "sigma_constant"),
-                            _real_array(sigma_continuum, "sigma_continuum"))
+                            _real_array(sigma_continuum, "sigma_continuum"), jitter)
     prior = continuum_prior(sigma_constant=jnp.asarray(sigma_constant, dtype=dtype),
                             sigma_continuum=jnp.asarray(sigma_continuum, dtype=dtype),
                             degree=degree, n_regions=None if observation.ndim == 1 else observation.n_regions)
@@ -165,6 +176,12 @@ def _conditional_system(observation, model_flux, sigma_constant, sigma_continuum
     # This prevents NaNs in inactive branches from poisoning reverse-mode AD.
     y = jnp.where(usable, jnp.asarray(observation.flux, dtype=dtype), 0)
     error = jnp.where(usable, jnp.asarray(observation.uncertainty, dtype=dtype), 1)
+    jitter = jitter.astype(dtype)
+    per_pixel_jitter = jitter[0] if observation.ndim == 1 else jitter[:, None]
+    # Excluded errors stay exactly one even with nonzero regional jitter, so
+    # they contribute no Gaussian determinant term. hypot is the stable
+    # evaluation of sqrt(sigma_obs**2 + jitter**2), including at jitter=0.
+    error = jnp.hypot(error, jnp.where(usable, per_pixel_jitter, 0))
     flux = jnp.where(usable, flux.astype(dtype), 0)
     _require(jnp.all(jnp.isfinite(flux)), "model_flux must be finite on usable pixels")
     design = continuum_design_matrix(flux, basis.astype(dtype))
@@ -179,24 +196,28 @@ def _conditional_system(observation, model_flux, sigma_constant, sigma_continuum
 
 
 def marginalized_continuum_log_likelihood(observation, model_flux, *, sigma_constant,
-                                         sigma_continuum, degree=4, basis=None):
+                                         sigma_continuum, degree=4, basis=None, jitter=0.0):
     """Fully normalized Gaussian density, summed over independent regions.
 
-    Integrates a~N(mu,diag(scale**2)) in y~N(X*a,diag(uncertainty**2)).
+    Integrates a~N(mu,diag(scale**2)) in y~N(X*a,D), with diagonal
+    D[i,i]=uncertainty[i]**2+jitter[region]**2. Jitter is additive absolute
+    noise in the same flux units as uncertainty, scalar or (n_region,),
+    finite nonnegative. It has no prior here and is not observation/model state.
     With Z=D**(-1/2)*X*diag(scale), r=D**(-1/2)*(y-X*mu),
     H=I+Z.T*Z and delta=H**(-1)*Z.T*r, the residual quadratic is evaluated
     stably as ||r-Z*delta||**2+||delta||**2, avoiding subtractive Woodbury
     cancellation. logdet = 2*sum(log(error)) + 2*sum(log(diag(chol(H)))).
     The standardized system contains the complete prior determinant contribution.
     Only usable pixels contribute to N*log(2*pi). Fully masked regions contribute
-    zero. No pixel-by-pixel covariance, jitter or numerical ridge is constructed.
+    zero. Both whitening and the Gaussian determinant use the effective error
+    sqrt(uncertainty**2+jitter**2). No pixel covariance or numerical ridge.
 
     Optional basis permits setup-time caching; its last dimension must match
     the static degree. Invalid concrete scales raise ValueError; invalid traced
     scales raise a runtime JAX error reporting the same validation message.
     """
     _, scaled, residual, cholesky, delta, error, usable = _conditional_system(
-        observation, model_flux, sigma_constant, sigma_continuum, degree, basis)
+        observation, model_flux, sigma_constant, sigma_continuum, degree, basis, jitter)
     fitted_residual = residual - jnp.einsum("...ik,...k->...i", scaled, delta)
     quadratic = jnp.sum(fitted_residual ** 2, axis=-1) + jnp.sum(delta ** 2, axis=-1)
     logdet = 2 * (jnp.sum(jnp.log(error), axis=-1)
@@ -206,16 +227,18 @@ def marginalized_continuum_log_likelihood(observation, model_flux, *, sigma_cons
 
 
 def continuum_posterior(observation, model_flux, *, sigma_constant,
-                        sigma_continuum, degree=4, basis=None):
+                        sigma_continuum, degree=4, basis=None, jitter=0.0):
     """Return conditional coefficient mean and covariance via Cholesky solves.
 
     Shapes are (degree+1,), (degree+1,degree+1) for 1D data; a leading
     independent region axis is retained for 2D data. Evaluate the recovered
     continuum with evaluate_continuum(basis, posterior.mean), or its spectrum
     with apply_continuum(model_flux, basis, posterior.mean).
+    Uses the same uncertainty**2+jitter[region]**2 diagonal covariance as the
+    marginalized likelihood, with scalar or per-region additive absolute jitter.
     """
     prior, _, _, cholesky, delta, _, _ = _conditional_system(
-        observation, model_flux, sigma_constant, sigma_continuum, degree, basis)
+        observation, model_flux, sigma_constant, sigma_continuum, degree, basis, jitter)
     identity = jnp.broadcast_to(jnp.eye(prior.scale.shape[-1], dtype=prior.scale.dtype), cholesky.shape)
     standardized_covariance = cho_solve((cholesky, True), identity)
     covariance = prior.scale[..., :, None] * standardized_covariance * prior.scale[..., None, :]

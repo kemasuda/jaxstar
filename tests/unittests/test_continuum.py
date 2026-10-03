@@ -35,11 +35,12 @@ def problem(pixels=13, regions=None, dtype=np.float64):
     return Observation(wave, flux, error, mask), jnp.asarray(model)
 
 
-def dense_reference(obs, model, degree, s0, sc):
+def dense_reference(obs, model, degree, s0, sc, jitter=0.):
     basis = np.asarray(chebyshev_basis(obs.wavelength, degree))
     model = np.asarray(model)
     region_count = obs.n_regions
     s0, sc = np.broadcast_to(s0, (region_count,)), np.broadcast_to(sc, (region_count,))
+    jitter = np.broadcast_to(jitter, (region_count,))
     if obs.ndim == 1:
         basis, model = basis[None], model[None]
     values, means, covariances = [], [], []
@@ -47,6 +48,7 @@ def dense_reference(obs, model, degree, s0, sc):
         usable = np.atleast_2d(obs.valid)[i]
         y = np.atleast_2d(obs.flux)[i, usable]
         error = np.atleast_2d(obs.uncertainty)[i, usable]
+        error = np.hypot(error, jitter[i])
         design = model[i, usable, None] * basis[i, usable]
         mean = np.zeros(degree+1)
         mean[0] = 1
@@ -262,7 +264,8 @@ def test_degree_zero_strong_continuum_avoids_quadratic_cancellation(dtype):
     np.testing.assert_allclose(value, expected, rtol=2e-7, atol=2e-5)
 
 
-def test_end_to_end_specmodel_eager_jit_physical_gradients():
+@pytest.mark.parametrize("jitter", [0., .005])
+def test_end_to_end_specmodel_eager_jit_physical_gradients(jitter):
     from test_specmodel import make_library, parameters
 
     library = make_library(pixels=513)
@@ -277,7 +280,7 @@ def test_end_to_end_specmodel_eager_jit_physical_gradients():
     coefficients = jnp.array([[1.02, .01, -.005, 0., .002], [.98, -.02, 0., .001, 0.]])
     obs = Observation(wave, apply_continuum(physical, basis, coefficients), jnp.full(wave.shape, .01))
     fn = lambda m, p, o, b: marginalized_continuum_log_likelihood(o, m(p, o.wavelength), basis=b,
-                                                               sigma_constant=.1, sigma_continuum=.03)
+                                                               sigma_constant=.1, sigma_continuum=.03, jitter=jitter)
     eager = fn(model, params, obs, basis)
     compiled = jax.jit(fn)(model, params, obs, basis)
     np.testing.assert_allclose(compiled, eager, rtol=1e-12, atol=1e-10)
@@ -366,3 +369,136 @@ def test_compiled_coefficient_matrices_have_no_pixel_covariance():
     seen = list(shapes(program))
     assert (2, 5, 5) in seen
     assert not any(shape.count(37) > 1 for shape in seen)
+
+
+@pytest.mark.parametrize("dtype, reference", [(np.float32, 43.680233001708984),
+                                              (np.float64, 43.67998215950677)])
+def test_zero_jitter_committed_reference_and_default_parity(dtype, reference):
+    # Captured from 24b690a, before adding jitter, for the same generated fixture.
+    obs, model = problem(regions=2, dtype=dtype)
+    options = dict(sigma_constant=.1, sigma_continuum=.03)
+    default = marginalized_continuum_log_likelihood(obs, model, **options)
+    np.testing.assert_allclose(default, reference, rtol=1e-7, atol=1e-11)
+    original_posterior = continuum_posterior(obs, model, **options)
+    for jitter in (0., np.zeros(2, dtype=dtype)):
+        np.testing.assert_array_equal(marginalized_continuum_log_likelihood(obs, model, jitter=jitter, **options), default)
+        posterior = continuum_posterior(obs, model, jitter=jitter, **options)
+        np.testing.assert_array_equal(posterior.mean, original_posterior.mean)
+        np.testing.assert_array_equal(posterior.covariance, original_posterior.covariance)
+
+
+@pytest.mark.parametrize("degree", [0, 4])
+@pytest.mark.parametrize("pixels", [3, 17])
+@pytest.mark.parametrize("regions", [None, 2])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_nonzero_jitter_dense_likelihood_and_posterior(degree, pixels, regions, dtype):
+    obs, model = problem(pixels, regions, dtype)
+    jitter = .025 if regions is None else np.array([.005, .04], dtype=dtype)
+    s0 = .1 if regions is None else np.array([.1, .15], dtype=dtype)
+    options = dict(sigma_constant=s0, sigma_continuum=.03, degree=degree, jitter=jitter)
+    expected, mean, covariance = dense_reference(obs, model, degree, s0, .03, jitter)
+    value = marginalized_continuum_log_likelihood(obs, model, **options)
+    posterior = continuum_posterior(obs, model, **options)
+    tolerance = dict(rtol=3e-6, atol=3e-6) if dtype == np.float32 else dict(rtol=3e-11, atol=3e-11)
+    np.testing.assert_allclose(value, expected, **tolerance)
+    np.testing.assert_allclose(posterior.mean, mean, **tolerance)
+    np.testing.assert_allclose(posterior.covariance, covariance, **tolerance)
+    assert value.dtype == dtype and posterior.mean.dtype == dtype
+
+
+def test_jitter_normalization_penalty_with_exactly_zero_residuals():
+    # X=0 and y=0 eliminate every residual/prior term: only logdet(D) changes.
+    obs = Observation(np.linspace(5000., 5002., 9), np.zeros(9), np.full(9, .01))
+    model = jnp.zeros(9)
+    values = []
+    for jitter in (0., .02, .2):
+        value = marginalized_continuum_log_likelihood(obs, model, sigma_constant=.1, sigma_continuum=.03, jitter=jitter)
+        expected = -.5*9*np.log(2*np.pi*(.01**2+jitter**2))
+        np.testing.assert_allclose(value, expected, rtol=1e-13, atol=1e-13)
+        values.append(value)
+    assert values[0] > values[1] > values[2]
+
+
+def test_scalar_jitter_region_equivalence_posterior_broadening_and_flux_units():
+    obs, model = problem(regions=2)
+    options = dict(sigma_constant=.1, sigma_continuum=.03)
+    value = marginalized_continuum_log_likelihood(obs, model, jitter=.02, **options)
+    np.testing.assert_array_equal(value, marginalized_continuum_log_likelihood(obs, model, jitter=[.02, .02], **options))
+    zero = continuum_posterior(obs, model, jitter=0., **options)
+    nonzero = continuum_posterior(obs, model, jitter=[.02, .04], **options)
+    assert np.all(np.linalg.eigvalsh(nonzero.covariance-zero.covariance) > 0)
+    assert not np.allclose(zero.mean, nonzero.mean, rtol=1e-7, atol=1e-7)
+    noisy = continuum_posterior(obs, model, jitter=1e4, **options)
+    prior = continuum_prior(n_regions=2, **options)
+    np.testing.assert_allclose(noisy.mean, prior.mean, atol=1e-9)
+    np.testing.assert_allclose(noisy.covariance, prior.covariance, atol=1e-9)
+    # Absolute flux-unit jitter rescales with the data, independently of model f.
+    scale = 7.
+    scaled = Observation(obs.wavelength, obs.flux*scale, obs.uncertainty*scale, obs.mask)
+    scaled_value = marginalized_continuum_log_likelihood(scaled, model*scale, jitter=.02*scale, **options)
+    np.testing.assert_allclose(scaled_value, value-np.sum(obs.valid)*np.log(scale), rtol=1e-12)
+    scaled_posterior = continuum_posterior(scaled, model*scale, jitter=.02*scale, **options)
+    original = continuum_posterior(obs, model, jitter=.02, **options)
+    np.testing.assert_allclose(scaled_posterior.mean, original.mean, atol=1e-13)
+    np.testing.assert_allclose(scaled_posterior.covariance, original.covariance, atol=1e-13)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_jitter_masked_nan_all_masked_region_and_gradients(dtype):
+    original, model = problem(regions=2, dtype=dtype)
+    mask = original.mask.copy()
+    mask[1] = True
+    flux, error = original.flux.copy(), original.uncertainty.copy()
+    flux[mask], error[mask] = np.nan, np.inf
+    dirty = Observation(original.wavelength, flux, error, mask)
+    flux[mask], error[mask] = np.inf, np.nan
+    changed = Observation(original.wavelength, flux, error, mask)
+    fn = lambda o,f,s0,sc,j: marginalized_continuum_log_likelihood(o,f,sigma_constant=s0,sigma_continuum=sc,jitter=j)
+    jitter = jnp.array([.015, .03], dtype=dtype)
+    value, gradient = jax.jit(jax.value_and_grad(fn, argnums=(1, 2, 3, 4)))(dirty, model, .1, .03, jitter)
+    assert np.isfinite(value) and all(np.all(np.isfinite(x)) for x in gradient)
+    np.testing.assert_array_equal(gradient[0][mask], 0)
+    np.testing.assert_array_equal(gradient[3][1], 0)
+    np.testing.assert_array_equal(fn(dirty, model, .1, .03, jitter), fn(changed, model, .1, .03, jitter))
+    expected, mean, covariance = dense_reference(dirty, model, 4, .1, .03, jitter)
+    tolerance = dict(rtol=3e-6, atol=3e-6) if dtype == np.float32 else dict(rtol=3e-11, atol=3e-11)
+    np.testing.assert_allclose(value, expected, **tolerance)
+    posterior = jax.jit(lambda o,f,j: continuum_posterior(o,f,sigma_constant=.1,sigma_continuum=.03,jitter=j))(changed,model,jitter)
+    np.testing.assert_allclose(posterior.mean, mean, **tolerance)
+    np.testing.assert_allclose(posterior.covariance, covariance, **tolerance)
+    prior = continuum_prior(sigma_constant=jnp.asarray(.1, dtype=dtype),
+                            sigma_continuum=jnp.asarray(.03, dtype=dtype))
+    np.testing.assert_array_equal(posterior.mean[1], prior.mean)
+    np.testing.assert_array_equal(posterior.covariance[1], prior.covariance)
+
+
+def test_jitter_jit_grad_vmap_and_finite_difference():
+    obs, model = problem(regions=2)
+    fn = lambda f,s0,sc,j: marginalized_continuum_log_likelihood(obs,f,sigma_constant=s0,sigma_continuum=sc,jitter=j)
+    value, gradients = jax.jit(jax.value_and_grad(fn,argnums=(0, 1, 2, 3)))(model,.1,.03,.02)
+    assert np.isfinite(value) and all(np.all(np.isfinite(x)) for x in gradients)
+    step = 1e-6
+    finite = (fn(model,.1,.03,.02+step)-fn(model,.1,.03,.02-step))/(2*step)
+    np.testing.assert_allclose(gradients[3],finite,rtol=1e-7,atol=1e-6)
+    np.testing.assert_array_equal(jax.grad(fn,argnums=3)(model,.1,.03,0.),0.)
+    jitters = jnp.array([[.005,.01],[.015,.02],[.025,.03]])
+    compiled = jax.jit(jax.vmap(lambda j: fn(model,.1,.03,j)))(jitters)
+    expected = jnp.stack([fn(model,.1,.03,j) for j in jitters])
+    np.testing.assert_allclose(compiled,expected,rtol=1e-12,atol=1e-12)
+    posterior = jax.jit(jax.vmap(lambda j: continuum_posterior(obs,model,sigma_constant=.1,sigma_continuum=.03,jitter=j)))(jitters)
+    assert posterior.mean.shape == (3,2,5) and np.all(np.isfinite(posterior.covariance))
+
+
+@pytest.mark.parametrize("jitter", [-.01, np.nan, np.inf, [0., .01, .02], np.ones((2,13)), np.ones((2,1))])
+def test_jitter_validation(jitter):
+    obs, model = problem(regions=2)
+    for function in (marginalized_continuum_log_likelihood, continuum_posterior):
+        with pytest.raises(ValueError, match="jitter"):
+            function(obs, model, sigma_constant=.1, sigma_continuum=.03, jitter=jitter)
+
+
+def test_jitter_jit_validation():
+    obs, model = problem()
+    fn = jax.jit(lambda j: marginalized_continuum_log_likelihood(obs,model,sigma_constant=.1,sigma_continuum=.03,jitter=j))
+    with pytest.raises(Exception, match="jitter must be finite and nonnegative"):
+        fn(-.01).block_until_ready()
