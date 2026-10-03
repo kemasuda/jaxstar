@@ -87,7 +87,7 @@ These are candidate boundaries, not commitments to exact names or signatures.
 | --- | --- |
 | Loaders/builders | Library schemas, wavelength units/medium, normalization, preparation, validation and provenance; construct the generic numerical grid. |
 | `PreparedSpectra` or equivalent | Thin `RectilinearGrid` plus model wavelengths, region identifiers and spectral metadata. Loader return type; advanced construction may be exposed. Name/public visibility remain open. No second interpolation system. |
-| `Observation` | Observed wavelength, flux, uncertainty, exclusion mask and labels; optional nominal instrument metadata. Useful for advanced/multiple observations, normally created internally for routine use. No required pixel edges. |
+| `Observation` | Immutable measured wavelength, flux, uncertainty, data-level exclusion mask and optional region/order/exposure labels. No resolving power or other model/instrument parameters. No required pixel edges. |
 | `SpecModel` | M3a: intrinsic interpolation, combined broadening/limb darkening/Gaussian IP, relativistic RV and requested-wavelength sampling. M3b: generic component mixing and dilution. No observed flux/errors/masks, continuum or priors. |
 | `SpecFit` | Lightweight observation/model bridge, region association, fitting masks, evaluation/likelihood conveniences and diagnostic delegation. Accepts arrays directly. Does not own priors or sampler logic. |
 | Continuum helpers | Deterministic basis/correction, prior-scale inputs and conditional coefficient recovery; usable with sampled or marginalized coefficients. |
@@ -99,6 +99,60 @@ Users must be able to bypass `SpecFit` and combine intrinsic/component spectra,
 continuum and likelihood helpers directly, including in joint MIST/spectral
 models. Diagnostics and optional preparation/GP dependencies should not be
 eager runtime requirements for the deterministic core.
+
+### Observed-data container
+
+The small public container is available independently of fitting:
+
+```python
+from jaxstar.specfit import Observation
+
+obs = Observation(
+    wavelength=wave,
+    flux=flux,
+    uncertainty=err,
+    mask=mask,                   # True excludes a pixel; None means all usable
+    region=("blue", "red"),      # optional labels, one per region
+    order=(8, 8),                # two segments may belong to the same order
+    exposure="epoch1",           # optional identifying label for this observation
+)
+prediction = model(params, obs.wavelength)
+```
+
+`wavelength`, `flux`, `uncertainty` and the defaulted Boolean mask have identical,
+nonempty `(n_pixel,)` or `(n_region, n_pixel)` shapes. No broadcasting, reshaping,
+reordering or ragged arrays are introduced. Wavelength is finite, positive and
+strictly increasing within every row, including excluded pixels, so it is a
+valid evaluation input for `SpecModel`. Units/medium must match the chosen
+prepared model library. Flux and uncertainty are finite on usable pixels, with
+positive uncertainty. Excluded flux/uncertainty may be nonfinite or invalid and
+are preserved without replacement. An entirely excluded observation is allowed;
+a later fitting layer can require usable data. Numeric 0/1 masks are safely
+converted to Boolean without inversion; other numeric/string casts are rejected.
+
+NumPy/list inputs are copied into read-only arrays without precision promotion
+or truncation; JAX arrays retain their dtype/device and are already immutable.
+No global x64 setting is changed. The four numerical arrays are dynamic PyTree
+leaves. JAX transformations follow the caller's precision setting (including
+float64 canonicalization when x64 is disabled). Construction validates concrete
+data before JIT. Optional `region` and `order` are independent static tuples of
+string/integer identifiers, one per row (also length one for 1D data); duplicates
+are allowed. `exposure` is one nonempty static string or None. Convenience
+properties are `shape`, `ndim`, `n_regions`, `n_pixels` and `valid = ~mask`.
+
+The responsibility split is:
+
+- Prepared spectral grids: model-library data and model wavelengths.
+- `SpecModel`: deterministic physical forward model, still callable without an
+  `Observation` as `model(params, wavelength)`.
+- `Observation`: measured arrays and their data-level exclusion mask/labels.
+- Future `SpecFit`: observation/model association, a separate adjustable fitting
+  mask, continuum and likelihood. This layer remains unimplemented.
+
+`Observation` intentionally does not store resolving power. Resolving power is
+a forward-model/instrument parameter and may be fixed or inferred independently
+of the observed spectral arrays. No model parameters, plotting, file I/O,
+likelihood, continuum, inference or multi-exposure framework is added here.
 
 ### Milestone 3 assumptions and the deterministic boundary
 
@@ -323,7 +377,8 @@ tests. Keep existing MIST first-use download behavior and numerical contracts.
 These are not yet frozen:
 
 - Final `SpecFit` API and exact spectral-container name/public visibility.
-- Exact `Observation` API and multiple-observation/region association surface.
+- Multiple-observation/region association and observation-construction conveniences
+  in the future `SpecFit` layer; the data-only `Observation` API is implemented above.
 - Continuum configuration, scale defaults and grouping/sharing surface.
 - Final diagnostics/inference-helper organization and optional GP public API.
 - Higher-level fitting orchestration under JAX, preserving the model's dynamic

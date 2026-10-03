@@ -1,4 +1,4 @@
-"""Spectral preparation, persistent grids and deterministic component modeling."""
+"""Spectral grids, deterministic component modeling and measured observations."""
 
 from .libraries import (
     load_bosz,
@@ -11,6 +11,7 @@ from .libraries import (
 from .storage import load_spectral_grid, save_spectral_grid
 from .sampling import is_log_uniform, resample_spectral_grid
 from .model import SpecModel, SpectralDecomposition
+from .observation import Observation
 
 __all__ = [
     "load_coelho", "load_bosz", "load_tlusty",
@@ -18,4 +19,5 @@ __all__ = [
     "load_spectral_grid", "save_spectral_grid",
     "is_log_uniform", "resample_spectral_grid",
     "SpecModel", "SpectralDecomposition",
+    "Observation",
 ]
