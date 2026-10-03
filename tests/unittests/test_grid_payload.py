@@ -212,8 +212,8 @@ def test_payload_piecewise_gradients_and_endpoints_match_scalar_path(axis):
     (np.float32, np.float64), (np.float64, np.float32), (np.float64, np.float64),
 ], ids=["field32-query64", "field64-query32", "field64-query64"])
 @pytest.mark.parametrize("query", [2.0, 2.123456789], ids=["midpoint", "non-dyadic"])
-def test_payload_mixed_dtypes_retain_field_precision(field_dtype, coordinate_dtype, query):
-    with jax.experimental.enable_x64():
+def test_payload_mixed_dtypes_retain_field_precision(field_dtype, coordinate_dtype, query, x64_context):
+    with x64_context():
         axis = np.array([0, 1, 3], dtype=coordinate_dtype)
         values = np.array([[1.000000001, 2], [4.000000003, 8], [10.000000009, 20]], dtype=field_dtype)
         grid = RectilinearGrid(axes={"x": axis}, fields={

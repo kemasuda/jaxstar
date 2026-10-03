@@ -4,8 +4,10 @@ Status: provisional engineering direction, 2026-10-02 (Asia/Tokyo).
 This note guides staged migration from frozen `jaxspec` into `jaxstar`; it is
 not a frozen public API or final specification. Revisit higher-level choices
 as each consumer is migrated and benchmarked. Settle only the decisions needed
-for the current milestone. Milestones 1 and 2 are complete; Milestone 2.5 is
-the current preparation scope. Milestone 3 has not started.
+for the current milestone. Milestones 1, 2 and 2.5 are complete. Milestone 3a
+implements only the deterministic single-component forward model; Milestone
+3b composition and later fitting/inference remain out of scope. See the
+[SpecModel note](specmodel-core.md) for the implemented API and validation.
 
 ## 1. Context
 
@@ -50,8 +52,9 @@ pass.
   `dlnlambda=velocity_step/299792.458`; it is numerical model sampling,
   independent of instrumental resolving power and observed detector pixels.
 - Use a deterministic physical boundary compatible with future SB-N components.
-  Component count may be static per compiled model. The static/dynamic JAX
-  treatment of `SpecModel` itself remains undecided.
+  Component count may be static per compiled model. M3a uses a small dynamic
+  PyTree for `SpecModel`; numerical library arrays remain ordinary arguments,
+  with callable/configuration metadata static.
 - Treat Korg as an offline/pre-inference grid builder. Inference consumes its
   prepared numerical grid entirely in JAX, without calling Korg per likelihood
   evaluation. Local-response interpolation is deferred.
@@ -85,7 +88,7 @@ These are candidate boundaries, not commitments to exact names or signatures.
 | Loaders/builders | Library schemas, wavelength units/medium, normalization, preparation, validation and provenance; construct the generic numerical grid. |
 | `PreparedSpectra` or equivalent | Thin `RectilinearGrid` plus model wavelengths, region identifiers and spectral metadata. Loader return type; advanced construction may be exposed. Name/public visibility remain open. No second interpolation system. |
 | `Observation` | Observed wavelength, flux, uncertainty, exclusion mask and labels; optional nominal instrument metadata. Useful for advanced/multiple observations, normally created internally for routine use. No required pixel edges. |
-| `SpecModel` | Intrinsic interpolation, component broadening, limb darkening, RV, instrumental response, point sampling, component mixing and dilution. Receives target geometry and instrument parameters when evaluated; does not own observed flux/errors/masks or priors. |
+| `SpecModel` | M3a: intrinsic interpolation, combined broadening/limb darkening/Gaussian IP, relativistic RV and requested-wavelength sampling. M3b: generic component mixing and dilution. No observed flux/errors/masks, continuum or priors. |
 | `SpecFit` | Lightweight observation/model bridge, region association, fitting masks, evaluation/likelihood conveniences and diagnostic delegation. Accepts arrays directly. Does not own priors or sampler logic. |
 | Continuum helpers | Deterministic basis/correction, prior-scale inputs and conditional coefficient recovery; usable with sampled or marginalized coefficients. |
 | Likelihood helpers | Independently callable Gaussian/marginalized densities and optional GP density/prediction. No sampling sites or sampler execution. |
@@ -97,10 +100,10 @@ continuum and likelihood helpers directly, including in joint MIST/spectral
 models. Diagnostics and optional preparation/GP dependencies should not be
 eager runtime requirements for the deterministic core.
 
-### Current Milestone 3 assumptions after Milestone 2.5
+### Milestone 3 assumptions and the M3a boundary
 
-Record these assumptions now; none authorizes forward-model implementation in
-Milestone 2.5:
+These assumptions guide the deterministic implementation without authorizing
+M3b composition or later fitting layers:
 
 - Fitting grids are prepared on log-uniform wavelength sampling. Common NPZ
   storage still supports arbitrary valid arrays. Offline raw preparation or a
@@ -121,10 +124,10 @@ Milestone 2.5:
   IP abstraction is selected yet.
 - Future custom broadening, including numerical/HEALPix implementations, should
   be possible without rewriting the whole model. No such operator is added now.
-- Whether `SpecModel` itself is static or dynamic under JAX remains open. Large
-  numerical library arrays must not be unnecessarily captured as compile-time
-  constants; the existing grid/carrier dynamic PyTree leaves support either
-  later choice.
+- M3a uses a small model PyTree containing the existing dynamic grid/carrier
+  leaves and velocity arrays. Pass it explicitly to JIT to avoid capturing
+  large library arrays as compile-time constants. Higher-level fitting object
+  compilation choices remain deferred.
 
 The intended offline workflow is:
 
@@ -143,6 +146,34 @@ the velocity scales needed for broadening/RV calculations and validate
 accuracy/performance in Milestone 3. Never infer it from detector pixel counts,
 and do not use `R`/`resolving_power` as an alias for numerical sampling. The
 instrumental resolving power remains a separate future model parameter.
+
+### Explicit parity inventory after Milestone 3a
+
+Milestone 3b must retain dilution, generic SB-N combination (including current
+SB2 through the same component path), component spectra and flux ratios. M3a
+requires exactly one component; removing that count restriction later must
+reuse the component physics, rather than introduce `SpecModel2` or duplicate it.
+
+Later SpecFit/fitting layers must preserve:
+
+- Observed/model region association and coverage validation, initial observation
+  masks, iterative fitting/outlier masks.
+- Current linear continuum compatibility and the new Chebyshev path.
+- The actual fitted data-space model including continuum: separately expose
+  `fit.physical_model(...)`, `fit.continuum(...)` and `fit.model(...)`, or an
+  equivalent API. Residual/model plotting must show the fitted data-space model.
+  Analytically marginalized Chebyshev coefficients must still permit an
+  appropriate conditional continuum reconstruction for visualization.
+- Single-star CCF and binary CCF behavior; residual/model plotting and diagnostics.
+- Gaussian noise with optional jitter; optional GP likelihood and GP predictions.
+- Useful empirical vmic/vmacro relations, q1/q2 limb-darkening convenience and
+  physical-logg constraints.
+- Default NumPyro single/binary models, custom user-written NumPyro models and
+  SVI/initialization helpers.
+
+None of these capabilities is implemented in M3a. The intentional omission of
+legacy norm/slope from the physical model does not remove the requirement to
+recover and plot continuum-corrected fitted spectra in later SpecFit.
 
 ## 4. Capability-preservation principle
 
@@ -253,14 +284,16 @@ well as residuals, and expose conditional coefficient recovery for predictions.
 - **Milestone 2 — library adapters/data contract (complete):** Coelho/BOSZ/TLUSTY preparation,
    common storage/runtime loading, metadata and intrinsic evaluation; compare
    against frozen grid references.
-- **Milestone 2.5 — log-uniform fitting-grid preparation (current scope):** direct raw
+- **Milestone 2.5 — log-uniform fitting-grid preparation (complete):** direct raw
    preparation and one-time library-agnostic conversion, numerical sampling
    validation, common artifact round trips and synthetic accuracy tests.
    Actual full raw-library integration/smoke testing remains a later validation
    TODO on a machine with those libraries, not a blocker for this merge.
-- **Milestone 3 — unified deterministic physical model:** single/SB2/SB-N, existing
-   broadening/limb darkening/RV/IP, runtime resolution, point sampling and
-   mixing/dilution. Compare values and physical gradients.
+- **Milestone 3a — deterministic single-component model (current scope):** symmetric
+   intrinsic/broadened/full outputs, combined broadening, relativistic RV,
+   dynamic requested wavelength, JIT/gradients, coverage and frozen parity.
+- **Milestone 3b — deterministic composition (not started):** generic SB-N,
+   existing SB2 capability, dilution, component spectra and flux ratios.
 - **Milestone 4 — fit bridge/probabilistic compatibility:** simple construction, masks,
    custom composition, optional GP and default model functions.
 - **Milestone 5 — intentional statistical defaults:** Gaussian/jitter and marginalized
@@ -289,8 +322,8 @@ These are not yet frozen:
 - Exact `Observation` API and multiple-observation/region association surface.
 - Continuum configuration, scale defaults and grouping/sharing surface.
 - Final diagnostics/inference-helper organization and optional GP public API.
-- Static/dynamic treatment of the future `SpecModel` under JAX, without baking
-  large numerical library arrays into compile-time constants.
+- Higher-level fitting orchestration under JAX, preserving the model's dynamic
+  numerical library arrays rather than baking them into compile-time constants.
 - Future detector integration and optical/empirical LSF response convention.
 - Later Korg preparation API and full calibrated absolute-flux handling.
 

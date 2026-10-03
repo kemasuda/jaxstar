@@ -34,8 +34,8 @@ CASES = {
 
 
 @pytest.fixture(scope="module", autouse=True)
-def precision():
-    with jax.experimental.enable_x64():
+def precision(x64_context):
+    with x64_context():
         yield
 
 

@@ -34,8 +34,8 @@ LOADERS = {"coelho": load_coelho, "bosz": load_bosz, "tlusty": load_tlusty}
 
 
 @pytest.fixture(autouse=True)
-def precision():
-    with jax.experimental.enable_x64():
+def precision(x64_context):
+    with x64_context():
         yield
 
 
@@ -227,9 +227,9 @@ def test_coelho_missing_alpha_has_only_an_explicit_zero_singleton(tmp_path):
         load_coelho(path)
 
 
-def test_loaders_follow_existing_jax_dtype_canonicalization(prepared):
+def test_loaders_follow_existing_jax_dtype_canonicalization(prepared, x64_context):
     name, _, paths, _, _ = prepared
-    with jax.experimental.disable_x64():
+    with x64_context(False):
         library = LOADERS[name](paths)
         assert library.grid.field("flux").values.dtype == jnp.float32
         assert library.wavelength.dtype == jnp.float32
