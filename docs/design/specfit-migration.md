@@ -1,12 +1,13 @@
 # Provisional spectral-model migration design
 
-Status: provisional engineering direction, 2026-10-03 (Asia/Tokyo).
+Status: provisional engineering direction, 2026-10-04 (Asia/Tokyo).
 This note guides staged migration from frozen `jaxspec` into `jaxstar`; it is
 not a frozen public API or final specification. Revisit higher-level choices
 as each consumer is migrated and benchmarked. Settle only the decisions needed
 for the current milestone. Milestones 1, 2, 2.5, 3a and 3b are implemented.
 The deterministic model now supports generic fixed-count SB-N composition and
-decomposition; later fitting/inference remains out of scope. See the
+decomposition. Observation and low-level marginalized Chebyshev continuum
+helpers are implemented; SpecFit and inference remain out of scope. See the
 [physics note](specmodel-core.md) and [SB-N note](specmodel-sbn.md) for the API and validation.
 
 ## 1. Context
@@ -71,7 +72,7 @@ pass.
   unnormalized/intrinsic products and component spectra. General calibrated
   absolute-flux inference is outside the initial scope.
 - Prefer Gaussian observational noise plus optional jitter, with a low-order
-  multiplicative Chebyshev continuum, zero-centered Gaussian shrinkage and
+  multiplicative Chebyshev continuum, Gaussian shrinkage toward unity and
   analytic marginalization. Keep the legacy GP as optional compatibility
   functionality, including useful prediction behavior.
 - Define clean domain/coverage behavior instead of adopting accidental legacy
@@ -90,7 +91,7 @@ These are candidate boundaries, not commitments to exact names or signatures.
 | `Observation` | Immutable measured wavelength, flux, uncertainty, data-level exclusion mask and optional region/order/exposure labels. No resolving power or other model/instrument parameters. No required pixel edges. |
 | `SpecModel` | M3a: intrinsic interpolation, combined broadening/limb darkening/Gaussian IP, relativistic RV and requested-wavelength sampling. M3b: generic component mixing and dilution. No observed flux/errors/masks, continuum or priors. |
 | `SpecFit` | Lightweight observation/model bridge, region association, fitting masks, evaluation/likelihood conveniences and diagnostic delegation. Accepts arrays directly. Does not own priors or sampler logic. |
-| Continuum helpers | Deterministic basis/correction, prior-scale inputs and conditional coefficient recovery; usable with sampled or marginalized coefficients. |
+| Continuum helpers (implemented) | Independent Chebyshev basis/correction, two-scale Gaussian prior, normalized analytically marginalized density and conditional coefficient recovery. No fitting object or sampler. |
 | Likelihood helpers | Independently callable Gaussian/marginalized densities and optional GP density/prediction. No sampling sites or sampler execution. |
 | `numpyro_model.py` | Optional ready-to-use single-star and SB2 functions, including useful fixed/fitted and empirical-prior choices. Probabilistic structures may differ; physical evaluation is shared. |
 | Inference/initialization helpers | CCF estimates, initial values, bounds/scaling and useful SVI conveniences; operate on ordinary callable NumPyro models. |
@@ -296,42 +297,143 @@ A custom NumPyro model can use the same deterministic pieces without `SpecFit`:
 def research_model(model, data, basis):
     teff = numpyro.sample("teff", dist.Uniform(5500, 6250))
     R = numpyro.sample("R", dist.Uniform(65000, 75000))
-    params = {**fixed_star, "atmosphere": {**fixed_atmosphere, "teff": teff},
-              "instrument": {"resolving_power": R}}
+    component = {**fixed_component, "atmosphere": {**fixed_atmosphere, "teff": teff}}
+    params = {"components": (component,), "instrument": {"resolving_power": R}}
     mu = model(params, data.wavelength)
     logp = marginalized_continuum_log_likelihood(
-        data.flux, mu, uncertainty=data.uncertainty, mask=data.mask,
-        basis=basis, coefficient_scales=(0.02, 0.02, 0.01), jitter=0.0,
+        data, mu, basis=basis, degree=4,
+        sigma_constant=0.1, sigma_continuum=0.02,
     )
     numpyro.factor("spectrum", logp)
 ```
 
-Here `fixed_star`/`fixed_atmosphere` are user-supplied physical parameters;
+Here `fixed_component`/`fixed_atmosphere` are user-supplied physical parameters;
 the coefficient scales are illustrative. Default NumPyro functions may call
 these same helpers. A package inference wrapper is optional.
 
-## 6. Continuum convention
+## 6. Regularized multiplicative Chebyshev continuum (implemented)
 
-The provisional correction is `C(x) = 1 + sum(a_k * T_k(x), k=0..degree)`
-over a fixed wavelength-domain coordinate `x` in `[-1, 1]`.
+After stellar component composition, apply one continuum per observed region:
+`f_pred = f_model * C(wavelength)`, with `C(x) = sum(a_k*T_k(x), k=0..degree)`.
+The free constant term is included once; there is no additional normalization.
+Default degree is **4**, giving five coefficients per region. This is a modest
+default whose mild overparameterization is controlled by the prior, rather
+than automatic degree selection. Any nonnegative static integer degree works.
+The prior is `a0 ~ Normal(1, sigma_constant)`, and every `ak>0` independently
+has `Normal(0, sigma_continuum)`. Thus `mu=[1,0,...]` and covariance is
+`diag([sigma_constant**2, sigma_continuum**2, ...])`. This is equivalent to
+the earlier provisional `1 + sum(delta_a_k*T_k)` centered at zero, but expresses
+the actual constant coefficient directly. Positivity is deliberately not
+enforced: clipping or constrained coefficients would destroy the linear
+Gaussian model and its analytic marginalization.
 
-```text
-continuum_degree=None -> no correction
-continuum_degree=0    -> T0
-continuum_degree=1    -> T0,T1
-continuum_degree=2    -> T0,T1,T2
+Public low-level helpers are exported from `jaxstar.specfit`:
+
+```python
+basis = chebyshev_basis(obs.wavelength, degree=4)  # cache once for fixed geometry
+model_flux = model(params, obs.wavelength)         # unchanged physical API
+design = continuum_design_matrix(model_flux, basis)
+prior = continuum_prior(sigma_constant=s0, sigma_continuum=sc,
+                        degree=4, n_regions=obs.n_regions if obs.ndim == 2 else None)
+logp = marginalized_continuum_log_likelihood(
+    obs, model_flux, basis=basis, degree=4,
+    sigma_constant=s0, sigma_continuum=sc, jitter=jitter,
+)
+posterior = continuum_posterior(
+    obs, model_flux, basis=basis, degree=4,
+    sigma_constant=s0, sigma_continuum=sc, jitter=jitter,
+)
+continuum = evaluate_continuum(basis, posterior.mean)
+prediction = apply_continuum(model_flux, basis, posterior.mean)
 ```
 
-Degree 2 therefore means three coefficients: normalization correction, slope
-and curvature. All shrink toward zero under proper Gaussian priors; do not
-add a duplicate free normalization. Exact configuration and scientifically
-appropriate scales remain provisional.
+Both prior scales must be supplied explicitly; no scientific scale default is
+chosen. Each is scalar or `(n_region,)`, permitting later fixed or inferred
+hyperparameters. Scales must be finite positive, including the nonconstant
+scale for degree 0. Concrete invalid inputs raise ValueError; traced invalid
+inputs raise a JAX runtime error with the same validation message. There is
+no arbitrary covariance API, degree-dependent shrinkage, or numerical ridge.
+`ContinuumPrior` is a small NamedTuple with `mean`, diagonal `scale` and a
+`covariance` property; `ContinuumPosterior` is a NamedTuple with `mean` and
+`covariance`. Both are ordinary JAX PyTrees containing numerical arrays.
 
-Analytic marginalization is preferred by default; explicit coefficient
-sampling remains possible. Use small coefficient-space Cholesky/Woodbury
-algebra instead of a dense pixel covariance. Retain the model-dependent
-covariance, log determinant and derivatives, apply masks to normalization as
-well as residuals, and expose conditional coefficient recovery for predictions.
+For each row separately, the coordinate is exactly
+`x=2*(wavelength-first)/(last-first)-1`. Endpoints map to -1 and +1, including
+masked endpoint wavelengths; a one-pixel region uses x=0. Wavelengths are
+finite, positive, strictly increasing as in Observation. The basis uses the
+recurrence `T0=1`, `T1=x`, `Tk=2*x*T(k-1)-T(k-2)` and has shape
+`obs.shape+(degree+1,)`. Explicit coefficient shapes are `(degree+1,)` for
+1D data or `(n_region,degree+1)` for 2D data. The latter retains the row axis
+even for one region. Ambiguous coefficient/flux broadcasting is rejected.
+Independent coefficients belong to observed regions, never individual stars.
+
+Both density and posterior functions accept optional `jitter=0.0`, scalar or
+`(n_region,)` (including a length-one region vector for 1D data). It is additive
+absolute Gaussian noise in the same flux units as observation uncertainty:
+`D[i,i]=sigma_obs[i]**2+jitter[region]**2`. Finite nonnegative values are required;
+per-pixel arrays, fractional/model-scaled jitter and arbitrary broadcasting are
+not supported. Jitter is a likelihood nuisance argument, never stored in
+Observation or SpecModel. `jaxstar.specfit` imposes no prior on it; a later
+user-written NumPyro model can choose an appropriate positive prior.
+
+For one region, let `X=f_model[:,None]*basis`, `D=diag(error**2)` on usable
+pixels, and `S=diag(prior.scale)`. Standardize to `Z=D^(-1/2)*X*S`,
+`r=D^(-1/2)*(y-X*mu)` and `H=I+Z.T*Z`. Cholesky solves yield
+`delta=H^(-1)*Z.T*r`. The full normalized density is
+
+```text
+q = ||r-Z*delta||^2 + ||delta||^2
+logdet = 2*sum(log(error)) + 2*sum(log(diag(chol(H))))
+logp_region = -0.5*(q + logdet + N_usable*log(2*pi))
+logp = sum(logp_region)
+```
+
+The non-subtractive expression for q avoids Woodbury cancellation. The
+`error` above is always the effective `sqrt(sigma_obs**2+jitter[region]**2)`,
+evaluated with stable `hypot`. It enters both whitening and the Gaussian
+variance determinant, so increasing jitter incurs the full normalization
+penalty. The conditional posterior uses exactly the same effective covariance.
+Default zero jitter reproduces the previous formulation. The
+standardized determinant includes the full continuum-prior determinant
+contribution, equivalent to `logdet(D)+logdet(Lambda)+logdet(Lambda^-1+X.T*D^-1*X)`.
+No normalization terms are dropped, so prior-scale gradients are meaningful.
+The conditional mean is `mu+S*delta`, and covariance is `S*solve(H,I)*S`, using
+Cholesky solves rather than an explicit matrix inverse. Cost is approximately
+`O(n_pixel*(degree+1)^2)` plus the small coefficient solve. The dense system is
+only `(degree+1,degree+1)` per region; no pixel-by-pixel covariance is built.
+For ten regions and degree 4, marginalization removes 50 continuum coefficients
+from a future nonlinear sampler. Conditional recovery still allows the actual
+data-space spectrum to be reconstructed and plotted after fitting.
+
+Masked entries are neutralized **before** any division, multiplication, square
+or log: excluded y/model flux become zero, and excluded uncertainty becomes
+one, with their jitter contribution set to zero before computing effective
+errors. They have zero design/residual weight and do not count toward N or the
+variance determinant. Masked NaN/Inf flux/error values therefore cannot poison
+values or gradients. Fully masked regions contribute zero likelihood and
+return the prior. This does not introduce a separate adjustable fitting mask.
+
+Numerical helpers preserve normal JAX float32/float64 promotion without a
+global x64 change and support JIT, grad/value_and_grad and vmap at fixed shapes.
+Degree and optional region-count setup are static; flux, observations and
+scales remain numerical inputs. Tests compare against dense Gaussian references,
+posterior linear algebra, finite differences, masked-NaN gradients and the SB-N
+physical path. `benchmarks/benchmark_continuum.py` provides a synchronized CPU/GPU
+sanity check for ten regions and ~2000 pixels with coefficient/HLO shape checks;
+run with `--jitter 0` and `--jitter 0.01` to compare noise choices and include
+jitter differentiation. There is no SpecFit, GP, inference, or change to
+SpecModel/Observation.
+
+The self-contained [synthetic continuum notebook](../../examples/tutorials/continuum.ipynb)
+uses a fixed seed and `model_flux=1`: degree-2 truth, degree-4 analysis, masked
+NaN/Inf data and known additive jitter. Three figures show conditional continuum
+recovery, all coefficient means/uncertainties (including unused a3/a4), and
+separate marginal-likelihood curves for prior scale and jitter. Higher-order
+coefficients may be compatible with zero without being exactly zero. The
+curves retain Gaussian normalization and integrate all five coefficients
+analytically, illustrating possible future hyperparameter inference without
+adding NumPyro or an optimization workflow. Generated figures and executed
+notebook outputs stay in ignored `benchmark-results/continuum-demo/`.
 
 ## 7. Milestones
 
@@ -352,6 +454,11 @@ well as residuals, and expose conditional coefficient recovery for predictions.
 - **Milestone 3b — deterministic composition (implemented):** generic fixed-count SB-N,
    existing SB2 capability, dilution, component/decomposition spectra and relative
    stellar flux weights; shared physics, frozen parity and N-scaling benchmark.
+- **Observed-data container (implemented):** immutable Observation with validated
+   measured arrays, masks, identifiers and dynamic PyTree leaves.
+- **Low-level continuum milestone (implemented):** regularized multiplicative
+   degree-4 Chebyshev model, full Gaussian marginalization and conditional
+   coefficient recovery, independently of any SpecFit/inference layer.
 - **Milestone 4 — fit bridge/probabilistic compatibility:** simple construction, masks,
    custom composition, optional GP and default model functions.
 - **Milestone 5 — intentional statistical defaults:** Gaussian/jitter and marginalized
@@ -379,7 +486,8 @@ These are not yet frozen:
 - Final `SpecFit` API and exact spectral-container name/public visibility.
 - Multiple-observation/region association and observation-construction conveniences
   in the future `SpecFit` layer; the data-only `Observation` API is implemented above.
-- Continuum configuration, scale defaults and grouping/sharing surface.
+- Future fitting-layer continuum configuration and scientifically appropriate
+  prior scales; the low-level independent-region/two-scale API is implemented above.
 - Final diagnostics/inference-helper organization and optional GP public API.
 - Higher-level fitting orchestration under JAX, preserving the model's dynamic
   numerical library arrays rather than baking them into compile-time constants.
