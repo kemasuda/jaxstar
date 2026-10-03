@@ -1,8 +1,9 @@
 # Milestone 3a: deterministic single-component SpecModel
 
-Scope: atmosphere interpolation, combined broadening, relativistic RV and
-evaluation-time wavelength sampling. No observation container, continuum,
-likelihood, inference or component combination is implemented here.
+This note records the M3a physics baseline: atmosphere interpolation, combined
+broadening, relativistic RV and evaluation-time wavelength sampling. M3b extends
+the same implementation with [generic SB-N composition and decomposition](specmodel-sbn.md).
+No observation container, fitted continuum, likelihood or inference is implemented.
 
 Setup API: `SpecModel(spectra, *, vmax=50., broadening_operator=None)`. `vmax`
 retains the frozen model's finite velocity-kernel support control (km/s), rather
@@ -49,8 +50,10 @@ assert SpecModel.__call__ is SpecModel.full
 
 `intrinsic` performs atmosphere interpolation and requested-wavelength sampling;
 `broadened` adds combined stellar/Gaussian broadening without RV; `full` then
-applies relativistic RV before sampling. No stage applies continuum or dilution.
-The component tuple/list must have length one. Atmosphere keys exactly match the
+applies relativistic RV before sampling. Ordinary one-star calls without composition
+fields retain this behavior. M3b permits any nonempty component tuple/list and
+composes every stage with explicit relative weights and optional dilution; see
+the linked M3b note. No fitted continuum is applied. Atmosphere keys exactly match the
 loaded named axes; no source-library dispatch exists in the physical model.
 Atmosphere values must be scalar, finite and inside the library domain. This
 avoids a region-query by region-payload cross-product. Stages only require their
@@ -169,7 +172,8 @@ quantization; centering cannot recover precision already lost in stored data.
 Float32 agreement retains rtol=2e-6/atol=2e-7 for all stages. Float64 agreement
 uses rtol=1e-12/atol=2e-13, permitting the reported vmap roundoff;
 [JAX documents](https://docs.jax.dev/en/latest/faq.html#jit-changes-the-exact-numerics-of-outputs)
-that compiler rearrangements can change floating-point results. Independent
+that compiler rearrangements can change floating-point results. SB-N physical
+arrays share this policy; weight/fraction checks remain tight. Independent
 float64 NumPy/SciPy quadrature with true Bessel J0 checks both broadening and
 the full shifted spectrum, including small-RV derivatives with x64 on/off.
 The full-spectrum oracle threshold is absolute flux error `5e-7`. Frozen
@@ -215,14 +219,15 @@ use 0.11. Environment versions are recorded so comparisons retain that context.
 
 ## Deferred parity
 
-M3b: dilution, generic SB-N including existing SB2, component spectra and flux
-ratios. Later SpecFit: region association, observation and iterative masks,
+M3b implements dilution, generic SB-N including existing SB2, component spectra
+and relative flux weights through the shared component path. Later SpecFit:
+region association, observation and iterative masks,
 linear/Chebyshev continuum and fitted data-space model reconstruction, CCF
 single/binary support, plotting/diagnostics, Gaussian/jitter and optional GP
 likelihood/predictions, empirical turbulence relations, q1/q2 and physical-logg
 conveniences, default/custom NumPyro models and SVI/initialization. The full
 inventory and fitted physical/continuum/data-space API requirement are in
-`specfit-migration.md`. None is implemented here.
+`specfit-migration.md`. Those fitting-layer capabilities remain unimplemented.
 
 ## Recorded M3a checks (2026-10-02)
 

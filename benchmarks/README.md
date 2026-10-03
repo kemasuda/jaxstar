@@ -277,3 +277,58 @@ that changing requested wavelengths and parameters affects the compiled closure,
 that both modes reuse the same device-resident parameter/wavelength arrays,
 and that the dynamic objective reproduces the existing benchmark. These are
 correctness checks, not an interpretation of A100 performance.
+
+## Generic SB-N scaling
+
+`benchmark_specmodel_sbn.py` measures N=1,2,3 by default using the same standard ten-region,
+4000 model / 2000 output pixel workload and deterministic weighted squared-flux
+objective. N=1 uses the existing M3a input tree exactly (no added weight/dilution
+AD leaves). N>1 varies every component's atmosphere, broadening and nonzero RV
+and uses unequal relative weights `1/(i+1)` as dynamic AD inputs. Resolving power
+is shared by all stars and region-dependent as before; dilution is zero.
+Larger counts are optional through `--components`; the synthetic atmosphere recipe
+supports N<=8, while SpecModel has no such limit. N=8 is not a routine validation target.
+
+The model/library, parameters and evaluation wavelengths are device-resident
+dynamic inputs. The existing synchronized timer reports separate forward and
+value_and_grad lowering/XLA/total compile time, then three warmups and twenty
+timed calls, each waiting for every output leaf. JSON records per-N dtype,
+median/min/mean, optional compiled temporary/argument/output bytes, objective
+and gradient finiteness. Compiled memory estimates are not runtime peak RSS.
+Each invocation emits exactly one `BENCHMARK_RESULT_BEGIN ... BENCHMARK_RESULT_END`
+block containing all N cases. Results/cache files stay ignored. No closure
+specialization, physical change, explicit component vmap or GPU optimization
+is introduced; interpret GPU scaling before choosing any execution restructuring.
+
+From the repository root, exact CPU commands (select the intended Python environment):
+
+```bash
+JAX_PLATFORMS=cpu PYTHONPATH=src python benchmarks/benchmark_specmodel_sbn.py \
+  --require-cpu --components 1 2 3 --regions 10 --model-pixels 4000 \
+  --output-pixels 2000 --warmup 3 --rounds 20 --dtype float32 \
+  --json-out benchmark-results/specmodel-sbn-cpu-f32.json
+JAX_PLATFORMS=cpu PYTHONPATH=src python benchmarks/benchmark_specmodel_sbn.py \
+  --require-cpu --components 1 2 3 --regions 10 --model-pixels 4000 \
+  --output-pixels 2000 --warmup 3 --rounds 20 --dtype float64 \
+  --json-out benchmark-results/specmodel-sbn-cpu-f64.json
+```
+
+On the A100 JAX/jaxlib 0.11.2 machine:
+
+```bash
+unset LD_LIBRARY_PATH
+JAX_PLATFORMS=cuda PYTHONPATH=src python benchmarks/benchmark_specmodel_sbn.py \
+  --require-gpu --components 1 2 3 --regions 10 --model-pixels 4000 \
+  --output-pixels 2000 --warmup 3 --rounds 20 --dtype float32 \
+  --json-out benchmark-results/specmodel-sbn-a100-f32-jax011.json
+JAX_PLATFORMS=cuda PYTHONPATH=src python benchmarks/benchmark_specmodel_sbn.py \
+  --require-gpu --components 1 2 3 --regions 10 --model-pixels 4000 \
+  --output-pixels 2000 --warmup 3 --rounds 20 --dtype float64 \
+  --json-out benchmark-results/specmodel-sbn-a100-f64-jax011.json
+```
+
+The library-path unset retains the workaround that resolved cuSPARSE discovery
+on this machine. For CPU on the same GPU machine, use the CPU commands above.
+Float64 explicitly enables x64; float32 disables it. No GPU is available on this
+Mac, so its timings are sanity measurements only. Paste both complete result
+blocks from the A100 for later scaling interpretation.

@@ -58,18 +58,19 @@ def verify_reference(root):
             raise ValueError(f"frozen reference hash mismatch: {relative}")
 
 
-def make_case(root, directory, name="coelho"):
+def make_case(root, directory, name="coelho", *, points=None, reference_tag=None):
     """Prepare the same log working samples once, keeping only local axis cells."""
     root, directory = Path(root).resolve(), Path(directory)
     modules = frozen_modules(root)
     point = POINTS[name]
+    points = [point] if points is None else points
     path = next((root / f"characterization/sample_grid_{name}").glob("*.npz"))
     with np.load(path, allow_pickle=False) as original:
         axes, indices = {}, []
-        for (_, key), value in zip(SCHEMAS[name], point):
+        for dimension, (_, key) in enumerate(SCHEMAS[name]):
             axis = original[key]
-            upper = int(np.searchsorted(axis, value, side="right"))
-            selected = np.array([upper - 1, upper])
+            upper = np.searchsorted(axis, [p[dimension] for p in points], side="right")
+            selected = np.arange(int(upper.min()) - 1, int(upper.max()) + 1)
             axes[key] = axis[selected]
             indices.append(selected)
         native_wave = original["wavgrid"]
@@ -78,9 +79,10 @@ def make_case(root, directory, name="coelho"):
     extracted = directory / f"{name}_local.npz"
     np.savez(extracted, **payload)
     tag = "tlusty" if name == "tlusty" else "ird"
+    prefix = f"forward_{reference_tag or tag}_"
     with np.load(root / "characterization/reference_outputs/frozen_main.npz", allow_pickle=False) as reference:
-        oracle = {key.removeprefix(f"forward_{tag}_"): reference[key].copy()
-                  for key in reference.files if key.startswith(f"forward_{tag}_") and "sb2" not in key}
+        oracle = {key.removeprefix(prefix): reference[key].copy()
+                  for key in reference.files if key.startswith(prefix) and (reference_tag or "sb2" not in key)}
     wave = oracle["wav_obs"]
     count = wave.shape[0]
     loader = {"coelho": load_coelho, "bosz": load_bosz, "tlusty": load_tlusty}[name]
