@@ -69,3 +69,127 @@ The CPU validation environment uses JAX/jaxlib 0.6.2; the planned GPU environmen
 uses 0.11. Scripts use public configuration APIs supported by both. Reported
 speed ratios therefore include compiler/version differences as well as hardware
 differences. The GPU run itself is still to be performed on that machine.
+
+## Controlled legacy full-iid rerun
+
+`benchmark_legacy_jaxspec.py` reruns **only** the frozen jaxspec
+`full_iid_value_and_grad` row from
+`../jaxspec/benchmarks/benchmark_best_gp_backend.py`. It does not use the M3a
+synthetic workload or jaxstar's physical implementation. It needs the sibling
+source, JAX/jaxlib, NumPy, SciPy and psutil; **tinygp is not required or imported**.
+No GP entry point, package initializer, inference or plotting module is loaded.
+Frozen source bytes are executed in an isolated module namespace without
+writing bytecode in the sibling. No numerical compatibility shim was needed
+on Mac JAX 0.6.2; the A100 JAX 0.11.2 execution remains to be checked there.
+Unsupported frozen-source APIs should fail rather than be silently rewritten.
+
+The default reproduces the documented Linux/A100 inputs:
+
+- CSV: `../jaxspec/data/IRDA00042313_H.csv`; orders 8–17 in that order.
+- Grid directory: `/home/masuda/specgrid_irdh_coelho`, recovered from the frozen
+  benchmark README. No Mac-directory or synthetic fallback is used.
+- CSV `lam` is multiplied by 10 (nm to Angstrom); the frozen CSV helper preserves
+  all 2048 rows per order. `all_mask` and nonfinite/error<=0 masks are combined;
+  masked flux/error are replaced with 1, as historically.
+- The frozen matcher requires `grid_min + 3 < obs_min` and
+  `grid_max - 3 > obs_max`, selecting the narrowest covering NPZ (historical
+  sorting/ties and filename range parsing are retained).
+- Float64/x64; `vmax=50`, `vsini=5`, `zeta=2` km/s, `wavres=70000`,
+  `u1=0.5`, `u2=0.2`, RV=0, norm=1, slope=0, dilution=0.
+- Scalar atmosphere coordinates are the intersection midpoints of the selected
+  grids' bounds. Values and per-file bounds are reported rather than guessed.
+- The frozen grid loader/interpolator and `SpecModel.fluxmodel_multiorder` run
+  unchanged, including runtime native-to-log interpolation, combined broadening,
+  relativistic RV, continuum and dilution. Its working wavelength is
+  `np.logspace(log10(wavmin), log10(wavmax), native_count)[1:-1]`, with
+  endpoint-trimmed native count, median `dlnlambda`, shared kernel length chosen
+  from the first order, `Nt=500`, and historical `same` convolution/interp edges.
+
+The objective is exactly the historical non-GP row:
+
+```python
+0.5 * sum(where(~mask_obs, ((flux_obs - flux_model) / error_obs)**2, 0))
+```
+
+No Gaussian normalization term or jitter is added. All **13 dict leaves** are
+differentiated: scalar `teff`, `logg`, `feh`, `alpha`, `vsini`, `zeta`, `u1`,
+`u2`, `dilution`, and per-order arrays `norm`, `slope`, `wavres`, `rv`.
+The ten-order case therefore has 49 scalar parameter entries. `mask_fit` is
+not used. The benchmark reports model/grid dimensions, matched paths, observed
+and valid counts, exact parameter values/shapes, objective, gradient finiteness,
+source/CSV SHA256, backend/device and compatibility shims (currently none).
+
+The default observation counts are 2048 per order (20480 total), with unmasked
+counts `[1546,1754,1408,1520,1302,1629,1553,1643,1622,1589]` (15566 total).
+The saved ten-order artifact's filename inventory reproduces the CSV matching
+below. These are the expected basenames under the Linux default directory;
+the actual Linux files/contents are unavailable on this Mac and must be
+confirmed by the A100 report's `grid_files` and `grid_shapes`.
+
+| Order | Matched basename | Unmasked pixels |
+| --- | --- | --- |
+| 8 | `15239-15449_normed.npz` | 1546 |
+| 9 | `15399-15611_normed.npz` | 1754 |
+| 10 | `15563-15777_normed.npz` | 1408 |
+| 11 | `15731-15947_normed.npz` | 1520 |
+| 12 | `15902-16120_normed.npz` | 1302 |
+| 13 | `16077-16297_normed.npz` | 1629 |
+| 14 | `16256-16478_normed.npz` | 1553 |
+| 15 | `16439-16663_normed.npz` | 1643 |
+| 16 | `16626-16853_normed.npz` | 1622 |
+| 17 | `16817-17046_normed.npz` | 1589 |
+
+The Linux/A100 historical iid objective is **not available** in the frozen local
+artifacts. The saved Mac value `94153.52017616687` belongs to different grids
+(`15×3×4×2×5000` per order, versus five gravity nodes in the Linux record), so
+it is not used as an A100 oracle. Before timing, this wrapper compares the full
+AD objective to an independent host reduction of the frozen forward spectrum
+and checks every gradient leaf/shape for finiteness; it rechecks the timed result.
+
+Timing uses the same synchronized utility as M3a. The full objective and every
+gradient leaf are ready before a timer stops. Loading, validation and explicit
+parameter/observation transfers are outside warm timing. The legacy model/grid
+NumPy arrays remain captured by frozen `static self` JIT, preserving that path.
+In-memory JIT caches are cleared after preflight; lowering and XLA compilation,
+one first execution (including materialization of legacy constants), **3 further
+warmup calls** and **30 timed calls** are separated. Reported compile time can
+still be affected by a configured persistent disk cache; relevant environment
+variables are included in JSON. First execution is an opt-in addition to the
+shared utility; existing M3a benchmark timings are unchanged.
+
+On the A100 with JAX/jaxlib 0.11.2, from the jaxstar repository root:
+
+```bash
+JAX_PLATFORMS=cuda PYTHONPATH=src python benchmarks/benchmark_legacy_jaxspec.py \
+  --require-gpu \
+  --json-out benchmark-results/legacy-jaxspec-a100-f64-jax011.json
+```
+
+For CPU on the same machine, change `cuda` to `cpu` and `--require-gpu` to
+`--require-cpu`, using a different result filename. The historical Linux grids
+must be available; `--grid-dir` can specify their actual location. To select a
+different frozen checkout use `--jaxspec-root`; `--data-csv` and `--orders` may
+also be overridden explicitly. An alternate grid or order set is a different
+workload and should not be interpreted as the historical A100 rerun.
+
+This Mac has only the immutable Coelho order-8 sample grid, not the historical
+Linux ten-order directory. On JAX/jaxlib 0.6.2, the order-8 sanity run returned
+objective `6027.030123935277`, finite model/all 13 gradient leaves, and an
+independent host-objective difference of `1.09e-11`. Grid shape was
+`(15,5,4,2,5000)`, working wavelengths `(1,4998)`, output `(1,2048)` and kernel
+`(1,123)`; the grid-midpoint atmosphere was `(5250,3,-0.25,0.2)`.
+No tinygp import or compatibility shim was used. Its import/CPU sanity command is:
+
+```bash
+JAX_PLATFORMS=cpu PYTHONPATH=src python benchmarks/benchmark_legacy_jaxspec.py \
+  --require-cpu --grid-dir ../jaxspec/characterization/sample_grid_coelho \
+  --orders 8 --warmup 1 --repeat 2 \
+  --json-out benchmark-results/legacy-jaxspec-mac-order8-sanity.json
+```
+
+Copy the **complete** `BENCHMARK_RESULT_BEGIN ... BENCHMARK_RESULT_END` block
+from the A100 run. Compare its warm median to the historical **1.685 ms**
+(A100/JAX 0.4.33), then consider the new M3a **~2.1–2.2 ms**. The latter uses
+different spectra, sampling and objective/gradient leaves; this first experiment
+tests the old implementation under the newer JAX stack, not old/new workload
+equivalence. Mac sanity timings are not evidence for the A100 comparison.

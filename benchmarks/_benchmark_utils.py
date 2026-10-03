@@ -26,12 +26,14 @@ def environment(device):
     }
 
 
-def measure(function, args, *, rounds=20, warmup=3):
+def measure(function, args, *, rounds=20, warmup=3, time_first=False):
     """Trace/lower, compile, then time device-resident, synchronized calls.
 
     The caller places and synchronizes args before entering this function.
     block_until_ready traverses the complete result PyTree, including all AD
     leaves. Setup, transfers, compilation and warmup are outside warm timings.
+    time_first adds one synchronized first execution before the warmup calls,
+    matching the historical legacy benchmark without changing existing callers.
     """
     start = perf_counter()
     lowered = jax.jit(function).lower(*args)
@@ -39,6 +41,11 @@ def measure(function, args, *, rounds=20, warmup=3):
     start = perf_counter()
     compiled = lowered.compile()
     xla_compile_seconds = perf_counter() - start
+    first_execution_seconds = None
+    if time_first:
+        start = perf_counter()
+        jax.block_until_ready(compiled(*args))
+        first_execution_seconds = perf_counter() - start
     for _ in range(warmup):
         jax.block_until_ready(compiled(*args))
     durations = []
@@ -55,6 +62,8 @@ def measure(function, args, *, rounds=20, warmup=3):
         "warm_min_seconds": min(durations),
         "warm_mean_seconds": float(np.mean(durations)),
     }
+    if time_first:
+        timing["first_execution_seconds"] = first_execution_seconds
     memory = None
     try:
         analysis = compiled.memory_analysis()
