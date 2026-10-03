@@ -9,6 +9,7 @@ import pytest
 
 from jaxstar.grid import Field, RectilinearGrid
 from jaxstar.specfit import SpecModel
+from jaxstar.specfit.broadening import combined_kernel
 from jaxstar.specfit._data import _SpectralLibrary
 from jaxstar.specfit.model import _doppler_factor
 from jaxstar.specfit.sampling import _C_KMS
@@ -43,6 +44,18 @@ def observations(library):
     return np.asarray(library.wavelength)[:, 340:685:2]
 
 
+def forward_tolerance(dtype, stage):
+    """Eager/JIT agreement, distinct from frozen scientific parity tolerances.
+
+    Float32 retains the original budget. Float64 permits the reported ~1e-13
+    vmap roundoff. Inspect
+    native wavelength precision even if mixed arithmetic returns f64.
+    """
+    if np.dtype(dtype) == np.float64:
+        return {"rtol": 1e-12, "atol": 2e-13}
+    return {"rtol": 2e-6, "atol": 2e-7}
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_stages_alias_jit_gradients_and_dynamic_arrays(dtype):
     spectra = make_library(dtype)
@@ -52,7 +65,7 @@ def test_stages_alias_jit_gradients_and_dynamic_arrays(dtype):
         eager = function(model, params, wave)
         compiled = jax.jit(function)(model, params, wave)
         assert compiled.shape == wave.shape
-        np.testing.assert_allclose(compiled, eager, rtol=2e-6, atol=2e-7)
+        np.testing.assert_allclose(compiled, eager, **forward_tolerance(dtype, stage), err_msg=stage)
         value, gradient = jax.jit(jax.value_and_grad(lambda p: function(model, p, wave).sum()))(params)
         assert np.isfinite(value)
         assert all(np.all(np.isfinite(x)) for x in jax.tree_util.tree_leaves(gradient))
@@ -235,7 +248,7 @@ def test_x64_disabled_forward_and_reverse_mode(x64_context):
         function = jax.jit(lambda m, p, w: m(p, w))
         result = function(model, params, wave)
         assert result.dtype == np.float32
-        np.testing.assert_allclose(result, model(params, wave), rtol=2e-6, atol=2e-7)
+        np.testing.assert_allclose(result, model(params, wave), **forward_tolerance(library.wavelength.dtype, "full"))
         value, gradient = jax.jit(jax.value_and_grad(lambda m, p, w: m(p, w).mean(), argnums=1))(model, params, wave)
         assert np.isfinite(value)
         assert all(np.all(np.isfinite(x)) for x in jax.tree_util.tree_leaves(gradient))
@@ -248,7 +261,90 @@ def test_outer_parameter_vmap_keeps_scalar_atmosphere_queries():
     batch["components"][0]["atmosphere"]["custom_temperature"] = jnp.array([.4, .6])
     output = jax.jit(jax.vmap(lambda p: model(p, wave)))(batch)
     assert output.shape == (2, *wave.shape)
-    np.testing.assert_allclose(output[0], model(params, wave), rtol=0, atol=5e-15)
+    np.testing.assert_allclose(output[0], model(params, wave), **forward_tolerance(library.wavelength.dtype, "full"))
+
+
+def numpy_kernel(velocity, vmacro, vsini, u1, u2, resolution):
+    """Independent float64 quadrature using SciPy's true Bessel J0."""
+    from scipy.integrate import trapezoid
+    from scipy.special import j0
+
+    frequency = np.fft.fftfreq(len(velocity), d=float(np.median(np.diff(velocity))))
+    t = np.linspace(0., 1., 500)[:, None]
+    projected = np.sqrt(1 - t*t)
+    limb = (1 - (1 - projected) * (u1 + u2 * (1 - projected))) / (1 - u1/3 - u2/6)
+    macro = np.exp(-np.pi**2 * vmacro**2 * frequency**2 * (1 - t*t)) + np.exp(
+        -np.pi**2 * vmacro**2 * frequency**2 * t*t)
+    beta = _C_KMS / resolution / 2.354820
+    instrumental = np.exp(-2*np.pi**2 * beta**2 * frequency**2)
+    fourier = trapezoid((limb * macro * instrumental * j0(2*np.pi*frequency*vsini*t) * t).T, axis=-1)
+    kernel = np.fft.fftshift(np.fft.fft(fourier).real)
+    return kernel / kernel.sum()
+
+
+@pytest.mark.parametrize("vsini,vmacro,resolution", [(6.3, 3.1, 70000.), (18.7, 5.2, 45000.)])
+def test_float32_broadening_agrees_with_independent_float64_quadrature(vsini, vmacro, resolution, x64_context):
+    velocity = np.linspace(-50., 50., 205, dtype=np.float32)
+    expected_kernel = numpy_kernel(velocity, vmacro, vsini, .5, .2, resolution)
+    beta = _C_KMS / resolution / 2.354820
+    profile_velocity = np.linspace(-250., 250., 1025)
+    intrinsic = (1 - .42 * np.exp(-.5 * (profile_velocity / 3)**2)).astype(np.float32)
+    expected = np.convolve(intrinsic.astype(np.float64), expected_kernel, mode="valid")
+    with x64_context(False):
+        args = tuple(jnp.asarray(value, dtype=jnp.float32) for value in
+                     (velocity, vmacro, vsini, .5, .2, beta))
+        apply = lambda *args: jnp.convolve(jnp.asarray(intrinsic), combined_kernel(*args), mode="valid")
+        for function in (apply, jax.jit(apply)):
+            actual = function(*args)
+            assert actual.dtype == np.float32
+            np.testing.assert_allclose(actual, expected, **forward_tolerance(np.float32, "broadened"))
+
+
+@pytest.mark.parametrize("enable_x64", [False, True])
+def test_float32_full_and_small_rv_gradients_against_numpy(enable_x64, x64_context):
+    # Preserve the exact float32 data/parameters in the oracle: this measures
+    # arithmetic accuracy, separately from offline wavelength quantization.
+    with x64_context(enable_x64):
+        library = make_library(np.float32)
+        model, wave = SpecModel(library), observations(library)
+        params = jax.tree_util.tree_map(lambda x: jnp.asarray(x, dtype=jnp.float32), parameters())
+        component = params["components"][0]
+        temperature = float(component["atmosphere"]["custom_temperature"])
+        nodes = np.asarray(library.grid.field("flux").values, dtype=np.float64)
+        intrinsic = (1 - temperature) * nodes[0] + temperature * nodes[1]
+        broad = {key: float(value) for key, value in component["broadening"].items()}
+        resolution = float(params["instrument"]["resolving_power"])
+        kernels = [numpy_kernel(velocity, broad["vmacro"], broad["vsini"],
+                                broad["u1"], broad["u2"], resolution)
+                   for velocity in np.asarray(model.velocity_grid)]
+        flux = np.stack([np.convolve(row, kernel, mode="valid") for row, kernel in zip(intrinsic, kernels)])
+        half = model.velocity_grid.shape[-1] // 2
+        source_wave = np.asarray(library.wavelength, dtype=np.float64)[:, half:-half]
+
+        def oracle(rv):
+            factor = np.sqrt((1 + rv/_C_KMS) / (1 - rv/_C_KMS))
+            return np.stack([np.interp(out, source * shift, row)
+                             for out, source, shift, row in zip(wave, source_wave, factor, flux)])
+
+        compiled = jax.jit(lambda m, p, w: m.full(p, w))
+        for velocities in ((.001, -.001), (.43, -.43), (12., -12.)):
+            component["rv"] = jnp.asarray(velocities, dtype=jnp.float32)
+            expected = oracle(np.asarray(component["rv"], dtype=np.float64))
+            for result in (model.full(params, wave), compiled(model, params, wave)):
+                np.testing.assert_allclose(result, expected, rtol=0, atol=5e-7)
+
+        component["rv"] = jnp.asarray((.001, -.001), dtype=jnp.float32)
+        weights = np.linspace(.2, 1.3, wave.size).reshape(wave.shape).astype(np.float32)
+        gradient = jax.jit(jax.grad(lambda p: jnp.sum(model(p, wave) * weights)))(params)["components"][0]["rv"]
+        rv = np.asarray(component["rv"], dtype=np.float64)
+        # Stay on one side of the piecewise-linear interpolation knots.
+        step = 1e-4
+        differences = []
+        for region in range(len(rv)):
+            offset = np.zeros_like(rv)
+            offset[region] = step
+            differences.append(np.sum((oracle(rv + offset) - oracle(rv - offset)) * weights) / (2 * step))
+        np.testing.assert_allclose(gradient, differences, rtol=3e-4, atol=2e-5)
 
 
 @pytest.mark.parametrize("path,value,message", [
