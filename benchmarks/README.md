@@ -193,3 +193,87 @@ from the A100 run. Compare its warm median to the historical **1.685 ms**
 different spectra, sampling and objective/gradient leaves; this first experiment
 tests the old implementation under the newer JAX stack, not old/new workload
 equivalence. Mac sanity timings are not evidence for the A100 comparison.
+
+## SpecModel model/library closure specialization
+
+`benchmark_specmodel_specialization.py` measures execution strategy only.
+It imports the existing `benchmark_specmodel.make_inputs`, builds/places one
+model/parameter/wavelength tuple once, and reuses those exact arrays for:
+
+- `dynamic_model`: `jit(lambda model, params, wavelength: model(params, wavelength))`.
+- `specialized_model`: `jit(lambda params, wavelength: model(params, wavelength))`,
+  capturing the same fixed model/library in the closure.
+
+Requested wavelengths and parameters remain **dynamic in both modes**. The
+primary experiment captures only the model/library; no optional wavelength
+capture case, `static_argnums`, public compile/specialize API, physics change or
+SB-N implementation is included. The compiler's internal constant representation
+is not prescribed by closure capture. The relevant constant/cache environment
+flags are reported along with the actual compiled memory metadata.
+
+The standard workload remains B=1, ten regions, 4000 model pixels and 2000
+output pixels per region, 1 km/s numerical model spacing, four two-node
+atmosphere axes, vsini=6.3, vmacro=3.1 km/s, u1=0.5/u2=0.2, region RVs from
+-15 to +15 km/s and resolving powers from 68000 to 72000. The scalar objective
+is the existing `mean(flux**2 * linspace(0.5,1.5,n_output))`, differentiating
+only the same complete parameter PyTree, not model/library or wavelength.
+This is not the legacy iid likelihood workload.
+
+Both modes use the unchanged shared synchronized timer: separate lowering,
+XLA compile and total compile, then 3 warmup and 20 timed calls for forward and
+value_and_grad. The entire result PyTree is ready before each timer stops.
+Model construction, preparation, transfer and compilation are excluded from
+warm timing. Public compiled-memory estimates (`temporary_bytes`,
+`argument_bytes`, `output_bytes`) are reported for each stage/mode, or null
+when unsupported. No private-XLA inspection is used.
+
+After timing, forward flux, scalar objective and every gradient leaf must
+agree: float32 `rtol=5e-5, atol=2e-6`; float64 `rtol=1e-10, atol=1e-12`.
+Shapes/dtypes/PyTree structure and finiteness are also checked. JSON includes
+maximum absolute differences, including each gradient leaf. A failed comparison
+raises instead of reporting a successful benchmark.
+
+From the jaxstar root on the A100 with JAX/jaxlib 0.11.2:
+
+```bash
+JAX_PLATFORMS=cuda PYTHONPATH=src python benchmarks/benchmark_specmodel_specialization.py \
+  --require-gpu --dtype float32 \
+  --json-out benchmark-results/specmodel-specialization-a100-f32-jax011.json
+JAX_PLATFORMS=cuda PYTHONPATH=src python benchmarks/benchmark_specmodel_specialization.py \
+  --require-gpu --dtype float64 \
+  --json-out benchmark-results/specmodel-specialization-a100-f64-jax011.json
+```
+
+For Mac sanity or same-machine CPU comparison use `JAX_PLATFORMS=cpu` and
+`--require-cpu` with separate JSON filenames. Defaults already specify the
+standard workload, 3 warmup and 20 rounds; size/round options remain available.
+Float64 enables x64 explicitly; float32 disables it, as in the existing benchmark.
+
+Each run emits one `BENCHMARK_RESULT_BEGIN ... BENCHMARK_RESULT_END` block.
+Paste **both complete blocks**, including `environment`, `problem`, `parameters`,
+`timing`, `modes`, `comparison` and `validation`. Warm speedup is
+`dynamic_median / specialized_median` (>1 means faster); warm improvement is
+`100 * (1 - specialized_median / dynamic_median)`. Compile ratio is
+`specialized_compile / dynamic_compile` (>1 means more compile cost).
+
+Interpret the A100 result before any architectural decision: below roughly 10%
+improvement is likely too small to justify complexity, 10–20% may be useful,
+and above 20% warrants considering a future fitting specialization path.
+Approaching 1.5–1.7 ms in float64 would support specialization explaining much
+of the reported gap (controlled legacy ~1.522 ms versus dynamic M3a ~2.1–2.2 ms),
+but the legacy spectra/objective/gradient leaves differ. Mac timings are only
+sanity checks; this experiment adds no specialization API or Milestone 3b work.
+
+Mac CPU sanity (JAX/jaxlib 0.6.2) passed for the full standard workload in both
+precisions with 3 warmup/20 rounds. Maximum absolute dynamic/closure differences:
+
+| Dtype | Forward | Objective | Parameter gradients |
+| --- | --- | --- | --- |
+| float32 | `2.38e-7` | `1.19e-7` | `1.64e-10` |
+| float64 | `4.44e-16` | `0` | `5.94e-19` |
+
+All ten gradient leaves were finite and matched. Additional checks confirmed
+that changing requested wavelengths and parameters affects the compiled closure,
+that both modes reuse the same device-resident parameter/wavelength arrays,
+and that the dynamic objective reproduces the existing benchmark. These are
+correctness checks, not an interpretation of A100 performance.
