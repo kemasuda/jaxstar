@@ -277,8 +277,14 @@ def test_gp_sampled_sites_concrete_jit_and_joint_density(solver, dtype, x64_cont
         np.testing.assert_allclose(actual, eager, atol=tol)
         assert actual.dtype == jnp.dtype(dtype)
         assert all(np.all(np.isfinite(x)) for x in gradient.values())
+        # Dense GP derivatives can be O(1e3). Float32 eager/JIT rounding
+        # differs by a few ppm across CPU backends, so compare relatively
+        # as well as retaining the absolute tolerance for small derivatives.
+        gradient_rtol = 2e-6 if dtype == "float32" else 1e-10
         for name in theta:
-            np.testing.assert_allclose(gradient[name], eager_grad[name], atol=tol)
+            np.testing.assert_allclose(gradient[name], eager_grad[name],
+                                       rtol=gradient_rtol, atol=tol,
+                                       err_msg=f"eager/JIT gradient for {name}")
         # Different masked poison must not change inference or its gradients.
         changed = Observation(obs.wavelength, np.where(obs.mask, np.inf, obs.flux),
                               np.where(obs.mask, np.nan, obs.uncertainty),
