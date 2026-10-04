@@ -430,7 +430,7 @@ run with `--jitter 0` and `--jitter 0.01` to compare noise choices and include
 jitter differentiation. There is no SpecFit, GP, inference, or change to
 SpecModel/Observation.
 
-The self-contained [synthetic continuum notebook](../../examples/tutorials/continuum.ipynb)
+The self-contained [synthetic continuum notebook](../tutorials/specfit/continuum.ipynb)
 uses a fixed seed and `model_flux=1`: degree-2 truth, degree-4 analysis, masked
 NaN/Inf data and known additive jitter. Three figures show conditional continuum
 recovery, all coefficient means/uncertainties (including unused a3/a4), and

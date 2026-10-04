@@ -126,7 +126,7 @@ routine fitting preparation continues to use explicit velocity_step.
 
 ## Validation and repository examples
 
-The executed [SpecModel tutorial](../../examples/tutorials/specmodel.ipynb)
+The executed [SpecModel tutorial](../tutorials/specfit/specmodel.ipynb)
 walks through a Coelho common artifact, region/pixel sampling, the full parameter
 dictionary, explicit intrinsic/broadened/full calls, the real IRD sample overlay,
 individual parameter responses, per-region RV and frozen comparison. Figures
@@ -188,7 +188,7 @@ an existing invalid docstring escape in `utils/correction.py`.
 MPLCONFIGDIR=/private/tmp/jaxstar-mpl-cache JAXSPEC_REFERENCE_ROOT=../jaxspec \
   PYTHONPATH=src python -m pytest -q
 MPLCONFIGDIR=/private/tmp/jaxstar-mpl-cache PYTHONPATH=src \
-  python examples/specmodel_diagnostic.py --reference-root ../jaxspec \
+  python dev_notebooks/specfit/specmodel_diagnostic.py --reference-root ../jaxspec \
   --output-dir /private/tmp/jaxstar-specmodel-coelho
 MPLCONFIGDIR=/private/tmp/jaxstar-mpl-cache PYTHONPATH=src \
   python benchmarks/benchmark_specmodel.py --regions 10 --model-pixels 4000 \

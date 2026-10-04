@@ -300,7 +300,7 @@ synthetic library exercises the actual grid/SpecModel rather than claiming
 realistic stellar spectral physics. Injected continuum has degree 2; analysis
 has degree 4. Seed 20261004, uncertainty 0.004 and nonzero additive jitter 0.004
 are used; masked stored flux/error contain NaN/Inf. All injected values and
-example priors are in `examples/_spectral_inference_data.py`.
+example priors are in `dev_notebooks/specfit/_spectral_inference_data.py`.
 
 The atmosphere, vsini/vmacro, RV, per-region R, global jitter and global
 sigma_continuum are inferred. q1/q2 and sigma_constant are fixed. The R priors
@@ -404,7 +404,7 @@ matters when comparing individual conditional coefficients against truth.
 
 ## Real-data notebook groundwork
 
-`examples/spectral_inference_real_setup.py` locates the existing frozen IRD
+`dev_notebooks/specfit/spectral_inference_real_setup.py` locates the existing frozen IRD
 CSV and Coelho NPZ, converts the grid once to 1 km/s sampling and writes a common
 artifact. Subsequent setup loads the common artifact. It creates Observation,
 SpecModel, a cached basis, explicit fixed/sample priors and a native sample-site
@@ -412,7 +412,7 @@ initialization dictionary; no old flat vector/bounds bookkeeping is restored.
 Example continuum/jitter scales are illustrative. Supply an approximate RV:
 
 ```bash
-PYTHONPATH=src python examples/spectral_inference_real_setup.py --rv-initial 12.4
+PYTHONPATH=src python dev_notebooks/specfit/spectral_inference_real_setup.py --rv-initial 12.4
 ```
 
 The numeric value above is only a setup demonstration, not a measured RV for

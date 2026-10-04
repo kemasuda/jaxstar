@@ -20,7 +20,7 @@ from numpyro.infer import MCMC, NUTS, SVI, Trace_ELBO, init_to_value
 from numpyro.infer.autoguide import AutoLaplaceApproximation
 from numpyro.infer.util import log_density
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dev_notebooks/specfit"))
 from _spectral_inference_data import synthetic_case, point_params
 from _benchmark_utils import environment, measure, emit_result
 from jaxstar.specfit import (model_single, continuum_posterior,

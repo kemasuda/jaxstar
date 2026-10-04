@@ -1,9 +1,9 @@
 """Batch sample-data stages, legacy parity and parameter response plots.
 
-For a step-by-step interactive tutorial, see tutorials/specmodel.ipynb.
+For a step-by-step interactive tutorial, see docs/tutorials/specfit/specmodel.ipynb.
 This CLI retains the three-library, parameter-override and file-output workflow.
 
-PYTHONPATH=src python examples/specmodel_diagnostic.py --reference-root ../jaxspec \
+PYTHONPATH=src python dev_notebooks/specfit/specmodel_diagnostic.py --reference-root ../jaxspec \
     --output-dir /private/tmp/jaxstar-specmodel-plots
 
 Use --vsini/--vmacro/--resolving-power/--rv to vary one scalar, or comma-separated

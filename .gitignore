@@ -1,3 +1,11 @@
-/dev_notebooks/
+# Local development work stays ignored; only these shared helpers are versioned.
+/dev_notebooks/*
+!/dev_notebooks/specfit/
+/dev_notebooks/specfit/*
+!/dev_notebooks/specfit/specmodel_diagnostic.py
+!/dev_notebooks/specfit/_specmodel_reference.py
+!/dev_notebooks/specfit/_specmodel_plotting.py
+!/dev_notebooks/specfit/_spectral_inference_data.py
+!/dev_notebooks/specfit/spectral_inference_real_setup.py
 /examples/tutorials/.specmodel-data/
 /benchmark-results/

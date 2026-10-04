@@ -13,7 +13,7 @@ from jaxstar.specfit import SpecModel
 
 ROOT = os.environ.get("JAXSPEC_REFERENCE_ROOT")
 pytestmark = pytest.mark.skipif(not ROOT, reason="set JAXSPEC_REFERENCE_ROOT for frozen SB2 parity")
-HELPER = runpy.run_path(str(Path(__file__).resolve().parents[2] / "examples/_specmodel_reference.py"))
+HELPER = runpy.run_path(str(Path(__file__).resolve().parents[2] / "dev_notebooks/specfit/_specmodel_reference.py"))
 
 
 @pytest.fixture(scope="module", autouse=True)

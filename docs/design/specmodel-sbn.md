@@ -128,7 +128,7 @@ optional, with the synthetic atmosphere recipe covering N<=8. Float32 runs disab
 as in the established benchmark; mixed-dtype promotion of the unchanged Fourier
 kernel is not altered.
 
-The executed [tutorial](../../examples/tutorials/specmodel.ipynb) adds compact
+The executed [tutorial](../tutorials/specfit/specmodel.ipynb) adds compact
 SB2/SB3 sections using direct model/decomposition calls. It plots raw stars,
 weighted stellar contributions, featureless dilution and total; SB3 additionally
 shows region-dependent weights/RVs. These are parameter illustrations, not fits

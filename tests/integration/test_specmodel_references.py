@@ -20,7 +20,7 @@ from jaxstar.specfit.broadening import combined_kernel
 
 ROOT = os.environ.get("JAXSPEC_REFERENCE_ROOT")
 pytestmark = pytest.mark.skipif(not ROOT, reason="set JAXSPEC_REFERENCE_ROOT for frozen forward-model parity")
-HELPER = runpy.run_path(str(Path(__file__).resolve().parents[2] / "examples/_specmodel_reference.py"))
+HELPER = runpy.run_path(str(Path(__file__).resolve().parents[2] / "dev_notebooks/specfit/_specmodel_reference.py"))
 
 
 @pytest.fixture(scope="module", autouse=True)
