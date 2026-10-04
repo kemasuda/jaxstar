@@ -7,5 +7,6 @@
 !/dev_notebooks/specfit/_specmodel_plotting.py
 !/dev_notebooks/specfit/_spectral_inference_data.py
 !/dev_notebooks/specfit/spectral_inference_real_setup.py
+!/dev_notebooks/specfit/specfit_end_to_end.ipynb
 /examples/tutorials/.specmodel-data/
 /benchmark-results/

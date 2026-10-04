@@ -12,6 +12,7 @@ from .storage import load_spectral_grid, save_spectral_grid
 from .sampling import is_log_uniform, resample_spectral_grid
 from .model import SpecModel, SpectralDecomposition
 from .observation import Observation
+from .fit import SpecFit
 from .numpyro_model import (
     model_single,
     single_star_params,
@@ -43,7 +44,7 @@ __all__ = [
     "load_spectral_grid", "save_spectral_grid",
     "is_log_uniform", "resample_spectral_grid",
     "SpecModel", "SpectralDecomposition",
-    "Observation",
+    "Observation", "SpecFit",
     "model_single", "single_star_params",
     "physical_logg_max", "empirical_vmic", "empirical_vmacro_valenti_fischer2005",
     "ContinuumPrior", "ContinuumPosterior",
