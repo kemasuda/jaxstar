@@ -1,4 +1,4 @@
-"""Spectral grids, physical models, observations and Gaussian continuum helpers."""
+"""Spectral grids, physical models, observations and Gaussian likelihoods."""
 
 from .libraries import (
     load_bosz,
@@ -27,8 +27,14 @@ from .continuum import (
     evaluate_continuum,
     apply_continuum,
     continuum_prior,
-    marginalized_continuum_log_likelihood,
     continuum_posterior,
+)
+from .likelihood import (
+    marginalized_continuum_log_likelihood,
+    prepare_gp_observation,
+    gp_marginalized_continuum_log_likelihood,
+    gp_continuum_posterior,
+    gp_conditional_mean,
 )
 
 __all__ = [
@@ -44,4 +50,6 @@ __all__ = [
     "chebyshev_basis", "continuum_design_matrix", "evaluate_continuum",
     "apply_continuum", "continuum_prior",
     "marginalized_continuum_log_likelihood", "continuum_posterior",
+    "prepare_gp_observation", "gp_marginalized_continuum_log_likelihood",
+    "gp_continuum_posterior", "gp_conditional_mean",
 ]

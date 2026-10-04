@@ -195,37 +195,6 @@ def _conditional_system(observation, model_flux, sigma_constant, sigma_continuum
     return prior, scaled, residual, cholesky, delta, error, usable
 
 
-def marginalized_continuum_log_likelihood(observation, model_flux, *, sigma_constant,
-                                         sigma_continuum, degree=4, basis=None, jitter=0.0):
-    """Fully normalized Gaussian density, summed over independent regions.
-
-    Integrates a~N(mu,diag(scale**2)) in y~N(X*a,D), with diagonal
-    D[i,i]=uncertainty[i]**2+jitter[region]**2. Jitter is additive absolute
-    noise in the same flux units as uncertainty, scalar or (n_region,),
-    finite nonnegative. It has no prior here and is not observation/model state.
-    With Z=D**(-1/2)*X*diag(scale), r=D**(-1/2)*(y-X*mu),
-    H=I+Z.T*Z and delta=H**(-1)*Z.T*r, the residual quadratic is evaluated
-    stably as ||r-Z*delta||**2+||delta||**2, avoiding subtractive Woodbury
-    cancellation. logdet = 2*sum(log(error)) + 2*sum(log(diag(chol(H)))).
-    The standardized system contains the complete prior determinant contribution.
-    Only usable pixels contribute to N*log(2*pi). Fully masked regions contribute
-    zero. Both whitening and the Gaussian determinant use the effective error
-    sqrt(uncertainty**2+jitter**2). No pixel covariance or numerical ridge.
-
-    Optional basis permits setup-time caching; its last dimension must match
-    the static degree. Invalid concrete scales raise ValueError; invalid traced
-    scales raise a runtime JAX error reporting the same validation message.
-    """
-    _, scaled, residual, cholesky, delta, error, usable = _conditional_system(
-        observation, model_flux, sigma_constant, sigma_continuum, degree, basis, jitter)
-    fitted_residual = residual - jnp.einsum("...ik,...k->...i", scaled, delta)
-    quadratic = jnp.sum(fitted_residual ** 2, axis=-1) + jnp.sum(delta ** 2, axis=-1)
-    logdet = 2 * (jnp.sum(jnp.log(error), axis=-1)
-                  + jnp.sum(jnp.log(jnp.diagonal(cholesky, axis1=-2, axis2=-1)), axis=-1))
-    count = jnp.sum(usable, axis=-1)
-    return jnp.sum(-.5 * (quadratic + logdet + count * jnp.log(2 * jnp.pi)))
-
-
 def continuum_posterior(observation, model_flux, *, sigma_constant,
                         sigma_continuum, degree=4, basis=None, jitter=0.0):
     """Return conditional coefficient mean and covariance via Cholesky solves.
@@ -243,3 +212,11 @@ def continuum_posterior(observation, model_flux, *, sigma_constant,
     standardized_covariance = cho_solve((cholesky, True), identity)
     covariance = prior.scale[..., :, None] * standardized_covariance * prior.scale[..., None, :]
     return ContinuumPosterior(prior.mean + prior.scale * delta, covariance)
+
+
+def __getattr__(name):
+    # Preserve the former module import as well as the package-level export.
+    if name == "marginalized_continuum_log_likelihood":
+        from .likelihood import marginalized_continuum_log_likelihood
+        return marginalized_continuum_log_likelihood
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
