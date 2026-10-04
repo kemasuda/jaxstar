@@ -151,8 +151,9 @@ Preserved here: atmosphere interpolation, combined rotation/RT macro/Gaussian
 IP, relativistic effective RV, quadratic limb darkening, scalar/per-region RV
 and resolving power, fixed versus sampled parameters, and the same NumPyro
 model for point initialization and NUTS. The white-noise implementation omits
-GP sites intentionally. GP likelihoods/predictions remain a deferred migration
-requirement, together with binary prior models and dilution. The stellar
+GP sites intentionally. Low-level GP likelihoods/predictions are now available
+as described below; NumPyro integration remains a separate migration step,
+together with binary prior models and dilution. The stellar
 relation options now reproduce the legacy single-star logg/vmic/vmacro
 expressions using the helpers below, native physical site names and strict
 configuration checks. All other physical priors remain explicit arguments.
@@ -264,7 +265,8 @@ median without a covariance. This is a MAP-like point in transformed latent
 space; do not equate it with a uniquely defined constrained-space MAP. The
 helper's returned dict may include deterministic sites too. No separate custom
 objective, least-squares prefit or optimizer wrapper was added to jaxstar.
-The `spectral-inference` extra includes inferutils >=0.2.1,<0.3 and matplotlib;
+The `spectral-inference` extra includes inferutils >=0.2.1,<0.3, matplotlib
+and optional GP dependency tinygp >=0.3,<0.4;
 the base model requires only already-declared NumPyro/JAX dependencies.
 
 Pass large Observation/SpecModel arrays as dynamic arguments to ordinary
@@ -421,3 +423,107 @@ copied. No final inferred real-data equality is claimed, since continuum/noise
 models intentionally differ. Deterministic frozen-reference tests remain the
 strict numerical regression check. No SpecFit, CCF, iterative clipping,
 automatic refitting or GP was implemented.
+
+## Low-level spectral GP likelihood
+
+The first GP implementation step now lives in `jaxstar.specfit.likelihood`.
+The existing iid `marginalized_continuum_log_likelihood` moved here without
+changing its signature or arithmetic. Package-level imports remain the same;
+the former `jaxstar.specfit.continuum` import also resolves to the moved
+function. Continuum construction and the iid coefficient posterior stay in
+`continuum.py`. GP NumPyro integration is the next separate step; `model_single`
+continues to use its existing iid likelihood.
+
+Install `jaxstar[spectral-inference]` to include `tinygp>=0.3,<0.4` (no smolgp).
+GP operations import tinygp lazily, so iid use does not require it. The test
+extra includes tinygp for normal CI coverage. Installed tinygp 0.3.0 and the
+benchmark environment's 0.3.1 expose compatible `QuasisepSolver`, `DirectSolver`,
+`solver.solve_triangular` and `solver.normalization` APIs.
+
+The public functions are:
+
+- `prepare_gp_observation(observation)`;
+- `gp_marginalized_continuum_log_likelihood(observation, model_flux, *,
+  gp_amplitude, gp_scale, sigma_constant, sigma_continuum, degree=4,
+  basis=None, jitter=0.0, gp_solver="auto")`;
+- `gp_continuum_posterior(...)`, with the same arguments;
+- `gp_conditional_mean(observation, model_flux, *, gp_amplitude, gp_scale,
+  jitter=0.0, wavelength=None, gp_solver="auto")`.
+
+The Matérn-3/2 kernel is
+`k(d) = amplitude**2 * (1 + sqrt(3)*d/scale) * exp(-sqrt(3)*d/scale)`.
+`gp_amplitude` is a finite positive scalar standard deviation in observation
+flux units; `gp_scale` is a finite positive scalar correlation length in the
+observation wavelength unit. Both are shared across independent regions.
+Additive absolute jitter is finite nonnegative, scalar or `(n_region,)`, with
+diagonal variance `uncertainty**2 + jitter**2`. No scientific priors or log
+parameterization are imposed. Concrete invalid values fail before calculation;
+traced values use the existing runtime JAX validation convention.
+
+For each region C is the GP plus diagonal noise covariance. Whiten the residual
+`y-X*mu` and prior-scaled continuum columns `X*S` together using tinygp, then
+factor the coefficient-space matrix `H=I+Z.T@Z`. The stable quadratic is
+`||r_white-Z*delta||**2 + ||delta||**2`; normalization includes C, H and every
+usable pixel. No explicit inverse of C is formed. `gp_continuum_posterior`
+reuses the same system and returns `ContinuumPosterior(mean, covariance)` with
+the existing 1D/2D shape convention.
+
+Exact GP masks require fixed conditioning sizes. `prepare_gp_observation`
+computes usable integer indices from the concrete mask once; indices are static
+PyTree metadata and all Observation arrays stay dynamic. Pass the returned
+object inside JIT/NUTS. Eager calls or JIT closures over a concrete Observation
+may pass it directly. An unprepared dynamic Observation inside JIT fails with
+setup guidance. Rebuild the prepared object when a fitting mask changes.
+Masked flux/error/model values, including NaN/Inf, are excluded before any
+arithmetic and are absent from the conditioned covariance. Different usable
+counts per region require no ragged public arrays or Observation redesign.
+
+`gp_solver` is static: `"auto"` uses Quasisep on JAX's default CPU backend,
+Direct on its GPU backend; explicit `"quasisep"`/`"direct"` override it. Select
+explicitly if an executable uses a different backend from the default. This
+heuristic comes from the representative float64 spectral benchmark, not a
+universal performance claim, and changes no statistical model. Direct can use
+substantially more memory. tinygp 0.3 has a mixed-dtype state-space limitation:
+float32 inputs require caller-controlled x64=False; in x64 mode use float64.
+The package gives setup guidance and never changes JAX precision configuration.
+
+At one fixed nonlinear/GP parameter point, reconstruct the posterior mean by:
+
+```python
+data = prepare_gp_observation(obs)  # outside JIT / NUTS
+posterior = gp_continuum_posterior(data, physical_flux, **gp_continuum_options)
+mean_flux = apply_continuum(physical_flux, basis, posterior.mean)
+gp_mean = gp_conditional_mean(data, mean_flux, **gp_noise_options)
+data_space_mean = mean_flux + gp_mean
+```
+
+Prediction conditions only on usable pixels and defaults to all observation
+wavelengths, including masked pixels. Optional prediction wavelengths retain
+the region layout and may have a different common pixel count. The helper uses
+tinygp triangular solves and the kernel cross-coordinate matrix-vector product
+to return the latent residual GP mean. This is the joint linear-Gaussian
+posterior-mean decomposition at fixed parameters; a single curve does not
+propagate continuum/GP uncertainty or average over nonlinear posterior samples.
+Fully masked regions contribute zero density, return the continuum prior and
+have zero residual GP mean.
+
+This step adds no GP sites to `model_single`, SpecFit, CCF, outlier handling or
+explicit continuum sampling. Later NumPyro code supplies physical GP values
+and priors and prepares each fixed observation mask before tracing.
+
+Validation on CPU with JAX/jaxlib 0.6.2: the focused likelihood suite passes
+all 57 tests with both tinygp 0.3.0 and 0.3.1; the full suite reports 710 passed,
+34 skipped and 2 xfailed. Tests cover exact masks, joint Gaussian dense
+references, coefficient/GP means, both solvers, float32/float64, JIT, gradients,
+an isolated low-level NUTS smoke test and unchanged iid behavior. Representative
+float64 one-/two-region fixtures have maximum absolute dense-reference errors
+of 1.42e-14 in log likelihood, 1.73e-17 in coefficient mean, 8.42e-19 in
+coefficient covariance and 1.67e-16 in residual GP mean. Direct/Quasisep differ
+by at most 1.42e-14 in log likelihood and 4.97e-14 in tested gradients.
+
+A small CPU sanity check of the marginalized GP likelihood's `value_and_grad`
+(1984 pixels, 1587 usable, degree 4, float64, auto/Quasisep) takes 0.567 s
+for first trace/lowering/compilation and a 4.382 ms median warmed evaluation
+over 10 synchronized calls. This measures the likelihood with model-flux and
+GP/noise gradients, not a full SpecModel evaluation. GPU execution is not
+available here; its auto/Direct selection is policy-tested but not newly timed.

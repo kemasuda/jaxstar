@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 
-from .continuum import marginalized_continuum_log_likelihood
+from .likelihood import marginalized_continuum_log_likelihood
 from .model import SpecModel, _require
 from .observation import Observation
 
