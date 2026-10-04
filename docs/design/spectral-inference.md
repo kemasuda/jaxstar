@@ -86,11 +86,67 @@ arguments. To reproduce a legacy jitter prior, pass
 `dist.TransformedDistribution(dist.Uniform(-10, -3), dist.transforms.ExpTransform())`;
 the example HalfNormal prior is a documented synthetic choice, not legacy parity.
 
-Empirical relations or conditional physical constraints can already be
-expressed in a custom model using the low-level physical/likelihood helpers.
-They are not yet extra switches on the packaged single-star function. Future
-SB2/SB-N priors can reuse the small sampling helper and shared SpecModel
+Empirical relations or conditional physical constraints can be expressed in a
+custom model using the relation helpers below and the low-level
+physical/likelihood helpers. They are not extra switches on the packaged
+single-star function. Future SB2/SB-N priors can reuse the small sampling
+helper and shared SpecModel
 component physics, rather than duplicate physical evaluation or likelihoods.
+
+## Empirical relation helpers
+
+`jaxstar.specfit.numpyro_model` defines two numerical relation helpers and a
+NumPyro prior factory, also exported from `jaxstar.specfit`. Their coefficients
+are preserved from
+`jaxspec` commit `e7b2f30`, `src/jaxspec/numpyro_model.py`:
+
+| Helper | Output | Applicability noted in the legacy source |
+| --- | --- | --- |
+| `physical_logg_max(teff)` | Upper bound on logg, in log10 cgs | 4500--7000 K |
+| `empirical_vmic(teff, logg, feh)` | Microturbulent velocity, km/s | Teff > 5000 K and logg > 3.5 |
+| `empirical_vmacro_valenti_fischer2005(teff, sigma=1.0)` | Nonnegative macroturbulence prior, km/s | No range specified in the legacy source |
+
+Teff inputs are in kelvin and metallicity is in dex. The legacy BOSZ model
+passed its `mh` coordinate to the vmic helper's `feh` argument; this convention
+is explicit in the example below, with no automatic abundance conversion.
+The macroturbulence location is the relation of
+[Valenti & Fischer (2005), ApJS 159, 141](https://doi.org/10.1086/430500):
+`3.98 + (teff - 5770) / 650` km/s. The normal scatter with default
+`sigma=1 km/s` and truncation at zero reproduce the old single-star model's
+prior choices; that scatter is not attributed to the paper. The legacy source
+does not cite publications for the logg and vmic expressions.
+
+These helpers accept scalar or broadcastable array inputs and support JIT,
+gradients and vmap (applied to distribution calculations for the prior
+factory). The logg/vmic helpers evaluate the original expressions without
+clipping or range validation; the vmacro helper returns a `TruncatedNormal`
+distribution with `low=0`. None of the helpers creates sample sites. A custom
+model controls their application and checks applicability and spectral
+coverage. For example, with `teff` and `mh` already sampled and a suitable
+`logg_min` supplied:
+
+```python
+import numpyro
+import numpyro.distributions as dist
+from jaxstar.specfit import (
+    physical_logg_max, empirical_vmic, empirical_vmacro_valenti_fischer2005,
+)
+
+logg = numpyro.sample("logg", dist.Uniform(logg_min, physical_logg_max(teff)))
+vmic = numpyro.deterministic("vmic", empirical_vmic(teff, logg, feh=mh))
+vmacro = numpyro.sample(
+    "vmacro", empirical_vmacro_valenti_fischer2005(teff),
+)
+```
+
+Use `sigma=...` to change the standard deviation of the normal before
+truncation. Sigma is fixed by default, as in the old model; a custom model may
+also sample it explicitly and pass that value to the helper. The author/year
+suffix identifies the relation. Future alternatives, including a Teff/logg
+relation, should have their own named prior factories with the same
+distribution-returning convention. Sampling remains visible in the model
+body. `model_single` retains its current API and does not apply these relations
+automatically.
 
 ## Custom model workflow
 
