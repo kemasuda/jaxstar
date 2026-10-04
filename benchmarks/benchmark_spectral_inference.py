@@ -2,7 +2,7 @@
 
 Run from the checkout with PYTHONPATH=src and the spectral-inference extra.
 CPU/GPU selection uses JAX_PLATFORMS before Python starts, not a library toggle.
-This longer validation is intentionally outside CI; see docs/design/spectral-inference.md.
+This longer validation is intentionally outside CI; use --help for run options.
 """
 
 import argparse
