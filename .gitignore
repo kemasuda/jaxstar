@@ -23,3 +23,12 @@ __pycache__/
 
 # Local coordination notes; root AGENTS.md stays visible and untracked.
 /docs/local/
+
+# Local research data and backups
+/stellar-analyses/
+/.git_broken/
+/tests/unittests/MIST_iso_*.iso.cmd
+
+# Legacy local files already excluded from package builds
+/src/jaxstar/jaxstar_version.py
+/src/jaxstar/mistfit/mistgrid/__init__.py
