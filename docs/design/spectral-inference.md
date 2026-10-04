@@ -14,7 +14,8 @@ from jaxstar.specfit import model_single, chebyshev_basis
 
 kwargs = dict(
     atmosphere={"teff": dist.Uniform(5000, 6500), "logg": dist.Uniform(3.5, 4.7),
-                "mh": dist.Uniform(-0.6, 0.4), "alpha": dist.Uniform(0, 0.4)},
+                "mh": dist.Uniform(-0.6, 0.4), "alpha": dist.Uniform(0, 0.4),
+                "carbon": 0.0, "vmic": dist.Uniform(0.5, 2.5)},
     broadening={"vsini": dist.Uniform(2, 13),
                 "vmacro": dist.TruncatedNormal(3, 1, low=0.5, high=6),
                 "q1": 0.36, "q2": 0.3},
@@ -22,14 +23,18 @@ kwargs = dict(
     sigma_constant=0.1, sigma_continuum=dist.LogNormal(-3.2188758, 0.7),
     jitter=dist.HalfNormal(0.01), degree=4,
     basis=chebyshev_basis(obs.wavelength),
+    use_empirical_vmic=False,
 )
-# All ranges/scales above are illustrative, not scientific package defaults.
+# Explicit BOSZ example; all ranges/scales above are illustrative.
 ```
 
 `model_single(obs, specmodel, **kwargs)` accepts a fixed number/JAX array or
 NumPyro distribution at every parameter input. Atmosphere keys must exactly
-match the loaded library and be scalar. Other inputs can be scalar or one
-value per region. A vector distribution is promoted to one event site; there
+match the loaded library and be scalar, except that `vmic` must be omitted
+when empirical vmic is active. Broadening normally requires exactly
+`vsini/vmacro/q1/q2`; omit `vmacro` when empirical vmacro is active. Other
+inputs can be scalar or one value per region. A vector distribution is
+promoted to one event site; there
 is no accidental plate/region broadcasting. Rows are aligned explicitly;
 optional Observation.region labels must equal library labels in row order.
 No positional parameter vector, automatic CCF bounds or universal prior ranges
@@ -51,6 +56,74 @@ array site only when useful. No conditional continuum or residual array is
 stored for every draw; compute it afterwards using `continuum_posterior`,
 `evaluate_continuum`, and `apply_continuum` at a representative point or draws.
 The model returns its physical parameter dict when called under a trace.
+
+## Stellar relation options
+
+The readable model resolves Teff, then logg, then the mh coordinate needed
+for empirical vmic. Remaining atmosphere axes use their supplied fixed values
+or distributions. Relations are opt-in except for empirical vmic on BOSZ:
+
+| Argument | Default | Behavior |
+| --- | --- | --- |
+| `use_physical_logg_max` | `False` | Enable a Teff-dependent logg ceiling |
+| `use_empirical_vmic` | `None` | Auto-enable on BOSZ; `True` requests the relation, `False` disables it |
+| `use_empirical_vmacro` | `False` | Enable the Valenti & Fischer (2005) vmacro prior |
+| `vmacro_empirical_sigma` | `1.0` | Positive finite scalar width of that prior, in km/s |
+
+These switches are static Python bools (`use_empirical_vmic` also accepts
+`None`). Library identity comes from `specmodel.spectra.library == "bosz"`,
+set by the BOSZ loaders/preparers and preserved by common-grid storage and
+resampling. Axis names or source filenames alone do not enable BOSZ auto mode.
+
+With `use_physical_logg_max=True`, `atmosphere["logg"]` supports a scalar
+`dist.Uniform` or a fixed scalar. For a Uniform, its lower bound is retained
+and its upper bound is replaced by `physical_logg_max(teff)`; the originally
+supplied upper bound is ignored, reproducing legacy jaxspec behavior. Logg
+remains a native `logg` sample site. Other distribution types, including
+transformed or event-wrapped Uniforms, are rejected in this mode. A fixed
+logg remains deterministic and must be finite and at or below the ceiling.
+The Uniform lower bound must be finite and strictly below the computed
+upper bound; invalid intervals fail clearly. This option requires teff/logg
+axes and does not clip the input Teff to 4500--7000 K or clamp the computed
+ceiling to a grid boundary. The caller must select a compatible Teff prior
+and lower bound over the full support.
+
+Empirical vmic requires teff/logg/mh/vmic axes. `None` enables it automatically
+for BOSZ, `True` enables it explicitly for any compatible library, and
+`False` uses the ordinary explicit vmic value or prior. The active mode
+records `vmic` deterministically from `empirical_vmic(teff, logg, mh)`;
+there is no latent vmic. Omit `atmosphere["vmic"]` in active modes. Supplying
+it is an error even in BOSZ auto mode; use `False` to fit or fix it explicitly.
+Non-BOSZ auto mode requires explicit vmic if the loaded library has that axis.
+All other atmosphere keys remain mandatory and extra keys are rejected.
+
+Empirical vmacro requires a teff axis and samples exactly one shared scalar
+stellar `vmacro` from `empirical_vmacro_valenti_fischer2005(teff,
+sigma=vmacro_empirical_sigma)`. Its lower bound is zero and its default
+normal width before truncation is 1 km/s. Sigma must be finite, positive and
+scalar; a per-region sigma is rejected. Omit `broadening["vmacro"]` when
+this mode is enabled; providing both is an error. `vsini/q1/q2` remain
+mandatory and extra broadening keys are rejected. Explicit broadening,
+kinematics, continuum scales and jitter retain their scalar/per-region
+behavior. No `*_scaled` sites are introduced.
+
+For a BOSZ fit using all three relations, the configuration is explicit:
+
+```python
+kwargs = dict(
+    atmosphere={"teff": dist.Uniform(5200, 6200),
+                "logg": dist.Uniform(3.8, 4.9),  # upper bound is replaced
+                "mh": dist.Uniform(-0.3, 0.3), "alpha": 0.0, "carbon": 0.0},
+    broadening={"vsini": dist.Uniform(2, 13), "q1": 0.36, "q2": 0.3},
+    rv=dist.Uniform(8, 17), resolving_power=70000,
+    sigma_constant=0.1, sigma_continuum=0.03, jitter=0.0,
+    use_physical_logg_max=True,
+    use_empirical_vmic=None,  # BOSZ auto; vmic omitted above
+    use_empirical_vmacro=True,
+    vmacro_empirical_sigma=1.0,
+)
+# Illustrative configuration; choose a grid and coverage supporting the priors.
+```
 
 ## Likelihood and deliberate legacy changes
 
@@ -79,18 +152,74 @@ IP, relativistic effective RV, quadratic limb darkening, scalar/per-region RV
 and resolving power, fixed versus sampled parameters, and the same NumPyro
 model for point initialization and NUTS. The white-noise implementation omits
 GP sites intentionally. GP likelihoods/predictions remain a deferred migration
-requirement, together with empirical vmic/vmacro options, physical-logg
-constraints, binary prior models and dilution. No old prior range has been
-silently replaced by a new default: physical priors are mandatory explicit
-arguments. To reproduce a legacy jitter prior, pass
+requirement, together with binary prior models and dilution. The stellar
+relation options now reproduce the legacy single-star logg/vmic/vmacro
+expressions using the helpers below, native physical site names and strict
+configuration checks. All other physical priors remain explicit arguments.
+To reproduce a legacy jitter prior, pass
 `dist.TransformedDistribution(dist.Uniform(-10, -3), dist.transforms.ExpTransform())`;
 the example HalfNormal prior is a documented synthetic choice, not legacy parity.
 
-Empirical relations or conditional physical constraints can already be
-expressed in a custom model using the low-level physical/likelihood helpers.
-They are not yet extra switches on the packaged single-star function. Future
-SB2/SB-N priors can reuse the small sampling helper and shared SpecModel
+Empirical relations or conditional physical constraints can be expressed in a
+custom model using the relation helpers below and the low-level
+physical/likelihood helpers, or selected through the single-star options above.
+Future SB2/SB-N priors can reuse the small sampling helper and shared SpecModel
 component physics, rather than duplicate physical evaluation or likelihoods.
+
+## Empirical relation helpers
+
+`jaxstar.specfit.numpyro_model` defines two numerical relation helpers and a
+NumPyro prior factory, also exported from `jaxstar.specfit`. Their coefficients
+are preserved from
+`jaxspec` commit `e7b2f30`, `src/jaxspec/numpyro_model.py`:
+
+| Helper | Output | Applicability noted in the legacy source |
+| --- | --- | --- |
+| `physical_logg_max(teff)` | Upper bound on logg, in log10 cgs | 4500--7000 K |
+| `empirical_vmic(teff, logg, feh)` | Microturbulent velocity, km/s | Teff > 5000 K and logg > 3.5 |
+| `empirical_vmacro_valenti_fischer2005(teff, sigma=1.0)` | Nonnegative macroturbulence prior, km/s | No range specified in the legacy source |
+
+Teff inputs are in kelvin and metallicity is in dex. The legacy BOSZ model
+passed its `mh` coordinate to the vmic helper's `feh` argument; this convention
+is explicit in the example below, with no automatic abundance conversion.
+The macroturbulence location is the relation of
+[Valenti & Fischer (2005), ApJS 159, 141](https://doi.org/10.1086/430500):
+`3.98 + (teff - 5770) / 650` km/s. The normal scatter with default
+`sigma=1 km/s` and truncation at zero reproduce the old single-star model's
+prior choices; that scatter is not attributed to the paper. The legacy source
+does not cite publications for the logg and vmic expressions.
+
+These helpers accept scalar or broadcastable array inputs and support JIT,
+gradients and vmap (applied to distribution calculations for the prior
+factory). The logg/vmic helpers evaluate the original expressions without
+clipping or range validation; the vmacro helper returns a `TruncatedNormal`
+distribution with `low=0`. None of the helpers creates sample sites. A custom
+model controls their application and checks applicability and spectral
+coverage. For example, with `teff` and `mh` already sampled and a suitable
+`logg_min` supplied:
+
+```python
+import numpyro
+import numpyro.distributions as dist
+from jaxstar.specfit import (
+    physical_logg_max, empirical_vmic, empirical_vmacro_valenti_fischer2005,
+)
+
+logg = numpyro.sample("logg", dist.Uniform(logg_min, physical_logg_max(teff)))
+vmic = numpyro.deterministic("vmic", empirical_vmic(teff, logg, feh=mh))
+vmacro = numpyro.sample(
+    "vmacro", empirical_vmacro_valenti_fischer2005(teff),
+)
+```
+
+Use `sigma=...` to change the standard deviation of the normal before
+truncation. Sigma is fixed by default, as in the old model; a custom model may
+also sample it explicitly and pass that value to the helper. The author/year
+suffix identifies the relation. Future alternatives, including a Teff/logg
+relation, should have their own named prior factories with the same
+distribution-returning convention. Sampling remains visible in the model
+body. The current `model_single` options use the existing helpers directly;
+custom models can choose other relations without adopting these switches.
 
 ## Custom model workflow
 
