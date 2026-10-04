@@ -13,12 +13,12 @@ import pytest
 
 from jaxstar.grid import Field, RectilinearGrid
 from jaxstar.specfit import (Observation, SpecModel, model_single, single_star_params,
-    marginalized_continuum_log_likelihood, continuum_posterior, chebyshev_basis)
+    marginalized_continuum_log_likelihood, continuum_posterior, chebyshev_basis,
+    prepare_gp_observation, gp_marginalized_continuum_log_likelihood)
 from jaxstar.specfit._data import _SpectralLibrary
 
 
-@pytest.fixture
-def case():
+def _case():
     wave = np.array([5000., 6000.])[:, None] * np.exp(np.linspace(-250., 250., 601) / 299792.458)
     profile = np.exp(-.5 * (np.linspace(-250., 250., 601) / 4.)**2)
     flux = np.stack([np.broadcast_to(1-depth*profile, wave.shape) for depth in (.2, .5)])
@@ -42,6 +42,11 @@ def case():
         sigma_constant=.1, sigma_continuum=.03, jitter=.004,
         basis=chebyshev_basis(obs.wavelength))
     return obs, model, kwargs, point, physical
+
+
+@pytest.fixture
+def case():
+    return _case()
 
 
 def trace_at(obs, model, kwargs, values):
@@ -193,3 +198,223 @@ def test_single_region_1d_observation(case):
     trace = trace_at(single_obs, single_model, config, {"teff": point["teff"]})
     assert trace["model_flux"]["value"].shape == single_obs.shape
     assert np.isfinite(log_density(model_single, (single_obs, single_model), config, {"teff": point["teff"]})[0])
+
+
+@pytest.fixture
+def gp_case(x64_context):
+    pytest.importorskip("tinygp")
+    with x64_context():
+        obs, model, kwargs, point, physical = _case()
+        mask = obs.mask.copy()
+        mask[:, 7:10] = True
+        y, error = obs.flux.copy(), obs.uncertainty.copy()
+        y[mask], error[mask] = np.nan, np.inf
+        obs = Observation(obs.wavelength, y, error, mask, region=obs.region)
+        config = dict(kwargs, gp_amplitude=.015, gp_scale=.3)
+        yield obs, model, config, point, physical
+
+
+@pytest.mark.parametrize("solver", ["auto", "quasisep", "direct"])
+def test_gp_fixed_factor_and_compact_trace(gp_case, solver):
+    import inspect
+    obs, model, config, point, physical = gp_case
+    assert "gp_data" not in inspect.signature(model_single).parameters
+    config = dict(config, gp_solver=solver, jitter=np.array([.004, .008]))
+    trace = trace_at(obs, model, config, point)
+    expected = gp_marginalized_continuum_log_likelihood(
+        prepare_gp_observation(obs), physical, gp_amplitude=.015, gp_scale=.3,
+        sigma_constant=.1, sigma_continuum=.03, jitter=config["jitter"],
+        basis=config["basis"], gp_solver=solver)
+    np.testing.assert_allclose(trace["spectrum"]["fn"].log_factor, expected, atol=1e-11)
+    assert trace["gp_amplitude"]["type"] == trace["gp_scale"]["type"] == "deterministic"
+    assert {name for name, site in trace.items()
+            if site["type"] == "sample" and not site["is_observed"]} == {"teff"}
+    assert set(trace) == {"teff", "vsini", "vmacro", "q1", "q2", "rv",
+        "resolving_power", "sigma_constant", "sigma_continuum", "jitter",
+        "gp_amplitude", "gp_scale", "u1", "u2", "spectrum"}
+    saved = trace_at(obs, model, dict(config, save_model_flux=True), point)
+    np.testing.assert_allclose(saved["model_flux"]["value"], physical, atol=1e-12)
+    params = handlers.substitute(model_single, data=point)(obs, model, **config)
+    expected_params = single_star_params({"teff": point["teff"]},
+        **{k: v for k, v in point.items() if k != "teff"})
+    for actual, expected in zip(jax.tree.leaves(params), jax.tree.leaves(expected_params)):
+        np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("solver", ["quasisep", "direct"])
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_gp_sampled_sites_concrete_jit_and_joint_density(solver, dtype, x64_context):
+    pytest.importorskip("tinygp")
+    with x64_context(dtype == "float64"):
+        obs, model, kwargs, point, physical = _case()
+        data = prepare_gp_observation(obs)
+        config = dict(kwargs, gp_solver=solver,
+            gp_amplitude=dist.LogNormal(jnp.log(.015), .4),
+            gp_scale=dist.LogNormal(jnp.log(.3), .4),
+            jitter=dist.HalfNormal(jnp.array([.01, .02])),
+            sigma_continuum=dist.LogNormal(jnp.log(.03), .5))
+        theta = dict(teff=5800., gp_amplitude=.015, gp_scale=.3,
+                     jitter=jnp.array([.004, .008]), sigma_continuum=.025)
+        trace = trace_at(obs, model, config, theta)
+        latent = {n for n, s in trace.items() if s["type"] == "sample" and not s["is_observed"]}
+        assert latent == set(theta)
+        assert trace["gp_amplitude"]["fn"].event_shape == trace["gp_scale"]["fn"].event_shape == ()
+        assert not {"lna", "lnc", "save_pred", "model_flux"}.intersection(trace)
+        expected = gp_marginalized_continuum_log_likelihood(
+            data, physical, gp_amplitude=.015, gp_scale=.3, sigma_constant=.1,
+            sigma_continuum=.025, jitter=theta["jitter"], basis=config["basis"], gp_solver=solver)
+        for name in theta:
+            prior = config["atmosphere"][name] if name == "teff" else config[name]
+            expected += jnp.sum(prior.log_prob(theta[name]))
+        def density(values, specmodel):
+            # Only Observation is concrete; large spectral-library arrays can
+            # still be passed as dynamic JIT data through SpecModel.
+            return log_density(model_single, (obs, specmodel), config, values)[0]
+        eager, eager_grad = jax.value_and_grad(density)(theta, model)
+        actual, gradient = jax.jit(jax.value_and_grad(density))(theta, model)
+        tol = 1e-3 if dtype == "float32" else 1e-10
+        np.testing.assert_allclose(actual, expected, atol=tol)
+        np.testing.assert_allclose(actual, eager, atol=tol)
+        assert actual.dtype == jnp.dtype(dtype)
+        assert all(np.all(np.isfinite(x)) for x in gradient.values())
+        for name in theta:
+            np.testing.assert_allclose(gradient[name], eager_grad[name], atol=tol)
+        # Different masked poison must not change inference or its gradients.
+        changed = Observation(obs.wavelength, np.where(obs.mask, np.inf, obs.flux),
+                              np.where(obs.mask, np.nan, obs.uncertainty),
+                              obs.mask, region=obs.region)
+        def changed_density(values, specmodel):
+            return log_density(model_single, (changed, specmodel), config, values)[0]
+        other, other_grad = jax.jit(jax.value_and_grad(changed_density))(theta, model)
+        np.testing.assert_allclose(other, actual, atol=tol)
+        for name in theta:
+            np.testing.assert_allclose(other_grad[name], gradient[name], atol=tol)
+
+
+@pytest.mark.parametrize("solver", ["quasisep", "direct"])
+def test_gp_svi_and_nuts_masked_sampled_hyperparameters(gp_case, solver):
+    from numpyro.infer.autoguide import AutoNormal
+    obs, model, config, point, _ = gp_case
+    config = dict(config, gp_amplitude=dist.LogNormal(jnp.log(.015), .4),
+                  gp_scale=dist.LogNormal(jnp.log(.3), .4), gp_solver=solver)
+    initial = dict(teff=point["teff"], gp_amplitude=.015, gp_scale=.3)
+    guide = AutoNormal(model_single, init_loc_fn=init_to_value(values=initial))
+    svi = SVI(model_single, guide, numpyro.optim.Adam(.02), Trace_ELBO(), **config)
+    result = svi.run(jax.random.PRNGKey(12), 20, obs, model, progress_bar=False)
+    assert np.all(np.isfinite(result.losses))
+    estimate = guide.median(result.params)
+    assert set(initial).issubset(estimate)
+    assert not {"model_flux", "gp_mean", "coefficients"}.intersection(estimate)
+    assert float(estimate["gp_amplitude"]) > 0 and float(estimate["gp_scale"]) > 0
+    sampler = MCMC(NUTS(model_single, init_strategy=init_to_value(values=initial)),
+                   num_warmup=8, num_samples=8, progress_bar=False)
+    sampler.run(jax.random.PRNGKey(13), obs, model, **config)
+    samples = sampler.get_samples()
+    assert set(initial).issubset(samples)
+    assert not {"model_flux", "gp_mean", "coefficients"}.intersection(samples)
+    assert all(np.all(np.isfinite(x)) for x in samples.values())
+    assert np.all(samples["gp_amplitude"] > 0) and np.all(samples["gp_scale"] > 0)
+
+
+@pytest.mark.parametrize("change,error,message", [
+    ({"gp_scale": None}, ValueError, "both gp_amplitude and gp_scale"),
+    ({"gp_amplitude": None}, ValueError, "both gp_amplitude and gp_scale"),
+    ({"gp_amplitude": np.array([.01, .02])}, ValueError, "gp_amplitude must be scalar"),
+    ({"gp_scale": dist.LogNormal(jnp.zeros(2), .4)}, ValueError, "gp_scale must be scalar"),
+    ({"gp_amplitude": 0.}, ValueError, "gp_amplitude must be finite and positive"),
+    ({"gp_scale": np.inf}, ValueError, "gp_scale must be finite and positive"),
+    ({"gp_solver": "unknown"}, ValueError, "gp_solver must be"),
+])
+def test_gp_configuration_errors(gp_case, change, error, message):
+    obs, model, config, point, _ = gp_case
+    with pytest.raises(error, match=message):
+        seeded = handlers.seed(handlers.substitute(model_single, data=point), 0)
+        handlers.trace(seeded).get_trace(obs, model, **dict(config, **change))
+
+
+def test_gp_internal_preparation_uses_current_mask_and_data(gp_case):
+    obs, model, config, point, physical = gp_case
+    changed_mask = obs.mask.copy()
+    changed_mask[:, 14:17] = True
+    changed = Observation(obs.wavelength, obs.flux, obs.uncertainty, changed_mask, region=obs.region)
+    trace = trace_at(changed, model, config, point)
+    expected = gp_marginalized_continuum_log_likelihood(prepare_gp_observation(changed), physical,
+        gp_amplitude=.015, gp_scale=.3, sigma_constant=.1, sigma_continuum=.03,
+        jitter=.004, basis=config["basis"])
+    np.testing.assert_allclose(trace["spectrum"]["fn"].log_factor, expected, atol=1e-11)
+    assert trace["spectrum"]["fn"].log_factor != trace_at(obs, model, config, point)["spectrum"]["fn"].log_factor
+    # Changing data or masks requires no separately managed preparation cache.
+    updated = Observation(obs.wavelength, obs.flux + .002, obs.uncertainty * 1.2,
+                          obs.mask, region=obs.region)
+    trace = trace_at(updated, model, config, point)
+    expected = gp_marginalized_continuum_log_likelihood(prepare_gp_observation(updated), physical,
+        gp_amplitude=.015, gp_scale=.3, sigma_constant=.1, sigma_continuum=.03,
+        jitter=.004, basis=config["basis"])
+    np.testing.assert_allclose(trace["spectrum"]["fn"].log_factor, expected, atol=1e-11)
+
+
+def test_gp_dynamic_observation_is_intentionally_unsupported(gp_case):
+    obs, model, config, point, _ = gp_case
+    assert np.any(obs.mask)
+    fn = jax.jit(jax.value_and_grad(lambda p, o, m: log_density(
+        model_single, (o, m), config, p)[0]))
+    with pytest.raises(ValueError, match="GP masks must be fixed.*Ordinary SVI/NUTS.*jit_model_args=True"):
+        fn({"teff": point["teff"]}, obs, model)
+
+
+def test_iid_nuts_preserves_dynamic_model_arguments(case):
+    from functools import partial
+    obs, model, config, point, _ = case
+    sampler = MCMC(NUTS(partial(model_single, **config),
+                        init_strategy=init_to_value(values={"teff": point["teff"]})),
+                   num_warmup=8, num_samples=8, progress_bar=False, jit_model_args=True)
+    sampler.run(jax.random.PRNGKey(14), obs, model)
+    assert np.all(np.isfinite(sampler.get_samples()["teff"]))
+
+
+@pytest.mark.parametrize("dtype,value,jitter_gradient,sc_gradient,teff_gradient", [
+    ("float32", 309.6420593261719, [-1489.8358154296875, -2071.884765625],
+     -326.5060119628906, 7.903543883003294e-05),
+    ("float64", 309.6426378883581, [-1489.8364308461478, -2071.8847537307847],
+     -326.50523535342893, 7.886845737471048e-05),
+])
+def test_iid_pre_gp_integration_reference(dtype, value, jitter_gradient, sc_gradient,
+                                          teff_gradient, x64_context):
+    with x64_context(dtype == "float64"):
+        obs, model, kwargs, point, _ = _case()
+        config = dict(kwargs, jitter=dist.HalfNormal(jnp.array([.01, .02])),
+                      sigma_continuum=dist.LogNormal(jnp.log(.03), .5))
+        theta = dict(teff=point["teff"], jitter=jnp.array([.004, .008]), sigma_continuum=.025)
+        fn = jax.jit(jax.value_and_grad(lambda p, o, m: log_density(
+            model_single, (o, m), config, p)[0]))
+        actual, gradients = fn(theta, obs, model)
+        # Captured from 85439c7 before adding any GP arguments/branches.
+        tol = dict(rtol=3e-6, atol=2e-7) if dtype == "float32" else dict(rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(actual, value, **tol)
+        np.testing.assert_allclose(gradients["jitter"], jitter_gradient, **tol)
+        np.testing.assert_allclose(gradients["sigma_continuum"], sc_gradient, **tol)
+        np.testing.assert_allclose(gradients["teff"], teff_gradient, **tol)
+        trace = trace_at(obs, model, config, theta)
+        assert list(trace) == ["teff", "vsini", "vmacro", "q1", "q2", "rv",
+            "resolving_power", "sigma_constant", "sigma_continuum", "jitter", "u1", "u2", "spectrum"]
+
+
+def test_gp_single_region_1d_observation(gp_case):
+    from dataclasses import replace
+    obs, model, config, point, _ = gp_case
+    library = model.spectra
+    field = library.grid.field("flux")
+    grid = RectilinearGrid(axes={"teff": library.grid.axis("teff")},
+        fields={"flux": Field(field.values[..., :1, :], field.dims, payload_dims=field.payload_dims)})
+    single_model = SpecModel(replace(library, grid=grid,
+        wavelength=np.asarray(library.wavelength)[:1], regions=(8,)), vmax=30.)
+    single_obs = Observation(obs.wavelength[0], obs.flux[0], obs.uncertainty[0],
+                             obs.mask[0], region=(8,))
+    config = dict(config, basis=chebyshev_basis(single_obs.wavelength), save_model_flux=True)
+    trace = trace_at(single_obs, single_model, config, point)
+    flux = trace["model_flux"]["value"]
+    assert flux.shape == single_obs.shape
+    expected = gp_marginalized_continuum_log_likelihood(prepare_gp_observation(single_obs), flux,
+        gp_amplitude=.015, gp_scale=.3, sigma_constant=.1, sigma_continuum=.03,
+        jitter=.004, basis=config["basis"])
+    np.testing.assert_allclose(trace["spectrum"]["fn"].log_factor, expected, atol=1e-11)

@@ -1,6 +1,6 @@
-"""Optional single-star priors on the ordinary deterministic/continuum APIs.
+"""Optional single-star priors on deterministic and marginalized likelihood APIs.
 
-No optimizer, sampled continuum coefficients, GP, or fitting state lives here.
+No optimizer, sampled continuum coefficients or fitting state lives here.
 Users can instead write their own NumPyro model using exactly the same helpers.
 """
 
@@ -10,7 +10,10 @@ import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 
-from .likelihood import marginalized_continuum_log_likelihood
+from .likelihood import (
+    gp_marginalized_continuum_log_likelihood,
+    marginalized_continuum_log_likelihood, prepare_gp_observation,
+)
 from .model import SpecModel, _require
 from .observation import Observation
 
@@ -166,8 +169,20 @@ def _validate_single_config(observation, specmodel, atmosphere, broadening, *,
     return axes, count, empirical_vmic_active
 
 
+def _validate_gp_config(axes, gp_amplitude, gp_scale):
+    """Select GP mode from the paired physical hyperparameter arguments."""
+    if (gp_amplitude is None) != (gp_scale is None):
+        raise ValueError("supply both gp_amplitude and gp_scale, or neither for iid noise")
+    if gp_amplitude is None:
+        return False
+    if set(axes).intersection(("gp_amplitude", "gp_scale")):
+        raise ValueError("atmosphere axis names conflict with GP sample sites")
+    return True
+
+
 def model_single(observation, specmodel, *, atmosphere, broadening, rv,
                  resolving_power, sigma_constant, sigma_continuum, jitter=0.0,
+                 gp_amplitude=None, gp_scale=None, gp_solver="auto",
                  use_physical_logg_max=False, use_empirical_vmic=None,
                  use_empirical_vmacro=False, vmacro_empirical_sigma=1.0,
                  degree=4, basis=None, save_model_flux=False):
@@ -182,6 +197,18 @@ def model_single(observation, specmodel, *, atmosphere, broadening, rv,
     scales can be scalar or (n_region,). No scientific prior ranges or universal
     continuum/jitter prior are chosen here; pass them explicitly. Jitter defaults
     to zero and is additive absolute noise in observation flux units.
+
+    With both ``gp_amplitude`` and ``gp_scale`` omitted, the existing iid
+    likelihood is used. Supply both as fixed positive scalars or NumPyro
+    distributions to add a Matérn-3/2 residual GP shared across independent
+    regions. Amplitude is in flux units; scale is in wavelength units. Exact
+    masked GP conditioning is prepared internally from the current Observation.
+    Its mask must be concrete/fixed when tracing: ordinary SVI/NUTS and JIT
+    closing over concrete data are supported; dynamically tracing Observation,
+    including MCMC(jit_model_args=True), is unsupported in GP mode. Static
+    ``gp_solver`` is passed to the likelihood: auto selects default CPU
+    Quasisep/GPU Direct; explicit quasisep/direct override it. No GP predictions
+    are stored in traces.
 
     ``use_physical_logg_max=True`` replaces the upper bound of a scalar Uniform
     logg prior with ``physical_logg_max(teff)``, retaining its lower bound.
@@ -202,7 +229,8 @@ def model_single(observation, specmodel, *, atmosphere, broadening, rv,
     calibration or grid bounds; the caller must choose compatible prior support.
 
     Site names are the atmosphere axis names, vsini/vmacro/q1/q2, rv,
-    resolving_power, sigma_constant/sigma_continuum and jitter. Fixed values
+    resolving_power, sigma_constant/sigma_continuum and jitter, plus
+    gp_amplitude/gp_scale when GP is enabled. Fixed values
     produce deterministic sites. u1/u2 are deterministic transformations.
     ``spectrum`` is a normalized marginalized-likelihood factor. Continuum
     coefficients never become latent sites. The returned physical parameter
@@ -217,6 +245,7 @@ def model_single(observation, specmodel, *, atmosphere, broadening, rv,
         observation, specmodel, atmosphere, broadening,
         use_physical_logg_max=use_physical_logg_max, use_empirical_vmic=use_empirical_vmic,
         use_empirical_vmacro=use_empirical_vmacro, vmacro_empirical_sigma=vmacro_empirical_sigma)
+    gp_enabled = _validate_gp_config(axes, gp_amplitude, gp_scale)
 
     # Resolve stellar coordinates in dependency order: Teff -> logg -> mh/vmic.
     coordinates = {}
@@ -268,6 +297,9 @@ def model_single(observation, specmodel, *, atmosphere, broadening, rv,
     sigma_constant = _draw("sigma_constant", sigma_constant, regions=n_regions)
     sigma_continuum = _draw("sigma_continuum", sigma_continuum, regions=n_regions)
     jitter = _draw("jitter", jitter, regions=n_regions)
+    if gp_enabled:
+        gp_amplitude = _draw("gp_amplitude", gp_amplitude)
+        gp_scale = _draw("gp_scale", gp_scale)
 
     # Convert limb darkening and evaluate the physical spectrum.
     params = single_star_params(
@@ -280,8 +312,22 @@ def model_single(observation, specmodel, *, atmosphere, broadening, rv,
         numpyro.deterministic("model_flux", flux)
 
     # Normalized likelihood with the continuum integrated out.
-    log_likelihood = marginalized_continuum_log_likelihood(
-        observation, flux, degree=degree, basis=basis,
-        sigma_constant=sigma_constant, sigma_continuum=sigma_continuum, jitter=jitter)
+    if not gp_enabled:
+        log_likelihood = marginalized_continuum_log_likelihood(
+            observation, flux, degree=degree, basis=basis,
+            sigma_constant=sigma_constant, sigma_continuum=sigma_continuum, jitter=jitter)
+    else:
+        try:
+            gp_data = prepare_gp_observation(observation)
+        except ValueError as exc:
+            raise ValueError(
+                "GP masks must be fixed before tracing model_single. Ordinary SVI/NUTS "
+                "are supported; dynamically tracing Observation/mask, including "
+                "jit_model_args=True, is not supported. Capture a concrete Observation "
+                "for GP JIT evaluation.") from exc
+        log_likelihood = gp_marginalized_continuum_log_likelihood(
+            gp_data, flux, degree=degree, basis=basis,
+            sigma_constant=sigma_constant, sigma_continuum=sigma_continuum, jitter=jitter,
+            gp_amplitude=gp_amplitude, gp_scale=gp_scale, gp_solver=gp_solver)
     numpyro.factor("spectrum", log_likelihood)
     return params
