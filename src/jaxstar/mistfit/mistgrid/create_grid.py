@@ -97,6 +97,10 @@ def create_mistgrid(path=None):
 
     # %%
     def eepderivative(y):
+        # Unit-spaced EEP: centered differences at interior nodes, copying the
+        # neighboring difference at each endpoint. dmdeep is stored and later
+        # interpolated independently of mass values to approximate the smooth
+        # physical relation; do not replace it with AD of the linear interpolant.
         dy = 0.5 * (y[2:] - y[:-2])
         return np.array([dy[0]]+list(dy)+[dy[-1]])
 

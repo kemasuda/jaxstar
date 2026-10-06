@@ -120,6 +120,7 @@ class RectilinearGrid:
     field_payload_dims: tuple[tuple[str, ...], ...]
     boundary: str
     _axis_values: tuple[Any, ...]
+    _axis_first_steps: tuple[Any, ...]
     _field_values: tuple[Any, ...]
     fill_value: Any
 
@@ -149,6 +150,7 @@ class RectilinearGrid:
         field_payload_dims,
         boundary,
         axis_values,
+        axis_first_steps,
         field_values,
         fill_value,
     ):
@@ -159,6 +161,7 @@ class RectilinearGrid:
         object.__setattr__(self, "field_payload_dims", tuple(field_payload_dims))
         object.__setattr__(self, "boundary", boundary)
         object.__setattr__(self, "_axis_values", tuple(axis_values))
+        object.__setattr__(self, "_axis_first_steps", tuple(axis_first_steps))
         object.__setattr__(self, "_field_values", tuple(field_values))
         object.__setattr__(self, "fill_value", fill_value)
 
@@ -187,6 +190,7 @@ class RectilinearGrid:
         coordinates: Mapping[str, ArrayLike],
         *,
         keys: str | Sequence[str] | None = None,
+        legacy_interpolation: bool = False,
     ) -> GridResult:
         """Linearly interpolate selected fields at physical coordinates.
 
@@ -196,6 +200,12 @@ class RectilinearGrid:
             keys: Field name, ordered sequence of field names, or ``None`` for
                 all fields in schema order.  This selection is immutable and is
                 normally static for a compiled model configuration.
+            legacy_interpolation: Static diagnostic option for regular axes.
+                Use the first node spacing, computed before JAX dtype conversion,
+                for fractional indices and disable query sanitization before
+                arithmetic. Inclusive endpoints and the output validity mask
+                are retained. Nonfinite inputs can then have nonfinite gradients.
+                This does not reproduce the old constant-fill kernel in full.
 
         Returns:
             An immutable ordered mapping from selected names to JAX arrays.
@@ -207,6 +217,10 @@ class RectilinearGrid:
         therefore retain the field dtype even with higher-precision queries.
         Scalar fields retain the existing ``map_coordinates`` dtype behavior.
         """
+        if not isinstance(legacy_interpolation, bool):
+            raise TypeError("legacy_interpolation must be a static bool")
+        if legacy_interpolation and any(kind != "regular" for kind in self.axis_kinds):
+            raise ValueError("legacy_interpolation requires regular axes with at least two nodes")
         selected_names = _normalize_selected_names(keys, self.field_names)
         selected_indices = tuple(self.field_names.index(name) for name in selected_names)
         query_values = _coordinates_in_schema_order(coordinates, self.axis_names)
@@ -222,13 +236,17 @@ class RectilinearGrid:
 
         fractional_by_name = {}
         valid_by_name = {}
-        for name, kind, axis_values, query in zip(
+        for name, kind, axis_values, first_step, query in zip(
             self.axis_names,
             self.axis_kinds,
             self._axis_values,
+            self._axis_first_steps,
             broadcast_queries,
         ):
-            fractional, valid = _fractional_coordinate(axis_values, kind, query)
+            fractional, valid = _fractional_coordinate(
+                axis_values, kind, query,
+                legacy_step=first_step if legacy_interpolation else None,
+            )
             fractional_by_name[name] = fractional
             valid_by_name[name] = valid
 
@@ -269,7 +287,7 @@ class RectilinearGrid:
         return GridResult(names=selected_names, arrays=tuple(outputs))
 
     def tree_flatten(self):
-        children = (self._axis_values, self._field_values, self.fill_value)
+        children = (self._axis_values, self._axis_first_steps, self._field_values, self.fill_value)
         metadata = (
             self.axis_names,
             self.axis_kinds,
@@ -290,7 +308,7 @@ class RectilinearGrid:
             field_payload_dims,
             boundary,
         ) = metadata
-        axis_values, field_values, fill_value = children
+        axis_values, axis_first_steps, field_values, fill_value = children
         grid = object.__new__(cls)
         grid._set_components(
             axis_names=axis_names,
@@ -300,6 +318,7 @@ class RectilinearGrid:
             field_payload_dims=field_payload_dims,
             boundary=boundary,
             axis_values=axis_values,
+            axis_first_steps=axis_first_steps,
             field_values=field_values,
             fill_value=fill_value,
         )
@@ -318,12 +337,14 @@ def _normalize_grid(*, axes, fields, fill_value, boundary):
     _validate_names(axis_names, "axis")
 
     axis_values = []
+    axis_first_steps = []
     axis_kinds = []
     axis_sizes = {}
     for name, specification in axes.items():
         axis = specification if isinstance(specification, Axis) else Axis(specification)
-        values, kind = _normalize_axis(name, axis)
+        values, kind, first_step = _normalize_axis(name, axis)
         axis_values.append(values)
+        axis_first_steps.append(first_step)
         axis_kinds.append(kind)
         axis_sizes[name] = values.shape[0]
 
@@ -396,6 +417,7 @@ def _normalize_grid(*, axes, fields, fill_value, boundary):
         "field_payload_dims": tuple(field_payload_dims),
         "boundary": boundary,
         "axis_values": tuple(axis_values),
+        "axis_first_steps": tuple(axis_first_steps),
         "field_values": tuple(field_values),
         "fill_value": jax_fill,
     }
@@ -445,7 +467,10 @@ def _normalize_axis(name: str, axis: Axis):
         else:
             kind = axis.kind
 
-    return jax_values, kind
+    # Keep the input-precision subtraction: casting 8.0 and 8.05 before
+    # subtracting does not give float32(0.05). Only the legacy option uses it.
+    first_step = jnp.asarray(input_values[1] - input_values[0]) if host_values.size > 1 else None
+    return jax_values, kind, first_step
 
 
 def _is_regular_axis(values):
@@ -567,7 +592,7 @@ def _interpolate_payload(values, axis_order, stencil, payload_ndim):
     return result
 
 
-def _fractional_coordinate(axis_values, kind, query):
+def _fractional_coordinate(axis_values, kind, query, *, legacy_step=None):
     """Map physical coordinates to fractional array indices and a valid mask."""
     query = jnp.asarray(query)
     lower = axis_values[0]
@@ -579,12 +604,15 @@ def _fractional_coordinate(axis_values, kind, query):
 
     # Sanitizing before arithmetic prevents NaN/inf query values from leaking
     # through gradients of an unselected ``where`` branch.
-    safe_query = jnp.where(valid, query, lower)
+    safe_query = jnp.where(valid, query, lower) if legacy_step is None else query
 
     if kind == "singleton":
         fractional = jnp.zeros_like(safe_query, dtype=jnp.result_type(safe_query, 1.0))
     elif kind == "regular":
-        fractional = (safe_query - lower) * (axis_values.size - 1) / (upper - lower)
+        if legacy_step is None:
+            fractional = (safe_query - lower) * (axis_values.size - 1) / (upper - lower)
+        else:
+            fractional = (safe_query - lower) / legacy_step
     elif kind == "nonuniform":
         lower_index = jnp.searchsorted(axis_values, safe_query, side="right") - 1
         lower_index = jnp.clip(lower_index, 0, axis_values.size - 2)

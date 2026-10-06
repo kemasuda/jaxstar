@@ -1,433 +1,107 @@
-__all__ = ["MistGridIso", "NamedMistGridIso", "MistFit"]
+"""Convenience interface combining a MistModel with fixed observations."""
 
-# %%
-import numpy as np
-import pandas as pd
-import jax.numpy as jnp
-import numpyro
-import numpyro.distributions as dist
-from jax import (random, jit)
-from numpyro.infer import init_to_value
-from jax.scipy.ndimage import map_coordinates as mapc
-from functools import partial
-from .gyrochrone_likelihood import loglike_gyro
-from jaxstar.grid import Field, RectilinearGrid
-from jaxstar.mistfit.mistgrid.create_grid import create_mistgrid
-from jaxstar.mistfit.mistgrid.paths import resolve_mistgrid_path
+# Preserve the previous import paths; implementations live in inference.py.
+__all__ = ["MistObservations", "MistFit", "model_isochrone", "make_init_strategy",
+           "run_nuts", "run_multinest"]
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+from .model import MistModel
+from .inference import (MistObservations, model_isochrone, make_init_strategy,
+                        run_nuts, run_multinest, smbound, _normalize_output_keys)
 
 
-def check_mistgrid_path():
-    """Return a usable grid path, creating the cached grid on first use.
-
-    An environment override is honored before the platform-specific cache.
-    If the resolved grid does not exist, it is downloaded and generated there.
-    """
-    gridfile_path = resolve_mistgrid_path()
-    if not gridfile_path.is_file():
-        print(f"{gridfile_path} not found.")
-        create_mistgrid(path=gridfile_path)
-    return gridfile_path
+def _model_options(model_kwargs, output_keys):
+    """Copy model options and merge the per-run additional deterministic keys."""
+    options = dict(model_kwargs or {})
+    options["output_keys"] = tuple(dict.fromkeys((
+        *_normalize_output_keys(options.get("output_keys")),
+        *_normalize_output_keys(output_keys),
+    )))
+    return options
 
 
-def interp(x, xp, fp):
-    """1D interpolation
-
-        Args:
-            x: x-coordinates at which interpolated values are evaluated
-            xp: x-coordinates of the data
-            fp: y-coordinates of the data
-
-        Returns:
-            array: linearly interpolated values
-
-    """
-    idx_min = jnp.nanargmin(jnp.abs(xp - x))
-    idx_add = jnp.where(x < xp[idx_min], 0, 1)
-    idx_low, idx_upp = idx_min - 1 + idx_add, idx_min + idx_add
-    weight_low = (xp[idx_upp] - x) / (xp[idx_upp] - xp[idx_low])
-    weight_upp = 1. - weight_low
-    return weight_low * fp[idx_low] + weight_upp * fp[idx_upp]
-
-
-@partial(jit, static_argnames=("keys",))
-def _named_grid_values(grid, age, feh, eep, *, keys):
-    """Compile the immutable numerical grid rather than a mutable MistGridIso."""
-    return grid.interpolate({"age": age, "feh": feh, "eep": eep}, keys=keys)
-
-
-@jit
-def _named_eep_given_mass(grid, age, feh, mass):
-    if any(jnp.ndim(value) != 0 for value in (age, feh, mass)):
-        raise ValueError("age, feh, and mass must be scalars; use jax.vmap for batches")
-    eep = grid.axis("eep")
-    mass_curve = grid.interpolate(
-        {"age": age, "feh": feh, "eep": eep}, keys="mass"
-    )["mass"]
-    return interp(mass, mass_curve, eep)
-
-
-@partial(jit, static_argnames=("keys",))
-def _named_values_given_mass(grid, age, feh, mass, *, keys):
-    eep = _named_eep_given_mass(grid, age, feh, mass)
-    return _named_grid_values(grid, age, feh, eep, keys=keys)
-
-
-class MistGridIso:
-    """class to store model grid """
-
-    def __init__(self, path=None):
-        """initialization
-
-            Args:
-                path: path to an existing npz grid file. If omitted, use the
-                    environment override or user cache, downloading on first use.
-
-        """
-        if path is None:
-            path = check_mistgrid_path()
-        self.dgrid = np.load(path)
-        self.a0, self.da = self.dgrid['logagrid'][0], np.diff(self.dgrid['logagrid'])[
-            0]
-        self.f0, self.df = self.dgrid['fgrid'][0], np.diff(self.dgrid['fgrid'])[
-            0]
-        self.eep0, self.deep = self.dgrid['eepgrid'][0], np.diff(self.dgrid['eepgrid'])[
-            0]
-        self.amin, self.amax = np.min(
-            self.dgrid['logagrid']), np.max(self.dgrid['logagrid'])
-        self.fmin, self.fmax = np.min(
-            self.dgrid['fgrid']), np.max(self.dgrid['fgrid'])
-        self.eepmin, self.eepmax = np.min(
-            self.dgrid['eepgrid']), np.max(self.dgrid['eepgrid'])
-        self.keys = None
-
-    def set_keys(self, keys):
-        """set keys for the stellar parameters to be evaluated
-
-            Args:
-                keys: list of strings, should be one of those listed in mistgrid/create_grid.py
-
-        """
-        self.keys = keys
-
-    @partial(jit, static_argnums=(0,))
-    def values(self, age, feh, eep):
-        """ compute stellar parameters for given age, feh, and eep
-
-            Args:
-                age: log10(stellar age in yr)
-                feh: metallicity (dex)
-                eep: equivalent evolutionary point
-
-            Returns:
-                list: interpolated values for the parameters in self.keys
-
-        """
-        aidx = (age - self.a0) / self.da
-        fidx = (feh - self.f0) / self.df
-        eepidx = (eep - self.eep0) / self.deep
-        idxs = [aidx, fidx, eepidx]
-        return [mapc(self.dgrid[key], idxs, order=1, cval=-jnp.inf) for key in self.keys]
-
-    @partial(jit, static_argnums=(0,))
-    def eep_given_mass(self, age, feh, mass):
-        """compute EEP for given age, feh, mass
-
-            Args:
-                age: log10(stellar age in yr)
-                feh: metallicity (dex)
-                mass: stellar mass (solar unit)
-
-            Returns:
-                tuple: equivalent evolutionary point, age index, feh index
-
-        """
-        aidx = (age - self.a0) / self.da
-        fidx = (feh - self.f0) / self.df
-        eepidx_grid = (self.dgrid['eepgrid'] - self.eep0) / self.deep
-        idxs_grid = [aidx, fidx, eepidx_grid]
-
-        mass_grid = mapc(self.dgrid['mass'], idxs_grid, order=1, cval=-jnp.inf)
-        eep = interp(mass, mass_grid, jnp.array(
-            self.dgrid['eepgrid']))  # jnp.interp fails
-        return eep, aidx, fidx
-
-    @partial(jit, static_argnums=(0,))
-    def values_given_mass(self, age, feh, mass):
-        """ compute stellar parameters for given age, feh, and mass
-
-            Args:
-                age: log10(stellar age in yr)
-                feh: metallicity (dex)
-                mass: stellar mass (solar unit)
-
-            Returns:
-                list: interpolated values for the parameters in self.keys
-
-        """
-        eep, aidx, fidx = self.eep_given_mass(age, feh, mass)
-        eepidx = (eep - self.eep0) / self.deep
-        idxs = [aidx, fidx, eepidx]
-
-        return [mapc(self.dgrid[key], idxs, order=1, cval=-jnp.inf) for key in self.keys]
-
-
-class NamedMistGridIso:
-    """MIST interpolation with named outputs and per-call selection.
-
-    All fields are loaded during initialization. The three NPZ entries
-    logagrid, fgrid, and eepgrid supply the axes; all remaining entries are
-    scalar fields with dimensions (age, feh, eep). Forward interpolation includes
-    axis endpoints and returns -inf for out-of-range coordinates. Nonfinite
-    field handling follows RectilinearGrid. Mass-to-EEP lookup uses the existing
-    interp() helper on a mass curve generated by the named grid.
-    """
-
-    def __init__(self, path=None):
-        if path is None:
-            path = check_mistgrid_path()
-        axis_keys = {"age": "logagrid", "feh": "fgrid", "eep": "eepgrid"}
-        with np.load(path) as data:
-            self._grid = RectilinearGrid(
-                axes={name: data[key] for name, key in axis_keys.items()},
-                fields={
-                    name: Field(data[name], dims=("age", "feh", "eep"))
-                    for name in data.files if name not in axis_keys.values()
-                },
-            )
-
-    def values(self, age, feh, eep, *, keys=None):
-        """Return a GridResult for all fields or the requested ordered keys.
-
-        age is log10(age in years). Coordinates may be scalars or broadcastable
-        arrays. keys accepts a name, a sequence of names, or None for all fields;
-        the selection is static within a JIT trace.
-        """
-        if keys is not None and not isinstance(keys, str):
-            keys = tuple(keys)
-        return _named_grid_values(self._grid, age, feh, eep, keys=keys)
-
-    def eep_given_mass(self, age, feh, mass):
-        """Return EEP alone for scalar log10(age in years), feh, and mass.
-
-        mass is the initial stellar mass in solar units. Use jax.vmap for
-        multiple queries. The existing interp() neighbor selection is retained:
-        a finite, increasing local mass bracket is needed. Invalid regions,
-        flat/nonmonotonic curves and endpoints are not guaranteed; no mass range
-        check is added. Gradients can be nonfinite with invalid field values.
-
-        On isochrones, near-flat initial-mass curves amplify roundoff into large
-        EEP/output differences, especially in float32. Addressing this numerical
-        sensitivity is deferred until an evolutionary-track grid is considered.
-        """
-        return _named_eep_given_mass(self._grid, age, feh, mass)
-
-    def values_given_mass(self, age, feh, mass, *, keys=None):
-        """Return a GridResult after scalar mass-to-EEP lookup.
-
-        keys follows values(); mass is always used for inverse lookup even
-        when it is not selected. The restrictions of eep_given_mass() apply.
-        """
-        if keys is not None and not isinstance(keys, str):
-            keys = tuple(keys)
-        return _named_values_given_mass(self._grid, age, feh, mass, keys=keys)
-
-
-@jit
-def smbound(x, low, upp, s=20, depth=30):
-    """ sigmoid bound
-
-        Args:
-            x: parameter to be bounded
-            low, upp: lower and upper bounds
-            s: smoothness of the bound
-            depth: depth of the bounds
-
-        Returns:
-            box-shaped penality term for the log-likelihood
-            const if low < x < upp, const+depth otherwise
-
-    """
-    return -depth*(1./(jnp.exp(s*(x-low))+1)+1./(jnp.exp(-s*(x-upp))+1))
-
-
+@dataclass(frozen=True, init=False)
 class MistFit:
-    """ main class for isochrone fitting """
+    """A physical model and fixed observations, reusable across independent runs.
 
-    def __init__(self, path=None, *, grid_backend="legacy"):
-        """initialization
+    Construct with ``MistFit(observations={"teff": (5700., 70.), ...}, model=model)``
+    or supply a path to load an isochrone model. Changing data means constructing
+    another fit, reusing the same MistModel. Each sampler call returns its own
+    native result; this object has no mutable sampler/sample state.
+    """
 
-            Args:
-                path: path to an existing npz grid file. If omitted, use the
-                    environment override or user cache, downloading on first use.
-                grid_backend: "legacy" (default) uses MistGridIso; "named" uses
-                    NamedMistGridIso. Choose the backend at initialization.
+    physical_model: MistModel
+    observations: MistObservations
 
-        """
-        grid_types = {"legacy": MistGridIso, "named": NamedMistGridIso}
-        if grid_backend not in grid_types:
-            raise ValueError("grid_backend must be 'legacy' or 'named'")
-        self.grid_backend = grid_backend
-        if path is None:
-            path = check_mistgrid_path()
-        self.mg = grid_types[grid_backend](path)
-
-    def set_data(self, keys, vals, errs):
-        """set observational data to be fitted
-
-            Args:
-                keys: names of the parameters (list of str)
-                vals: observed values of the parameters
-                errs: errors of the parameters (assumed to be Gaussian widths)
-
-        """
-        self.obskeys = keys
-        self.obsvals = vals
-        self.obserrs = errs
-        outkeys = ['kmag', 'teff', 'logg', 'mass', 'radius', 'feh_photosphere', 'star_mass',
-                   'dmdeep', 'mmin', 'mmax', 'bpmag2', 'rpmag2']  # DR2 BP-RP needed for gyro likelihood
-        # outkeys = ['eepmin', 'eepmax', 'kmag', 'teff', 'logg', 'mass', 'radius', 'dmdeep', 'mmin', 'mmax']
-        for k in keys:
-            if k not in outkeys and k != 'parallax' and k != 'feh':
-                outkeys += [k]
-        self.outkeys = outkeys
-        if self.grid_backend == "legacy":
-            self.mg.set_keys(outkeys)
-
-    def add_keys(self, keys):
-        """set keys for the stellar parameters to be evaluated
-
-            Args:
-                keys: keys to be added manually (list of str)
-                    note that 'outkeys' defined in set_data are automatically added
-
-        """
-        outkeys = self.outkeys
-        for k in keys:
-            if k not in outkeys:
-                outkeys += [k]
-        self.outkeys = outkeys
-        if self.grid_backend == "legacy":
-            self.mg.set_keys(outkeys)
-
-    def model(self, nodata=False, linear_age=True, flat_age_marginal=False, logamin=8, logamax=10.14,
-              fmin=-1, fmax=0.5, eepmin=0, eepmax=600, massmin=0.1, massmax=2.5, dist_scale=1.35, prot=None, prot_err=0.05, rho_obs=None, rho_err=None, age_obs=None, age_err=None):
-        """model for NumPyro HMC
-
-            Args:
-                nodata: if True, data is ignored (i.e. sampling from prior)
-                linear_age: if True/False, prior flat in age/logage is used
-                flag_age_marginal: if True, the prior is set so that the marginal age/logage prior is flat.
-                    Otherwise, PDF has a constant value in the mass-(log)age-eep space.
-                logamin, logmax: bounds for log10(age/yr)
-                fmin, fmax: bounds for FeH
-                eepmin, eepmax: bounds for EEP
-                massmin, massmax: bounds for stellar mass
-                dist_scale: length scale L in the distance prior (Bailer-Jones 2015; Astraatmadja & Bailer-Jones 2016)
-                prot: if specified, gyrochronal log-likelihood is added folloing Angus et al. (2019), AJ 158, 173
-                prot_err: error in Prot assumed in evaluating gyro log-likelihood
-                rho, rho_err: if specified, gaussian prior on the mean density can be imposed (solar units)
-
-        """
-        if linear_age:
-            age = numpyro.sample("age", dist.Uniform(
-                10**logamin/1e9, 10**logamax/1e9))
-            # logage = jnp.log10(age * 1e9)
-            # numpyro.deterministic("logage", logage)
-            logage = numpyro.deterministic("logage", jnp.log10(age * 1e9))
+    def __init__(self, path=None, *, observations, model=None, legacy_interpolation=None):
+        if isinstance(observations, Mapping):
+            observations = MistObservations.from_mapping(observations)
+        if not isinstance(observations, MistObservations):
+            raise TypeError("observations must be MistObservations or a mapping of (value, error) pairs")
+        if model is not None:
+            if not isinstance(model, MistModel):
+                raise TypeError("model must be a MistModel")
+            if path is not None or legacy_interpolation is not None:
+                raise ValueError("model cannot be combined with path or legacy_interpolation")
         else:
-            logage = numpyro.sample("logage", dist.Uniform(logamin, logamax))
-            age = numpyro.deterministic("age", 10**logage/1e9)
+            model = MistModel.from_isochrones(
+                path, legacy_interpolation=False if legacy_interpolation is None else legacy_interpolation,
+            )
+        unknown = set(observations.keys) - set(model.output_keys)
+        if unknown:
+            raise ValueError(f"unknown MistModel observation keys: {sorted(unknown)}")
+        object.__setattr__(self, "physical_model", model)
+        object.__setattr__(self, "observations", observations)
 
-        feh_init = numpyro.sample("feh_init", dist.Uniform(fmin, fmax))
-        eep = numpyro.sample("eep", dist.Uniform(eepmin, eepmax))
+    def model(self, *args, **kwargs):
+        """NumPyro callable delegating to model_isochrone with this fit's data."""
+        return model_isochrone(self.observations, self.physical_model, *args, **kwargs)
 
-        distance = numpyro.sample("distance", dist.Gamma(
-            3, rate=1./dist_scale))  # BJ18, kpc
-        parallax = numpyro.deterministic("parallax", 1. / distance)  # mas
+    def run_nuts(self, rng_key, *, output_keys=None, model_kwargs=None,
+                 init_strategy=None, **sampler_kwargs):
+        """Return a new MCMC result (four chains by default).
 
-        if self.grid_backend == "named":
-            params = dict(self.mg.values(logage, feh_init, eep, keys=self.outkeys))
-        else:
-            params = dict(zip(self.outkeys, self.mg.values(logage, feh_init, eep)))
-        for key in self.outkeys:
-            if 'mag' in key:
-                params[key] = params[key] - 5 * \
-                    jnp.log10(parallax) + 10  # apparent mag
-            params[key] = jnp.where(
-                params[key] == params[key], params[key], -jnp.inf)  # nan
-            numpyro.deterministic(key, params[key])
-        # "feh" is set to be photospheric value
-        params["feh"] = numpyro.deterministic("feh", params["feh_photosphere"])
-
-        if not nodata:
-            # params['parallax'], params['feh'] = parallax, feh
-            params['parallax'] = parallax
-            obsparams = jnp.array([params[key] for key in self.obskeys])
-            numpyro.sample("obs", dist.Normal(obsparams, jnp.array(
-                self.obserrs)), obs=jnp.array(self.obsvals))
-
-        # mass prior
-        logjac = jnp.log(params['dmdeep'])
-        logjac += smbound(params['mass'], massmin, massmax)
-        if flat_age_marginal:
-            params['mmax'] = jnp.where(
-                params['mmax'] < massmax, params['mmax'], massmax)
-            logjac -= jnp.log(params['mmax'] - params['mmin'])
-
-        logjac = jnp.where(logjac == logjac, logjac, -jnp.inf)
-        numpyro.factor("logjac", logjac)
-
-        if prot is not None:
-            bprp = params['bpmag2'] - params['rpmag2']
-            numpyro.factor("loglike_gyro", loglike_gyro(
-                prot, bprp, params['mass'], eep, logage, params['feh'], sigma=prot_err))
-
-        if rho_obs is not None and rho_err is not None:
-            rho_model = params['mass'] / params['radius']**3
-            numpyro.factor("loglike_rho", -0.5 *
-                           (rho_obs - rho_model)**2 / rho_err**2)
-
-        if age_obs is not None and age_err is not None:
-            age_model = age
-            numpyro.factor("loglike_age", -0.5 *
-                           (age_obs - age_model)**2 / age_err**2)
-
-    def setup_hmc(self, target_accept_prob=0.95, num_chains=1, max_tree_depth=10, num_warmup=1000, num_samples=1000, init_logage=9.3, init_feh=0, init_eep=300, dense_mass=True):
-        """ setup NumPyro HMC
-
-            Args:
-                target_accept_prob: target acceptance probability in HMC/NUTS
-                num_warmup: # of warmup steps
-                num_samples: # of sampling steps
-                init_logage: initival value of log10(age/yr)
-                init_feh: initial value of FeH
-                init_eep: initial value of EEP
-
+        output_keys adds deterministic outputs for this run. model_kwargs holds
+        prior/likelihood options; sampler_kwargs holds run_nuts sampler options.
+        Initialization is unchanged unless an explicit init_strategy is supplied.
         """
-        # initialize parameters for HMC
-        _parallax_obs = np.array(self.obsvals)[
-            np.array(self.obskeys) == 'parallax']
-        init_dist = float(np.where(_parallax_obs > 0, 1./_parallax_obs, 8))
-        initdict = {"distance": init_dist}
-        for key, val in zip(self.obskeys, self.obsvals):
-            if key == "parallax":
-                continue
-            initdict[key] = val
-        init_strategy = init_to_value(values=initdict)
+        if init_strategy is None:
+            init_strategy = make_init_strategy(self.observations)
+        return run_nuts(self.model, rng_key, init_strategy=init_strategy,
+                        model_kwargs=_model_options(model_kwargs, output_keys), **sampler_kwargs)
 
-        kernel = numpyro.infer.NUTS(
-            self.model, target_accept_prob=target_accept_prob, init_strategy=init_strategy, dense_mass=dense_mass, max_tree_depth=max_tree_depth)
-        mcmc = numpyro.infer.MCMC(
-            kernel, num_warmup=num_warmup, num_samples=num_samples, num_chains=num_chains)
-        self.mcmc = mcmc
+    # Retain the familiar name with the new single-call/result-returning API.
+    run_hmc = run_nuts
 
-    def run_hmc(self, rng_key, **kwargs):
-        """ run HMC/NUTS
+    def run_multinest(self, *, outputfiles_basename, output_keys=None, model_kwargs=None,
+                      **sampler_kwargs):
+        """Return a MultiNestRunner; scientific options match run_nuts exactly."""
+        return run_multinest(self.model, outputfiles_basename=outputfiles_basename,
+                             model_kwargs=_model_options(model_kwargs, output_keys), **sampler_kwargs)
 
-            Args:
-                rng_key: PRNG key from jax.random.PRNGKey()
+    def to_inference_data(self, result):
+        """Convert saved draws/provenance to portable ArviZ InferenceData."""
+        from .results import to_inference_data
+        return to_inference_data(result)
 
-        """
-        self.mcmc.run(rng_key, **kwargs)
-        self.mcmc.print_summary()
-        self.samples = pd.DataFrame(data=self.mcmc.get_samples())
+    def save_result(self, result, directory, **kwargs):
+        """Save posterior, run record and summary without mutating this fitter."""
+        from .results import save_result
+        return save_result(result, directory, **kwargs)
+
+    def plot_trace(self, result, **kwargs):
+        """Return a chain trace/marginal Figure using the result's observations."""
+        from .plotting import plot_trace
+        return plot_trace(result, **kwargs)
+
+    def plot_corner(self, result, **kwargs):
+        """Return a correlation Figure using the result's observations."""
+        from .plotting import plot_corner
+        return plot_corner(result, **kwargs)
+
+    def plot_diagnostics(self, result, **kwargs):
+        """Return diagnostic Figures; optionally save them in output_dir."""
+        from .plotting import plot_diagnostics
+        return plot_diagnostics(result, **kwargs)
