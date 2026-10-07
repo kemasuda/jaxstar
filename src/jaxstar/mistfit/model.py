@@ -8,6 +8,7 @@ import jax.numpy as jnp
 
 from jaxstar.grid import GridResult, RectilinearGrid
 from ._data import _MistGridData
+from ._track_interpolation import track_support
 from .mistgrid.isochrone import load_isochrones
 from .mistgrid.tracks import load_tracks
 
@@ -42,7 +43,7 @@ class MistModel:
     be scalars or broadcastable arrays. All returned arrays share that shape.
     ``from_tracks(path)`` instead takes ``mass_init`` (solar masses),
     ``feh_init``, and ``eep``; logage is then an interpolated output. It reads
-    a complete prebuilt track NPZ and requires JAX x64. Track Teff/radius/age
+    a prebuilt track NPZ and requires JAX x64. Track Teff/radius/age
     are exponentiated AFTER interpolating their logarithms.
 
     ``keys`` is a name, an ordered sequence, or None for all available public
@@ -109,7 +110,7 @@ class MistModel:
 
     @classmethod
     def from_tracks(cls, path):
-        """Load a complete track NPZ with precomputed UBVRIplus photometry.
+        """Load a track NPZ with precomputed UBVRIplus photometry.
 
         An explicit path and JAX x64 are required. No automatic download or
         grid generation is performed. Subsequent calls do no I/O. Native
@@ -117,18 +118,35 @@ class MistModel:
         magnitudes. The raw age_gyr field is linearly interpolated physical
         age; public age instead comes from interpolated logage, as in the
         validated track prototype.
+        Partially populated grids retain per-field support: a prediction is
+        -inf if any contributing corner lacks its required fields. Missing
+        photometry does not invalidate available physical outputs.
+        Native primary EEP metadata, when present, is retained for plotting.
         """
         return cls(load_tracks(path))
 
     @property
     def grid(self):
-        """The immutable numerical grid; raw photometric fields are absolute."""
+        """Numerical storage; masked track nodes contain finite placeholders.
+
+        Use model(...) for predictions and support checks. Raw photometric
+        fields are absolute magnitudes.
+        """
         return self.data.grid
 
     @property
     def kind(self):
         """The source parameterization: 'isochrone' or 'track'."""
         return self.data.kind
+
+    @property
+    def primary_eeps(self):
+        """Native primary EEP labels for track plots; empty when unavailable.
+
+        These are the union of labels in the source tracks' metadata and can
+        extend beyond a cropped grid. They do not change interpolation/priors.
+        """
+        return self.data.primary_eeps
 
     @property
     def input_keys(self):
@@ -227,6 +245,8 @@ class MistModel:
                        {"initial_mass": values["mass_init"], "initial_feh": values["feh_init"],
                         "eep": values["eep"]})
         raw = self._interpolate(coordinates, field_keys) if field_keys else GridResult((), ())
+        support = (track_support(self.data, coordinates, field_keys)
+                   if field_keys and self.data.validity is not None else None)
         parallax = 1. / values["distance"] if needs_parallax else None
         outputs = []
         for key in selected:
@@ -255,6 +275,11 @@ class MistModel:
                 value = values["mass_init"] / (10 ** raw["logR"])**3
             else:
                 value = raw[fields[0]]
+            if support is not None and fields:
+                valid = support[fields[0]]
+                for field in fields[1:]:
+                    valid = valid & support[field]
+                value = jnp.where(valid, value, -jnp.inf)
             outputs.append(jnp.where(jnp.isnan(value), -jnp.inf, value))
         return GridResult(selected, tuple(outputs))
 

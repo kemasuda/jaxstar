@@ -1,6 +1,6 @@
 """NumPyro isochrone/track models and shared NUTS/MultiNest inference functions."""
 
-__all__ = ["MistObservations", "model_isochrone", "model_track", "make_init_strategy",
+__all__ = ["MistObservations", "model_isochrone", "model_track", "find_initial", "make_init_strategy",
            "run_nuts", "run_multinest"]
 
 from dataclasses import dataclass
@@ -15,6 +15,7 @@ import numpyro
 import numpyro.distributions as dist
 from jax import jit, random
 from numpyro.infer import init_to_value
+from numpyro.infer.util import log_density
 from .gyrochrone_likelihood import loglike_gyro
 from .results import _new_run_record, _finish_run_record, _json_value, _native_files, _file_hash
 
@@ -275,6 +276,8 @@ def model_track(observations, physical_model, nodata=False, linear_age=True,
     Observations, optional gyro/initial-density/age constraints, distance
     prior, and per-call additional output_keys follow model_isochrone.
     nodata disables only the main Gaussian observations. JAX x64 is required.
+    Missing age/derivative stencils or required likelihood outputs have zero
+    density. Unsupported saved-only outputs do not restrict the prior.
     """
     if physical_model.kind != "track":
         raise ValueError("model_track requires MistModel.from_tracks(...)")
@@ -313,13 +316,24 @@ def model_track(observations, physical_model, nodata=False, linear_age=True,
     for key in dict.fromkeys((*saved_keys, "parallax", "feh")):
         if key not in ("mass", "feh_init", "eep", "distance"):
             numpyro.deterministic(key, params[key])
+    likelihood_keys = list(observations.keys) if not nodata else []
+    if prot is not None:
+        likelihood_keys.extend(("bpmag2", "rpmag2", "logage", "feh"))
+    if rho_obs is not None and rho_err is not None:
+        likelihood_keys.append("radius")
+    likelihood_valid = jnp.array(True)
+    for key in dict.fromkeys(likelihood_keys):
+        likelihood_valid &= jnp.isfinite(params[key])
+    # Keep rejected evaluations numerically finite until the support factor.
+    # In particular Normal(-inf, sigma) would produce NaN reverse gradients.
+    safe = {key: jnp.where(jnp.isfinite(value), value, 1.) for key, value in params.items()}
     if not nodata:
-        obsparams = jnp.array([params[key] for key in observations.keys])
+        obsparams = jnp.array([safe[key] for key in observations.keys])
         numpyro.sample("obs", dist.Normal(obsparams, jnp.array(observations.errors)),
                        obs=jnp.array(observations.values))
 
     dt = params["dtdeep"]
-    valid = (mass_valid & feh_valid & eep_valid & age_valid & distance_valid
+    valid = (mass_valid & feh_valid & eep_valid & age_valid & distance_valid & likelihood_valid
              & (mass >= mass_bounds[0]) & (mass <= mass_bounds[1])
              & (feh_init >= feh_bounds[0]) & (feh_init <= feh_bounds[1])
              & (eep >= eep_lo) & (eep <= eep_hi)
@@ -338,15 +352,14 @@ def model_track(observations, physical_model, nodata=False, linear_age=True,
 
     if prot is not None:
         numpyro.factor("loglike_gyro", loglike_gyro(
-            prot, params['bpmag2'] -
-            params['rpmag2'], mass, eep, params['logage'],
-            params['feh'], sigma=prot_err))
+            prot, jnp.where(likelihood_valid, safe['bpmag2'] - safe['rpmag2'], .8),
+            mass, eep, safe['logage'], safe['feh'], sigma=prot_err))
     if rho_obs is not None and rho_err is not None:
         numpyro.factor("loglike_rho", -0.5 * (rho_obs - mass /
-                       params['radius']**3)**2 / rho_err**2)
+                       safe['radius']**3)**2 / rho_err**2)
     if age_obs is not None and age_err is not None:
         numpyro.factor("loglike_age", -0.5 *
-                       (age_obs - params['age'])**2 / age_err**2)
+                       (age_obs - safe['age'])**2 / age_err**2)
 
 
 def _default_model(physical_model):
@@ -356,6 +369,104 @@ def _default_model(physical_model):
     if physical_model.kind == "track":
         return model_track
     raise ValueError(f"unsupported MIST model kind: {physical_model.kind}")
+
+
+def _initial_axis(axis, low, high, name):
+    """Native nodes inside open prior bounds, or a midpoint for a narrow range."""
+    axis = np.asarray(axis)
+    if np.ndim(low) or np.ndim(high) or not np.isfinite([low, high]).all() or low >= high:
+        raise ValueError(f"{name} bounds must be finite increasing scalars")
+    left, right = max(low, axis[0]), min(high, axis[-1])
+    if left >= right:
+        raise ValueError(f"{name} bounds have no interior overlap with the grid")
+    nodes = axis[(axis > low) & (axis < high)]
+    if not nodes.size:
+        nodes = np.asarray([left + (right - left) / 2], dtype=axis.dtype)
+    if not np.all((nodes > low) & (nodes < high)):
+        raise ValueError(f"{name} bounds are too narrow for grid precision")
+    return nodes
+
+
+def find_initial(observations, physical_model, *, feh_init=0., distance=None,
+                 model_kwargs=None):
+    """Find constrained NUTS starting values on a fixed-FeH/distance grid.
+
+    Search all native initial-mass x EEP nodes for tracks, or log-age x EEP
+    nodes for isochrones, within the sampling bounds in model_kwargs. Uniform
+    prior endpoints are excluded so the unconstrained start remains finite.
+    A range containing no interior native node uses its overlap midpoint.
+    Isochrone mass bounds remain soft and only affect the score.
+
+    feh_init defaults to zero (initial, not surface FeH). distance is in kpc;
+    when omitted, use the reciprocal of a positive observed parallax in mas.
+    Both are fixed only during this search. Rank candidates by the existing
+    model's constrained joint log density, including all enabled likelihood
+    and prior factors, and return the best with finite density and gradients.
+    The returned dict contains only latent sample sites, including age in Gyr
+    or logage for isochrones according to linear_age. No SVI is performed;
+    this starting point does not guarantee discovery of all posterior modes.
+    """
+    model = _default_model(physical_model)
+    options = dict(model_kwargs or {})
+    bound = inspect.signature(model).bind(observations, physical_model, **options)
+    bound.apply_defaults()
+    settings = bound.arguments
+    if physical_model.kind == "track":
+        if not jax.config.x64_enabled:
+            raise ValueError("Enable JAX x64 for track inference")
+        axis_names, latent = ("initial_mass", "initial_feh", "eep"), "mass"
+        limits = [(settings[lo], settings[hi]) for lo, hi in
+                  (("massmin", "massmax"), ("fmin", "fmax"), ("eepmin", "eepmax"))]
+        limits = [tuple(float(v) for v in _track_bounds(
+            physical_model.grid.axis(name), lo, hi, name)[0])
+            for name, (lo, hi) in zip(axis_names, limits)]
+    else:
+        axis_names, latent = ("age", "feh", "eep"), "logage"
+        limits = [(settings[lo], settings[hi]) for lo, hi in
+                  (("logamin", "logamax"), ("fmin", "fmax"), ("eepmin", "eepmax"))]
+    axes = [physical_model.grid.axis(name) for name in axis_names]
+    first = _initial_axis(axes[0], *limits[0], axis_names[0])
+    eeps = _initial_axis(axes[2], *limits[2], "EEP")
+    # Validate the fixed FeH in both the grid and the open sampling support.
+    _initial_axis(axes[1], *limits[1], "FeH")
+    if (np.ndim(feh_init) or not np.isfinite(feh_init)
+            or not limits[1][0] < feh_init < limits[1][1]
+            or not float(axes[1][0]) <= feh_init <= float(axes[1][-1])):
+        raise ValueError("feh_init must be finite, inside the open FeH prior bounds and within the grid; "
+                         "choose a different feh_init for initialization")
+    if distance is None:
+        measured = dict(zip(observations.keys, observations.values))
+        parallax = measured.get("parallax", 0.)
+        if parallax <= 0:
+            raise ValueError("grid initialization requires positive parallax; provide distance "
+                             "via init_kwargs or supply init_strategy explicitly")
+        distance = 1. / parallax
+    if np.ndim(distance) or not np.isfinite(distance) or distance <= 0:
+        raise ValueError("initial distance must be a finite positive scalar in kpc")
+
+    first, eeps = (jnp.asarray(a.ravel()) for a in np.meshgrid(first, eeps, indexing="ij"))
+    if physical_model.kind == "isochrone" and settings["linear_age"]:
+        latent, first = "age", 10.**first / 1e9
+    points = {latent: first, "eep": eeps,
+              "feh_init": jnp.full_like(first, feh_init),
+              "distance": jnp.full_like(first, distance)}
+
+    def score(grid_model, point):
+        return log_density(model, (observations, grid_model), options, point)[0]
+
+    # Pass the large grid as a dynamic PyTree, not an embedded JIT constant.
+    scores = np.asarray(jax.jit(jax.vmap(score, in_axes=(None, 0)))(physical_model, points))
+    finite = np.flatnonzero(np.isfinite(scores))
+    ranked = finite[np.argsort(-scores[finite], kind="stable")]
+    value_and_grad = jax.jit(jax.value_and_grad(score, argnums=1))
+    for index in ranked:
+        point = {key: values[index] for key, values in points.items()}
+        value, gradient = value_and_grad(physical_model, point)
+        if np.isfinite(value) and all(np.isfinite(v) for v in gradient.values()):
+            return {key: float(value) for key, value in point.items()}
+    raise ValueError("grid initialization found no candidate with finite density and gradients; "
+                     "check model bounds/data, change feh_init or distance via init_kwargs, "
+                     "or supply init_strategy explicitly")
 
 
 def make_init_strategy(observations):
@@ -394,8 +505,8 @@ def run_nuts(model, rng_key, *, model_args=(), model_kwargs=None,
     sequential execution when there are too few devices. Configure CPU devices
     in the calling program before JAX initializes; this function does not change
     the device configuration. chain_method can also be sequential or vectorized.
-    An omitted init_strategy uses NumPyro's default here; MistFit supplies the
-    historical observation-based rule from make_init_strategy instead.
+    An omitted init_strategy uses NumPyro's default here; MistFit supplies a
+    grid-search start by default, or make_init_strategy with grid_init=False.
     No samples or sampler state are written back to the model/fitter. Run
     metadata is attached to the returned MCMC for portable saving. By default,
     collect potential energy, acceptance probability, leapfrog count and step

@@ -118,6 +118,7 @@ def _new_run_record(sampler, model, args, kwargs):
     source_hashes = {str(path.relative_to(source_root)): _file_hash(path) for path in (
         source_root / "mistfit" / "model.py", source_root / "mistfit" / "inference.py",
         source_root / "mistfit" / "_data.py", source_root / "mistfit" / "mistgrid" / "tracks.py",
+        source_root / "mistfit" / "_track_interpolation.py",
         source_root / "mistfit" / "gyrochrone_likelihood.py", source_root / "grid" / "core.py",
     ) if path.is_file()}
     return {"format_version": _FORMAT_VERSION, "sampler": sampler, "source_sha256": source_hashes,

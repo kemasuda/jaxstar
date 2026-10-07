@@ -3,6 +3,7 @@
 import json
 
 import arviz as az
+import jax
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -173,3 +174,94 @@ def test_diagnostics_no_observed_band_and_explicit_axes(posterior):
     assert set(figs) == {'trace', 'corner', 'tracks'}
     with pytest.raises(ValueError, match='track model'):
         plot_diagnostics(idata, keys='mass', track_kwargs={'y': 'logg'})
+
+
+@pytest.fixture
+def primary_posterior(posterior, track_path):
+    fit, idata = posterior
+    with np.load(track_path) as archive:
+        arrays = {key: archive[key] for key in archive.files}
+    # Native phase labels extend beyond this cropped grid (EEP 300..500).
+    metadata = dict(kind='track', format_version=1, tracks=[
+        dict(primary_eeps=[1, 202, 353, 454]),
+        dict(primary_eeps=[1, 202, 353, 454, 605]),
+    ])
+    np.savez(track_path, **arrays, metadata_json=np.array(json.dumps(metadata)))
+    model = MistModel.from_tracks(track_path)
+    idata.posterior['eep'].values[:] = np.linspace(380., 430., 80).reshape(2, 40)
+    return MistFit(model=model, observations=fit.observations), idata
+
+
+def test_primary_metadata_survives_pytree_without_changing_predictions(primary_posterior, posterior, monkeypatch):
+    fit, _ = primary_posterior
+    original, _ = posterior
+    leaves, tree = jax.tree_util.tree_flatten(fit.physical_model)
+    restored = jax.tree_util.tree_unflatten(tree, leaves)
+    assert restored.primary_eeps == (1, 202, 353, 454, 605)
+    assert original.physical_model.primary_eeps == ()
+    monkeypatch.setattr(np, 'load', lambda *a, **kw: pytest.fail('metadata must already be in memory'))
+    evaluate = jax.jit(lambda m: m(PARAMS, keys=('age', 'dtdeep', 'kmag')))
+    before, after = evaluate(original.physical_model), evaluate(restored)
+    for key in before:
+        np.testing.assert_array_equal(after[key], before[key])
+
+
+def test_primary_range_default_and_diagnostics(primary_posterior):
+    fit, idata = primary_posterior
+    fig = fit.plot_posterior_tracks(idata, x='eep', y='mass', n_samples=3)
+    for line in fig.axes[0].lines[:3]:
+        np.testing.assert_array_equal(line.get_xdata()[[0, -1]], [353., 454.])
+    marker = fig.axes[0].lines[-1]
+    assert marker.get_label() == 'Posterior locations' and len(marker.get_xdata()) == 3
+    figures = fit.plot_diagnostics(idata, keys='mass',
+                                   track_kwargs=dict(x='eep', y='mass', n_samples=2))
+    for line in figures['tracks'].axes[0].lines[:2]:
+        np.testing.assert_array_equal(line.get_xdata()[[0, -1]], [353., 454.])
+
+
+def test_primary_range_uses_all_draws_and_clips_to_grid(primary_posterior):
+    fit, idata = primary_posterior
+    idata.posterior['eep'].values[:] = 400.
+    # Put tails in draws that will NOT be selected for the one plotted curve.
+    index = np.random.default_rng(0).choice(80, 1, replace=False)[0]
+    other = [i for i in range(80) if i != index]
+    idata.posterior['eep'].values.ravel()[other[0]] = 340.
+    idata.posterior['eep'].values.ravel()[other[-1]] = 470.
+    fig = fit.plot_posterior_tracks(idata, x='eep', y='mass', n_samples=1)
+    # Primary boundaries would be 202..605; the available grid is 300..500.
+    np.testing.assert_array_equal(fig.axes[0].lines[0].get_xdata()[[0, -1]], [300., 500.])
+    np.testing.assert_array_equal(fig.axes[0].lines[-1].get_xdata(), [400.])
+
+
+@pytest.mark.parametrize('eeps,expected', [
+    ([353., 454.], [353., 454.]),  # Inclusive primary boundaries.
+    ([400., 400.], [353., 454.]),
+    ([454., 454.], [353., 500.]),  # Zero width on a boundary includes neighbors.
+    ([300., 300.], [300., 353.]),
+    ([500., 500.], [454., 500.]),
+])
+def test_primary_range_at_boundaries(primary_posterior, eeps, expected):
+    fit, idata = primary_posterior
+    idata.posterior['eep'].values[:] = np.resize(eeps, (2, 40))
+    fig = fit.plot_posterior_tracks(idata, x='eep', y='mass', n_samples=1)
+    np.testing.assert_array_equal(fig.axes[0].lines[0].get_xdata()[[0, -1]], expected)
+    assert fig.axes[0].lines[-1].get_label() == 'Posterior locations'
+
+
+def test_explicit_ranges_opt_out_and_single_track_keep_their_behavior(primary_posterior):
+    fit, idata = primary_posterior
+    for kwargs, expected in [(dict(auto_eep_range=False), [300., 500.]),
+                              (dict(eep_range=(370., 420.)), [370., 420.])]:
+        fig = fit.plot_posterior_tracks(idata, x='eep', y='mass', n_samples=1, **kwargs)
+        np.testing.assert_array_equal(fig.axes[0].lines[0].get_xdata()[[0, -1]], expected)
+    fig = fit.plot_posterior_tracks(idata, x='age', y='mass', n_samples=1, age_range=(1.1, 3.7))
+    np.testing.assert_allclose(fig.axes[0].lines[0].get_xdata()[[0, -1]], [1.1, 3.7], rtol=3e-13)
+    fig = fit.plot_track(1.1, 0., x='eep', y='age')
+    np.testing.assert_array_equal(fig.axes[0].lines[0].get_xdata()[[0, -1]], [300., 500.])
+
+
+def test_legacy_grid_without_primary_metadata_keeps_full_range(posterior):
+    fit, idata = posterior
+    idata.posterior['eep'].values[:] = 400.
+    fig = fit.plot_posterior_tracks(idata, x='eep', y='mass', n_samples=1)
+    np.testing.assert_array_equal(fig.axes[0].lines[0].get_xdata()[[0, -1]], [300., 500.])

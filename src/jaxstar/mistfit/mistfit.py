@@ -1,14 +1,15 @@
 """Convenience interface combining a MistModel with fixed observations."""
 
 # Preserve the previous import paths; implementations live in inference.py.
-__all__ = ["MistObservations", "MistFit", "model_isochrone", "model_track", "make_init_strategy",
+__all__ = ["MistObservations", "MistFit", "model_isochrone", "model_track", "find_initial", "make_init_strategy",
            "run_nuts", "run_multinest"]
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from numpyro.infer import init_to_value
 
 from .model import MistModel
-from .inference import (MistObservations, model_isochrone, model_track, make_init_strategy,
+from .inference import (MistObservations, model_isochrone, model_track, find_initial, make_init_strategy,
                         run_nuts, run_multinest, smbound, _normalize_output_keys, _default_model)
 
 
@@ -59,18 +60,37 @@ class MistFit:
         """Default NumPyro model selected by the physical model's kind."""
         return _default_model(self.physical_model)(self.observations, self.physical_model, *args, **kwargs)
 
+    def find_initial(self, *, feh_init=0., distance=None, model_kwargs=None):
+        """Return latent starting values from a fixed-FeH/distance grid search.
+
+        Pass the same model_kwargs as the intended run. Track searches use
+        native mass x EEP; isochrone searches use native log-age x EEP.
+        See inference.find_initial for scoring, bounds and distance defaults.
+        """
+        return find_initial(self.observations, self.physical_model,
+                            feh_init=feh_init, distance=distance, model_kwargs=model_kwargs)
+
     def run_nuts(self, rng_key, *, output_keys=None, model_kwargs=None,
-                 init_strategy=None, **sampler_kwargs):
+                 grid_init=True, init_kwargs=None, init_strategy=None, **sampler_kwargs):
         """Return a new MCMC result (four chains by default).
 
         output_keys adds deterministic outputs for this run. model_kwargs holds
         prior/likelihood options; sampler_kwargs holds run_nuts sampler options.
-        Initialization is unchanged unless an explicit init_strategy is supplied.
+        By default, search once with find_initial and use that start for all
+        chains. init_kwargs can set feh_init and distance for this search only.
+        grid_init=False retains the historical parallax/NumPyro fallback rule.
+        Explicit init_strategy or init_params bypass automatic initialization
+        (including init_kwargs), and do not require a parallax observation.
         """
-        if init_strategy is None:
-            init_strategy = make_init_strategy(self.observations)
+        options = _model_options(model_kwargs, output_keys)
+        if init_strategy is None and sampler_kwargs.get("init_params") is None:
+            if grid_init:
+                initial = self.find_initial(model_kwargs=options, **dict(init_kwargs or {}))
+                init_strategy = init_to_value(values=initial)
+            else:
+                init_strategy = make_init_strategy(self.observations)
         return run_nuts(self.model, rng_key, init_strategy=init_strategy,
-                        model_kwargs=_model_options(model_kwargs, output_keys), **sampler_kwargs)
+                        model_kwargs=options, **sampler_kwargs)
 
     # Retain the familiar name with the new single-call/result-returning API.
     run_hmc = run_nuts

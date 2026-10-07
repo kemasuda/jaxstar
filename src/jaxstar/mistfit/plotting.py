@@ -177,25 +177,55 @@ def _track_curves(model, params, keys, eep_range, age_range, n_points):
     count = len(params["mass_init"])
     low, high = np.full(count, eep_range[0]), np.full(count, eep_range[1])
     coordinates = {key: values[:, None] for key, values in params.items()}
+    crossings = np.empty((count, 0))
     if age_range is not None:
         if age_range[0] < 0:
             raise ValueError("age_range must be nonnegative (Gyr)")
         curves = np.asarray(model({**coordinates, "eep": native[None, :]}, keys="logage")["logage"])
         log_limits = (np.log10(age_range[0])+9 if age_range[0] > 0 else -np.inf,
                       np.log10(age_range[1])+9)
-        limits = np.array([np.interp(log_limits, curve, native) for curve in curves])
-        low, high = limits.T
+        # Invert each valid segment separately; never bridge a missing EEP or
+        # assume that a full ragged track is globally increasing in age.
+        endpoints = []
+        for curve in curves:
+            points = []
+            for i in range(len(native)-1):
+                a, b = curve[i:i+2]
+                if not np.isfinite(a) or not np.isfinite(b):
+                    continue
+                lo, hi = max(min(a, b), log_limits[0]), min(max(a, b), log_limits[1])
+                if lo > hi:
+                    continue
+                if a == b:
+                    points.extend(native[i:i+2])
+                else:
+                    points.extend(native[i]+(np.array([lo, hi])-a)/(b-a)*(native[i+1]-native[i]))
+            endpoints.append(points)
+        low = np.array([min(p) if p else native[0] for p in endpoints])
+        high = np.array([max(p) if p else native[0] for p in endpoints])
+        crossings = np.array([np.pad(p, (0, max(map(len, endpoints))-len(p)),
+                                    constant_values=low[i]) for i, p in enumerate(endpoints)])
     active = low < high
     if not np.any(active):
         raise ValueError("the requested age range does not overlap these tracks")
     # Fixed-size batches avoid recompiling interpolation for each track. Native
     # knots outside the interval duplicate its endpoints, removed when drawing.
     eeps = np.sort(np.concatenate((np.linspace(low, high, n_points).T,
-                                  np.clip(native[None, :], low[:, None], high[:, None])), axis=1), axis=1)
-    values = model({**coordinates, "eep": eeps}, keys=keys)
-    values = {key: np.asarray(value) for key, value in values.items()}
-    if any(not np.all(np.isfinite(value[active])) for value in values.values()):
-        raise ValueError("nonfinite track predictions in the requested range")
+                                  np.clip(native[None, :], low[:, None], high[:, None]),
+                                  crossings), axis=1), axis=1)
+    predictions = model({**coordinates, "eep": eeps}, keys=tuple(dict.fromkeys((*keys, "logage"))))
+    values = {key: predictions[key] for key in keys}
+    logage = np.asarray(predictions["logage"])
+    # Even coordinate-only axes (e.g. mass vs EEP) need an actual track.
+    valid = np.isfinite(logage)
+    for value in values.values():
+        valid &= np.isfinite(value)
+    if age_range is not None:
+        valid &= np.isfinite(logage) & (logage >= log_limits[0]-1e-12) & (logage <= log_limits[1]+1e-12)
+    values = {key: np.where(valid, value, np.nan) for key, value in values.items()}
+    active &= np.any(valid, axis=1)
+    if not np.any(active):
+        raise ValueError("no supported track predictions in the requested range")
     return values, eeps, active
 
 
@@ -258,8 +288,35 @@ def _track_observation(ax, x, y, observations):
         ax.axhline(value, color="C3", ls="--", lw=1, label="Observed")
 
 
+def _posterior_eep_range(model, eeps):
+    """Enclose all finite posterior EEPs with native primary EEP boundaries."""
+    if not isinstance(model, MistModel) or model.kind != "track":
+        raise ValueError("track plots require MistModel.from_tracks(...)")
+    if not model.primary_eeps:
+        return None  # Legacy/custom grids without phase metadata use full coverage.
+    native = np.asarray(model.grid.axis("eep"))
+    primary = np.asarray(model.primary_eeps)
+    # A cropped grid may end within a phase; never extend outside its support.
+    boundaries = np.unique(np.r_[native[0], primary[(primary > native[0]) & (primary < native[-1])],
+                                 native[-1]])
+    finite = np.asarray(eeps).ravel()
+    finite = finite[np.isfinite(finite)]
+    if not finite.size:
+        raise ValueError("automatic EEP range requires finite posterior EEP samples")
+    low, high = finite.min(), finite.max()
+    if low < native[0] or high > native[-1]:
+        raise ValueError("posterior EEP samples lie outside the supplied track grid")
+    lower = np.searchsorted(boundaries, low, side="right") - 1
+    upper = np.searchsorted(boundaries, high, side="left")
+    if lower == upper:
+        # A single-valued posterior exactly on a primary EEP still needs a
+        # visible track: include the adjacent intervals that exist in the grid.
+        lower, upper = max(0, lower-1), min(len(boundaries)-1, upper+1)
+    return boundaries[[lower, upper]]
+
+
 def plot_posterior_tracks(result, model, *, x="teff", y=None, n_samples=20, seed=0,
-                          eep_range=None, age_range=None, n_points=400, labels=None,
+                          eep_range=None, age_range=None, auto_eep_range=True, n_points=400, labels=None,
                           show_observations=True, save_path=None, overwrite=False):
     """Return a Figure with posterior tracks and sampled locations in each panel.
 
@@ -271,8 +328,15 @@ def plot_posterior_tracks(result, model, *, x="teff", y=None, n_samples=20, seed
     Outputs are recomputed using the supplied track model, which must match
     the fitted grid. Thus axes need not have been saved as posterior outputs.
 
-    eep_range/age_range follow plot_track. Locations outside the drawing range
-    are not marked; tracks with no age overlap are omitted without resampling.
+    With neither eep_range nor age_range specified, auto_eep_range=True uses
+    the nearest primary EEP boundaries enclosing the minimum/maximum finite
+    EEP across ALL posterior draws, not just the selected curves. Boundaries
+    come from the model's native track metadata and are limited to grid coverage.
+    A single-valued posterior on a boundary includes its adjacent intervals.
+    Set auto_eep_range=False for full-grid EEP coverage. Grids without primary
+    EEP metadata also retain full coverage. Explicit eep_range/age_range take
+    precedence and follow plot_track. Locations outside the drawing range are
+    not marked; tracks with no age overlap are omitted without resampling.
     Observations/errors come from the result, with exact key matching. If only
     one axis is observed, show its value and error as a line and shaded band.
     Apparent and absolute magnitudes are never substituted for one another.
@@ -295,6 +359,8 @@ def plot_posterior_tracks(result, model, *, x="teff", y=None, n_samples=20, seed
     size = idata.posterior["eep"].size
     if size == 0:
         raise ValueError("posterior tracks need at least one draw")
+    if auto_eep_range and eep_range is None and age_range is None:
+        eep_range = _posterior_eep_range(model, idata.posterior["eep"])
     indices = np.random.default_rng(seed).choice(size, min(n_samples, size), replace=False)
     selected = {key: np.asarray(idata.posterior[key]).reshape(-1)[indices] for key in required}
     selected["mass_init"] = selected.pop(mass_key)
@@ -302,9 +368,12 @@ def plot_posterior_tracks(result, model, *, x="teff", y=None, n_samples=20, seed
     keys = tuple(dict.fromkeys((x, *ys)))
     curves, eeps, active = _track_curves(model, selected, keys, eep_range, age_range, n_points)
     positions = {key: np.asarray(value) for key, value in model({**selected, "eep": sample_eep}, keys=keys).items()}
-    if any(not np.all(np.isfinite(value)) for value in positions.values()):
-        raise ValueError("posterior locations lie outside the supplied track model")
     marked = active & (sample_eep >= eeps[:, 0]) & (sample_eep <= eeps[:, -1])
+    for value in positions.values():
+        marked &= np.isfinite(value)
+    if age_range is not None:
+        ages = np.asarray(model({**selected, "eep": sample_eep}, keys="age")["age"])
+        marked &= (ages >= age_range[0]) & (ages <= age_range[1])
     columns = min(3, len(ys))
     fig, axes = plt.subplots((len(ys)+columns-1)//columns, columns,
                              figsize=(5*columns, 4.3*((len(ys)+columns-1)//columns)), squeeze=False)
@@ -325,7 +394,7 @@ def plot_posterior_tracks(result, model, *, x="teff", y=None, n_samples=20, seed
         for ax in list(axes.flat)[len(ys):]:
             fig.delaxes(ax)
         if not np.all(active):
-            fig.suptitle(f"{active.sum()}/{len(active)} selected tracks overlap the age range")
+            fig.suptitle(f"{active.sum()}/{len(active)} selected tracks overlap the supported range")
         fig.tight_layout()
         return _save(fig, save_path, overwrite)
     except Exception:
@@ -341,7 +410,9 @@ def plot_diagnostics(result, *, keys=None, trace_kwargs=None, corner_kwargs=None
     MultiNest omits trace. Trace/corner need no grid. With a track model and
     observed magnitudes (or explicit track_kwargs['y']), add 'tracks', one
     panel per observed band. MistFit supplies its model automatically. Use
-    show_tracks=False for grid-free diagnostics. Per-plot dictionaries override
+    track_kwargs={'auto_eep_range': False} to disable the default primary-EEP
+    range enclosing all posterior EEPs. Explicit EEP/age ranges take precedence.
+    show_tracks=False gives grid-free diagnostics. Per-plot dictionaries override
     plotting options; keys selects only trace/corner variables. No fitter state
     is changed and no files are written unless output_dir is given.
     """

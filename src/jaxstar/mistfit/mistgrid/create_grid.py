@@ -4,11 +4,11 @@ __all__ = ["create_mistgrid"]
 # %%
 import numpy as np
 import pandas as pd
-import os
-import glob
 from astropy.constants import M_sun, R_sun, G
 from scipy.interpolate import interp1d
-from .paths import resolve_mistgrid_path
+from .cache import extract_archive
+from .paths import default_mistgrid_path, resolve_mistgrid_path
+from .sources import isochrone_archive
 logg_sun = np.log10((G * M_sun / R_sun**2).cgs.value)
 
 # %%
@@ -20,50 +20,44 @@ keys += ['star_mass', 'feh_photosphere']
 keys += ['Bessell_U',  'Bessell_B', 'Bessell_V', 'Bessell_R', 'Bessell_I']
 
 
-def create_mistgrid(path=None):
-    """Download the source CMDs and create a MIST grid.
+def _cmd_directory(output, raw_cache_dir, offline):
+    source = isochrone_archive()
+    directory_name = source.filename.removesuffix(".txz")
+    # Preserve earlier downloads/extractions, including when the NPZ output
+    # changes. New archives/extractions live in the shared raw cache.
+    parents = tuple(dict.fromkeys((output.parent, default_mistgrid_path().parent)))
+    for parent in parents:
+        directory = parent / directory_name
+        if directory.is_dir() and any(directory.glob("*.cmd")):
+            return directory
+    local = next((parent / source.filename for parent in parents
+                  if (parent / source.filename).is_file()), None)
+    root = extract_archive(source, cache_dir=raw_cache_dir, local_path=local, offline=offline)
+    directory = root / directory_name
+    if not directory.is_dir() or not any(directory.glob("*.cmd")):
+        raise ValueError(f"No CMD files in the expected archive directory: {directory}")
+    return directory
+
+
+def create_mistgrid(path=None, *, raw_cache_dir=None, offline=False):
+    """Create the historical v1.2 isochrone grid, reusing cached source CMDs.
 
     Args:
         path: output path for the generated grid. If omitted, use the
             environment override or the platform-specific user cache.
+        raw_cache_dir: shared raw-data cache; defaults to JAXSTAR_MIST_RAW_DIR
+            or the platform cache. Independent of the NPZ output path.
+        offline: require cached/local source files; never download.
 
     Returns:
         Path: path to the generated grid
     """
-    url_cmd = "http://waps.cfa.harvard.edu/MIST/data/tarballs_v1.2/MIST_v1.2_vvcrit0.4_UBVRIplus.txz"
-    filename_cmd = "MIST_v1.2_vvcrit0.4_UBVRIplus.txz"
     mistgrid_path = resolve_mistgrid_path(path)
-    mistgriddir_path = mistgrid_path.parent
-    mistgriddir_path.mkdir(parents=True, exist_ok=True)
-    mistdir_path = mistgriddir_path/'MIST_v1.2_vvcrit0.4_UBVRIplus'
-    # print (mistdir_path)
-
-    # %%
-    if not os.path.exists(mistdir_path):
-        print("CMD files not found. Downloading to %s..." %
-              str(mistgriddir_path))
-        import urllib.error
-        import urllib.request
-        import tarfile
-        cmdfile_tar = str(mistgriddir_path/filename_cmd)
-        cmdfile_tar
-        try:
-            with urllib.request.urlopen(url_cmd) as download_file:
-                data = download_file.read()
-                with open(cmdfile_tar, mode='wb') as save_file:
-                    save_file.write(data)
-        except urllib.error.URLError as errormsg:
-            print(errormsg)
-
-        import tarfile
-        with tarfile.open(cmdfile_tar, 'r:xz') as t:
-            t.extractall(path=mistgriddir_path)
-
-    if os.path.exists(mistdir_path):
-        print("CMD files found in %s" % str(mistdir_path))
-        filenames = glob.glob(str(mistdir_path/'*.cmd'))
-        # print (filenames)
-        print("creating grid for mistfit...")
+    mistgrid_path.parent.mkdir(parents=True, exist_ok=True)
+    mistdir_path = _cmd_directory(mistgrid_path, raw_cache_dir, offline)
+    filenames = sorted(mistdir_path.glob("*.cmd"))
+    print("CMD files found in %s" % mistdir_path)
+    print("creating grid for mistfit...")
 
     # %%
     header = ['EEP', 'log10_isochrone_age_yr', 'initial_mass', 'star_mass', 'log_Teff', 'log_g', 'log_L', '[Fe/H]_init', '[Fe/H]',  'Bessell_U',  'Bessell_B', 'Bessell_V', 'Bessell_R', 'Bessell_I', '2MASS_J', '2MASS_H', '2MASS_Ks', 'Kepler_Kp',
@@ -72,8 +66,6 @@ def create_mistgrid(path=None):
     # %%
     df_all = pd.DataFrame(data={})
     for filename in filenames:
-        feh = float(filename.split('/')[-1].split("_")
-                    [3].replace("m", "-").replace("p", "+"))
         d = pd.read_csv(filename, sep=r'\s+',
                         comment='#', header=None, names=header)
         d['mass'] = d['initial_mass']

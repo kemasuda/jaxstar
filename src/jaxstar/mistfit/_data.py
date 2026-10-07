@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 import jax
+import jax.numpy as jnp
 
 from jaxstar.grid import RectilinearGrid
 
@@ -20,6 +21,11 @@ class _MistGridData:
     grid: RectilinearGrid
     kind: str = "isochrone"
     sources: tuple[str, ...] = ()
+    # Optional per-field support, in grid.field_names order. Invalid values in
+    # the numerical grid are finite placeholders; only MistModel applies masks.
+    validity: tuple | None = None
+    # Sorted union of native primary EEP labels; plotting metadata only.
+    primary_eeps: tuple[int, ...] = ()
 
     def __post_init__(self):
         if not isinstance(self.grid, RectilinearGrid):
@@ -35,13 +41,22 @@ class _MistGridData:
         if isinstance(self.sources, str) or any(not isinstance(s, str) for s in self.sources):
             raise TypeError("sources must be a sequence of path strings")
         object.__setattr__(self, "sources", tuple(self.sources))
+        object.__setattr__(self, "primary_eeps", tuple(self.primary_eeps))
         if self.kind == "track":
             age = self.grid.field("logage")
             if age.dims != axes["track"]:
                 raise ValueError("track logage dimensions must be initial_mass, initial_feh, eep")
+        if self.validity is not None:
+            if self.kind != "track" or len(self.validity) != len(self.grid.field_names):
+                raise ValueError("validity must contain one mask per track field")
+            masks = tuple(jnp.asarray(mask, dtype=bool) for mask in self.validity)
+            if any(mask.shape != self.grid.field(name).values.shape
+                   for name, mask in zip(self.grid.field_names, masks)):
+                raise ValueError("track validity masks must match their fields")
+            object.__setattr__(self, "validity", masks)
 
     def tree_flatten(self):
-        return (self.grid,), (self.kind, self.sources)
+        return (self.grid, self.validity), (self.kind, self.sources, self.primary_eeps)
 
     @classmethod
     def tree_unflatten(cls, metadata, children):
@@ -50,4 +65,6 @@ class _MistGridData:
         object.__setattr__(data, "grid", children[0])
         object.__setattr__(data, "kind", metadata[0])
         object.__setattr__(data, "sources", metadata[1])
+        object.__setattr__(data, "primary_eeps", metadata[2])
+        object.__setattr__(data, "validity", children[1])
         return data

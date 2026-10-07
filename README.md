@@ -48,6 +48,124 @@ If the resolved default cache file is missing, it is generated transparently.
 The source CMDs come from the
 [MIST synthetic photometry grids](https://mist.science/model_grids.html#synthetic).
 
+Raw archives and extracted files are cached separately from generated grids.
+`JAXSTAR_MIST_RAW_DIR` selects this cache (default: `mist/raw` under the jaxstar
+platform cache); an explicit `cache_dir` takes precedence. Its keys include
+the MIST release, data kind, and archive filename, which identifies rotation,
+composition and photometry where applicable. Changing the jaxstar version or
+the output NPZ path does not trigger another download. A different MIST release
+has a separate cache entry.
+
+The raw-data API can import existing archives or download missing ones:
+
+```python
+from jaxstar.mistfit.mistgrid.sources import track_archives, bolometric_correction_archive
+from jaxstar.mistfit.mistgrid.cache import fetch_archive, extract_archive
+
+# Descriptors only; feh=None lists all published metallicities without downloading.
+sources = track_archives(version="1.2", rotation=0.4, afe=0., feh=[-0.25, 0., 0.25])
+source = sources[0]
+archive = fetch_archive(
+    source, local_path=f"benchmark-results/mist-bc-inputs/{source.filename}",
+)
+# No local_path: reuse the cache, or download on a miss.
+bc_archive = fetch_archive(bolometric_correction_archive())
+# Optional extraction; archive-reading builders can use `archive` directly.
+directory = extract_archive(source, offline=True)
+```
+
+An existing valid cache takes precedence over `local_path`. Imports copy the
+source without modifying it. Reuse verifies byte size and SHA-256 locally;
+`offline=True` forbids network access and fails on a cache miss. Explicit
+`force=True` on `fetch_archive` refreshes an entry. Transfers are streamed and
+validated as complete XZ/tar archives before publication. A failed transfer or
+refresh leaves the previous successful entry intact; partial downloads restart
+on retry. The receipt records the source URL, local hash, size and import/download
+origin. The hash detects local corruption; it is not a publisher-supplied checksum.
+Older content generations are retained when a refresh changes the archive.
+
+Isochrone creation uses this cache and also recognizes existing CMD folders or
+archives beside the output NPZ or in the earlier default cache:
+
+```python
+from jaxstar.mistfit.mistgrid.create_grid import create_mistgrid
+
+create_mistgrid("/path/to/new/mistgrid_iso.npz", offline=True)
+```
+
+The registered sources currently cover MIST v1.2 EEP tracks at both published
+rotation rates and solar alpha abundance, plus UBVRIplus CMD/BC archives.
+Source catalogues are separate from the version-independent cache; MIST v2
+catalogues, parsers and BC conventions remain future work. This raw-data API
+supplies the track grid builder below.
+
+### Building track grids
+
+Select a release, rotation and alpha abundance; by default the builder downloads
+all published FeH archives and retains all native masses and EEPs:
+
+```python
+from jaxstar.mistfit.mistgrid.create_tracks import create_track_grid
+
+path = create_track_grid("mistgrid_tracks.npz", version="1.2", rotation=0.4, afe=0.)
+# Optional subset: feh=[-0.25, 0., 0.25], mass_range=(0.8, 1.5), eep_range=(202, 550)
+# Enable JAX x64 before loading with MistModel.from_tracks(path).
+```
+
+The builder reuses the shared raw cache and downloads missing inputs. To import
+earlier downloads, add `local_dir="benchmark-results/mist-bc-inputs"`; files use
+their official archive names. `offline=True` allows only cached/local inputs.
+`raw_cache_dir=...` overrides the common cache location. Existing NPZ output
+requires `overwrite=True`; a failed build leaves the previous output intact.
+Regenerating a grid or updating jaxstar reuses the cached source archives. A new
+MIST release has separate source files and cache entries.
+
+The same operation is available from the command line:
+
+```bash
+python -m jaxstar.mistfit.mistgrid.create_tracks mistgrid_tracks.npz --rotation 0.4 --afe 0
+# Optional: --feh -0.25 0 0.25 --mass-range 0.8 1.5 --eep-range 202 550
+# Optional: --local-dir /path/to/archives --offline --raw-cache-dir /path/to/cache
+```
+
+Mass and EEP axes are unions of the selected native tracks, with no thinning.
+Explicit bounds are inclusive; at least two masses, two FeH values and three
+EEPs are required. Missing mass/FeH pairs and differing track endpoints remain
+missing cells. `*_INTERP` alternatives are excluded. No age cut or additional
+mass/EEP interpolation is applied during construction. `allow_missing=False`
+(`--strict`) instead requires a complete, finite rectangle with increasing ages.
+Malformed input files always raise an error.
+
+MIST v1.2, both rotation rates, afe=0 and UBVRIplus BCs (Av=0, Rv=3.1) are
+supported. BC interpolation follows the public recipe: Steffen in logT (linear
+in the first/last intervals), linear in logg, then Steffen in metallicity (the
+MESA limited three-point recipe at the edges). Inclusive table endpoints are
+supported. Atmospheres outside the BC table have missing photometry; they are
+not clipped or extrapolated. Available physical fields are still retained.
+The release catalogue and parser are separate; adding MIST v2 requires its own
+validated catalogue/parser before it can be selected.
+
+Format 2 NPZ files store `track_present` and NaN values for missing fields,
+plus `metadata_json` with build settings, coverage counts, native track members,
+input archive SHA-256 values, BC conventions and builder/parser hashes. Read it
+with `json.loads(np.load(path)["metadata_json"].item())`. Masks/metadata are not
+model output keys. Legacy complete NPZ grids remain supported.
+
+`MistModel` checks support separately for each requested output. All nonzero
+interpolation corners must have that output's required native fields; exact
+nodes/faces remain usable even beside a missing cell. Unsupported predictions
+return `-inf`. Use `model(...)` for predictions: masked `model.grid` stores finite
+placeholders for safe differentiation. The centered `dtdeep` uses valid native
+three-node age stencils, with adjacent interior values copied to track ends;
+missing nodes or nonpositive age increments invalidate the affected stencils.
+
+Track inference excludes unsupported age/derivative or likelihood values.
+Requesting an additional saved-only output does not change the target density;
+that output can contain `-inf` when unavailable. Track plots leave gaps across
+missing regions. Full grids describe available model coverage; posterior sampling
+across every evolutionary phase has not been validated merely by building one.
+Construction uses NumPy float64; JAX x64 is required when loading the model.
+
 ## Deterministic isochrone predictions
 
 `MistModel` evaluates stellar properties independently of observations and priors:
@@ -113,10 +231,32 @@ numpyro.set_host_device_count(4)
 
 MistFit does not change the process-wide device configuration.
 
-Initialization retains the existing parallax-based rule and NumPyro fallback;
-no preliminary fit to the observations is performed. A custom `init_strategy`
-is accepted, and required if parallax is absent. `output_keys` adds to the default
-and observed outputs for that run, without changing future runs.
+`MistFit.run_nuts` initializes both model kinds with a grid search (no SVI).
+At fixed initial FeH = 0 and distance = 1 / observed positive parallax, it
+searches native mass × EEP for tracks, or native log-age × EEP for isochrones.
+It uses all EEP nodes within the sampling bounds and scores the existing joint
+log density, including the run's prior/Jacobian and optional likelihood factors.
+Uniform prior endpoints are excluded; a bound interval with no interior native
+node uses its overlap midpoint. The best candidate with finite density and
+gradients initializes all chains. All parameters are then free in NUTS;
+this search does not guarantee finding every posterior mode.
+
+```python
+options = {"linear_age": True}
+initial = fit.find_initial(model_kwargs=options)  # inspect constrained latent values
+mcmc = fit.run_nuts(random.PRNGKey(0), model_kwargs=options)
+# Or override the quantities fixed only during initialization:
+mcmc = fit.run_nuts(random.PRNGKey(0), model_kwargs=options,
+                   init_kwargs={"feh_init": -0.1, "distance": 0.15})  # kpc
+```
+
+Without a positive observed parallax, supply `init_kwargs={"distance": ...}`
+or explicit initialization. `grid_init=False` uses the historical parallax-based
+rule and NumPyro fallback. Explicit `init_strategy` or unconstrained `init_params`
+always take precedence and bypass the search. Selected grid starting values are
+saved in the run metadata as the `init_to_value` strategy's values.
+`output_keys` adds to the default and observed outputs for that run, without
+changing future runs. Standalone `run_nuts` retains NumPyro's default initialization.
 
 `model_isochrone(observations, physical_model, ...)` is the shared probability
 function in `jaxstar.mistfit.inference`, alongside the NUTS/MultiNest execution
@@ -184,7 +324,7 @@ are unchanged.
 This initial loader requires JAX x64, a complete rectangular grid with uniform
 EEP spacing, and precomputed UBVRIplus photometry. It performs no downloads or
 grid generation. The example grid is a local benchmark artifact, not bundled
-package data: see [track grid construction](benchmarks/README.md#extending-the-track-mass-domain-from-12-to-15-solar-masses)
+package data: see [track grid construction](#building-track-grids)
 and the [example notebook](examples/mistfit/fit_track.ipynb).
 
 To draw a track at fixed initial mass and initial FeH:
@@ -205,7 +345,14 @@ single tracks; temperature and magnitude axes follow HR-diagram directions.
 `track_fit.plot_diagnostics(idata)` adds a `tracks` figure, with one panel per
 observed magnitude versus Teff. It draws 20 joint posterior tracks, marks the
 sampled positions and adds the recorded observations with error bars. Each
-track uses its draw's initial mass, initial FeH and distance. To customize it:
+track uses its draw's initial mass, initial FeH and distance. By default, the
+drawn EEP interval spans the nearest primary EEP boundaries enclosing the
+minimum and maximum EEP across **all posterior draws**, not just the selected
+20. Boundaries come from native track metadata and are clipped to grid coverage.
+Explicit `eep_range` or `age_range` takes precedence. `auto_eep_range=False`
+shows the full grid extent; grids without primary EEP metadata also retain
+full coverage. These are drawing limits only and do not change the samples
+or inference bounds. To customize it:
 
 ```python
 figures = track_fit.plot_diagnostics(
@@ -214,6 +361,9 @@ figures = track_fit.plot_diagnostics(
 )
 # Draw only this figure; y=None selects all observed magnitude bands.
 fig = track_fit.plot_posterior_tracks(idata, y="kmag")
+# Show the full track extent instead of the posterior's primary EEP interval:
+fig = track_fit.plot_posterior_tracks(idata, y="kmag", auto_eep_range=False)
+# The same option can be passed via plot_diagnostics(track_kwargs=...).
 ```
 
 Selection is reproducible and uses the same draws across bands. Requested

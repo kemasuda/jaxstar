@@ -1,10 +1,12 @@
-"""Load complete evolutionary-track NPZ grids, with precomputed photometry.
+"""Load evolutionary-track NPZ grids, with precomputed photometry.
 
-This reads the schema produced by benchmarks/build_mist_track_extension.py.
+This reads the schema produced by create_tracks.create_track_grid and the
+earlier benchmarks/build_mist_track_extension.py.
 It does not download tracks or build bolometric corrections on first use.
 """
 
 from pathlib import Path
+import json
 
 import jax
 import numpy as np
@@ -45,12 +47,43 @@ def centered_age_derivative(age_gyr, eep):
     return np.concatenate((middle[..., :1], middle, middle[..., -1:]), axis=-1)
 
 
+def masked_age_derivative(age_gyr, eep, present):
+    """Centered differences within native segments, never across missing EEPs.
+
+    A center needs two positive adjacent age increments. Copy its derivative
+    to a segment endpoint only when that endpoint has a full three-node
+    stencil. Invalid ages/increments inside a native segment remain holes.
+    """
+    # Validate spacing through the complete-grid routine, using a dummy curve.
+    centered_age_derivative(np.arange(1., len(eep)+1), eep)
+    result = np.full_like(age_gyr, np.nan, dtype=np.float64)
+    step = np.diff(eep)[0]
+    for age, exists, out in zip(age_gyr.reshape(-1, len(eep)),
+                                present.reshape(-1, len(eep)), result.reshape(-1, len(eep))):
+        changes = np.diff(np.r_[False, exists, False].astype(int))
+        for start, end in zip(np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)):
+            if end-start < 3:
+                continue
+            a = age[start:end]
+            valid = np.isfinite(a) & (a > 0)
+            increasing = np.diff(a) > 0
+            good = valid[:-2] & valid[1:-1] & valid[2:] & increasing[:-1] & increasing[1:]
+            middle = np.where(good, (a[2:]-a[:-2])/(2*step), np.nan)
+            out[start+1:end-1] = middle
+            out[start], out[end-1] = middle[0], middle[-1]
+    return result
+
+
 def load_tracks(path):
-    """Read an explicit NPZ once; require x64 and a complete rectangular grid.
+    """Read an explicit NPZ once; require x64.
 
     All scalar native fields are retained. Named photometric bands are split
     into scalar absolute-magnitude fields. dtdeep is recomputed from native
-    age_gyr on the full EEP axis. Missing cells/partial tracks are not supported.
+    age_gyr on the full EEP axis. Primary EEP labels from optional metadata_json
+    are retained for plotting, not as an interpolated field. Format 2 uses
+    track_present plus NaN field values to
+    represent ragged tracks and unsupported photometry. Legacy grids remain
+    strict: missing/nonfinite values without this explicit schema are errors.
     """
     if not jax.config.x64_enabled:
         raise ValueError("Enable JAX x64 before loading a track grid")
@@ -74,22 +107,65 @@ def load_tracks(path):
         if len(bands) != len(_BAND_KEYS) or set(bands) != set(_BAND_KEYS):
             raise ValueError("track bands must contain the 14 supported UBVRIplus bands exactly once")
         magnitudes = np.array(data["absolute_magnitudes"], dtype=np.float64)
-        if magnitudes.shape != (*shape, len(bands)) or not np.all(np.isfinite(magnitudes)):
+        metadata = None
+        if magnitudes.shape != (*shape, len(bands)):
             raise ValueError("Incomplete or nonfinite absolute_magnitudes")
-        excluded = {*TRACK_AXES, "absolute_magnitudes", "bands"}
+        if "metadata_json" in data.files:
+            if data["metadata_json"].shape != () or data["metadata_json"].dtype.kind != "U":
+                raise ValueError("track metadata_json must be a scalar JSON string")
+            try:
+                metadata = json.loads(data["metadata_json"].item())
+            except ValueError as exc:
+                raise ValueError("Invalid track metadata_json") from exc
+            if (not isinstance(metadata, dict) or metadata.get("kind") != "track"
+                    or metadata.get("format_version") not in (1, 2)):
+                raise ValueError("Unsupported track metadata format")
+        masked = metadata is not None and metadata["format_version"] == 2
+        present = None
+        if masked:
+            if "track_present" not in data.files:
+                raise ValueError("Masked track NPZ requires track_present")
+            present = np.array(data["track_present"])
+            if present.dtype.kind != "b" or present.shape != shape or not present.any():
+                raise ValueError("track_present must be a nonempty Boolean mask matching the grid")
+        elif "track_present" in data.files:
+            raise ValueError("track_present requires track metadata format 2")
+        excluded = {*TRACK_AXES, "absolute_magnitudes", "bands", "metadata_json", "track_present"}
         native = {name: np.array(data[name], dtype=np.float64) for name in data.files if name not in excluded}
     for name, values in native.items():
-        if values.shape != shape or not np.all(np.isfinite(values)):
+        if values.shape != shape or np.any(np.isinf(values)) or (not masked and np.any(np.isnan(values))):
             raise ValueError(f"Incomplete or nonfinite native field: {name}")
-    if not np.allclose(10 ** (native["logage"] - 9), native["age_gyr"], rtol=2e-13, atol=0):
+        if masked and np.any(np.isfinite(values[~present])):
+            raise ValueError(f"Native field {name} contains values outside track_present")
+    if (np.any(np.isinf(magnitudes)) or (not masked and np.any(np.isnan(magnitudes)))
+            or (masked and np.any(np.isfinite(magnitudes[~present])))):
+        raise ValueError("Incomplete or nonfinite absolute_magnitudes")
+    if not np.allclose(10 ** (native["logage"] - 9), native["age_gyr"],
+                       rtol=2e-13, atol=0, equal_nan=masked):
         raise ValueError("Native physical ages and logage disagree")
-    native["dtdeep"] = centered_age_derivative(native["age_gyr"], axes["eep"])
+    if masked and np.any(np.isfinite(native["age_gyr"]) & (native["age_gyr"] <= 0)):
+        raise ValueError("Native physical ages must be positive or missing")
+    native["dtdeep"] = (masked_age_derivative(native["age_gyr"], axes["eep"], present)
+                        if masked else centered_age_derivative(native["age_gyr"], axes["eep"]))
     for i, band in enumerate(bands):
         name = _BAND_KEYS[band]
         if name in native:
             raise ValueError(f"Duplicate scalar and band field: {name}")
         native[name] = magnitudes[..., i]
+    masks = {name: np.isfinite(values) for name, values in native.items()} if masked else None
+    if masked:
+        native = {name: np.where(masks[name], values, 0.) for name, values in native.items()}
     grid = RectilinearGrid(axes=axes,
         fields={name: Field(values, TRACK_AXES) for name, values in native.items()},
-        fill_value=np.nan)
-    return _MistGridData(grid, kind="track", sources=(str(path),))
+        fill_value=0. if masked else np.nan)
+    try:
+        primary = np.asarray(sorted({eep for record in (metadata or {}).get("tracks", ())
+                                     for eep in record.get("primary_eeps", ())}), dtype=float)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("Invalid primary EEP metadata") from exc
+    if (primary.ndim != 1 or not np.all(np.isfinite(primary))
+            or np.any(primary <= 0) or np.any(primary != np.floor(primary))):
+        raise ValueError("Primary EEP metadata must contain positive integer labels")
+    return _MistGridData(grid, kind="track", sources=(str(path),),
+                         validity=None if masks is None else tuple(masks[k] for k in grid.field_names),
+                         primary_eeps=tuple(int(eep) for eep in primary))
