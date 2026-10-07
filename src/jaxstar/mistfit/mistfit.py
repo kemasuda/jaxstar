@@ -1,15 +1,15 @@
 """Convenience interface combining a MistModel with fixed observations."""
 
 # Preserve the previous import paths; implementations live in inference.py.
-__all__ = ["MistObservations", "MistFit", "model_isochrone", "make_init_strategy",
+__all__ = ["MistObservations", "MistFit", "model_isochrone", "model_track", "make_init_strategy",
            "run_nuts", "run_multinest"]
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .model import MistModel
-from .inference import (MistObservations, model_isochrone, make_init_strategy,
-                        run_nuts, run_multinest, smbound, _normalize_output_keys)
+from .inference import (MistObservations, model_isochrone, model_track, make_init_strategy,
+                        run_nuts, run_multinest, smbound, _normalize_output_keys, _default_model)
 
 
 def _model_options(model_kwargs, output_keys):
@@ -56,8 +56,8 @@ class MistFit:
         object.__setattr__(self, "observations", observations)
 
     def model(self, *args, **kwargs):
-        """NumPyro callable delegating to model_isochrone with this fit's data."""
-        return model_isochrone(self.observations, self.physical_model, *args, **kwargs)
+        """Default NumPyro model selected by the physical model's kind."""
+        return _default_model(self.physical_model)(self.observations, self.physical_model, *args, **kwargs)
 
     def run_nuts(self, rng_key, *, output_keys=None, model_kwargs=None,
                  init_strategy=None, **sampler_kwargs):
@@ -101,7 +101,17 @@ class MistFit:
         from .plotting import plot_corner
         return plot_corner(result, **kwargs)
 
+    def plot_track(self, mass_init, feh_init, **kwargs):
+        """Plot a track at fixed initial mass/FeH using this fitter's model."""
+        from .plotting import plot_track
+        return plot_track(self.physical_model, mass_init, feh_init, **kwargs)
+
+    def plot_posterior_tracks(self, result, **kwargs):
+        """Plot joint posterior tracks/locations with the result's observations."""
+        from .plotting import plot_posterior_tracks
+        return plot_posterior_tracks(result, self.physical_model, **kwargs)
+
     def plot_diagnostics(self, result, **kwargs):
-        """Return diagnostic Figures; optionally save them in output_dir."""
+        """Return diagnostic Figures, including tracks for observed track photometry."""
         from .plotting import plot_diagnostics
-        return plot_diagnostics(result, **kwargs)
+        return plot_diagnostics(result, model=self.physical_model, **kwargs)

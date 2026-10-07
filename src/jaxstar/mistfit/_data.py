@@ -12,9 +12,9 @@ from jaxstar.grid import RectilinearGrid
 class _MistGridData:
     """Loader result; interpolation stays in RectilinearGrid.
 
-    Only isochrones are implemented. Their axes are log10(age/yr), initial
-    FeH (dex), and EEP, named age/feh/eep in the numerical grid. Numerical
-    arrays are dynamic leaves; kind and source paths are static provenance.
+    Isochrone axes are age/feh/eep; track axes are initial_mass/initial_feh/eep.
+    Numerical arrays are dynamic leaves; kind and source paths are static
+    provenance.
     """
 
     grid: RectilinearGrid
@@ -24,15 +24,21 @@ class _MistGridData:
     def __post_init__(self):
         if not isinstance(self.grid, RectilinearGrid):
             raise TypeError("grid must be a RectilinearGrid")
-        if self.kind != "isochrone":
-            raise ValueError("only kind='isochrone' is currently supported")
-        if set(self.grid.axis_names) != {"age", "feh", "eep"}:
-            raise ValueError("isochrone grid axes must be age, feh, and eep")
+        axes = {"isochrone": ("age", "feh", "eep"),
+                "track": ("initial_mass", "initial_feh", "eep")}
+        if self.kind not in axes:
+            raise ValueError("kind must be 'isochrone' or 'track'")
+        if set(self.grid.axis_names) != set(axes[self.kind]):
+            raise ValueError(f"{self.kind} grid axes must be {', '.join(axes[self.kind])}")
         if any(self.grid.field_payload_dims):
-            raise ValueError("isochrone fields must be scalar at each grid node")
+            raise ValueError(f"{self.kind} fields must be scalar at each grid node")
         if isinstance(self.sources, str) or any(not isinstance(s, str) for s in self.sources):
             raise TypeError("sources must be a sequence of path strings")
         object.__setattr__(self, "sources", tuple(self.sources))
+        if self.kind == "track":
+            age = self.grid.field("logage")
+            if age.dims != axes["track"]:
+                raise ValueError("track logage dimensions must be initial_mass, initial_feh, eep")
 
     def tree_flatten(self):
         return (self.grid,), (self.kind, self.sources)

@@ -139,6 +139,88 @@ MultiNest requires `numpyro-inferutils`, `pymultinest` and the native MultiNest
 library. These are loaded only on that path; NUTS has no new dependencies.
 Both samplers keep the existing priors, Jacobian field and likelihood options.
 
+## Evolutionary-track models
+
+An explicit, prebuilt track NPZ can use the same prediction and fitting APIs:
+
+```python
+import jax
+jax.config.update("jax_enable_x64", True)
+from jaxstar.mistfit import MistModel, MistFit
+
+track_model = MistModel.from_tracks("benchmark-results/mist-track-grid-extended/grid.npz")
+prediction = track_model(
+    {"mass_init": 1.16, "feh_init": 0., "eep": 435.5, "distance": .22},
+    keys=("age", "teff", "radius", "gmag3", "dtdeep"),
+)
+track_fit = MistFit(model=track_model, observations={
+    "teff": (6175., 60.), "feh": (0., .04), "parallax": (4.55, .05),
+})
+track_mcmc = track_fit.run_nuts(
+    jax.random.PRNGKey(0), num_warmup=1500, num_samples=2000,
+    model_kwargs={"linear_age": True},
+    output_keys=("rho", "kmag_abs"),
+)
+```
+
+Track inputs are initial mass, initial FeH and EEP; age is an output. The
+NumPyro mass site remains named `mass`, with `mass_init` also saved as an alias.
+`MistFit` selects `model_track` automatically. Mass, FeH and EEP bounds default
+to the grid endpoints; `massmin`/`massmax`, `fmin`/`fmax`, and `eepmin`/`eepmax`
+may narrow those ranges. Track mass bounds are hard limits. The age prior uses
+the separately interpolated centered `dtdeep` (Gyr/EEP); `linear_age=False`
+selects the log-age target. The track model does not take `flat_age_marginal`.
+
+EEP uses a fixed interval for both NUTS and MultiNest. **The default is a soft
+upper age bound at 13.8 Gyr**, with `age_bound_width=0.1` Gyr. Set
+`model_kwargs={"age_max": None}` to disable it; `age_min` optionally adds a
+lower penalty. These values are in Gyr. Each sigmoid contributes a log
+penalty of −15 at its bound, approaching −30 outside (`age_bound_depth=30`).
+This softly suppresses ages outside the bounds without excluding them or
+changing EEP limits, and remains active for `nodata=True`. The track API no
+longer accepts `logamin`, `logamax`, or `bound_eep_by_age`; isochrone age options
+are unchanged.
+
+This initial loader requires JAX x64, a complete rectangular grid with uniform
+EEP spacing, and precomputed UBVRIplus photometry. It performs no downloads or
+grid generation. The example grid is a local benchmark artifact, not bundled
+package data: see [track grid construction](benchmarks/README.md#extending-the-track-mass-domain-from-12-to-15-solar-masses)
+and the [example notebook](examples/mistfit/fit_track.ipynb).
+
+To draw a track at fixed initial mass and initial FeH:
+
+```python
+from jaxstar.mistfit import plot_track
+
+fig = plot_track(track_model, mass_init=1.1, feh_init=0.,
+                 x="teff", y="kmag_abs", age_range=(0., 13.8))
+# Alternatively: eep_range=(250., 500.). Apparent magnitudes need distance (kpc).
+fig = track_fit.plot_track(1.1, 0., distance=.2, y="kmag")
+```
+
+The range defaults to the full grid EEP extent, independently of inference age
+bounds. Axes accept scalar MistModel output keys. `ax=...` allows overlaid
+single tracks; temperature and magnitude axes follow HR-diagram directions.
+
+`track_fit.plot_diagnostics(idata)` adds a `tracks` figure, with one panel per
+observed magnitude versus Teff. It draws 20 joint posterior tracks, marks the
+sampled positions and adds the recorded observations with error bars. Each
+track uses its draw's initial mass, initial FeH and distance. To customize it:
+
+```python
+figures = track_fit.plot_diagnostics(
+    idata, track_kwargs={"x": "teff", "y": ("jmag", "kmag"),
+                         "n_samples": 20, "seed": 0, "age_range": (0., 13.8)},
+)
+# Draw only this figure; y=None selects all observed magnitude bands.
+fig = track_fit.plot_posterior_tracks(idata, y="kmag")
+```
+
+Selection is reproducible and uses the same draws across bands. Requested
+axes are evaluated from the grid, so they need not have been saved as outputs.
+For reloaded results, `plot_posterior_tracks(idata, track_model)` uses an
+explicit matching model; `show_tracks=False` keeps diagnostics grid-free.
+
 ## Save results and plot diagnostics
 
 Install the optional plotting/NetCDF dependencies in a source checkout:
@@ -170,7 +252,8 @@ settings = get_run_metadata(loaded)
 
 `save_result` writes `posterior.nc` (ArviZ InferenceData), `run.json` and
 `summary.csv` (mean, standard deviation, 68% HDI, and MCMC Rhat/ESS).
-`plot_diagnostics` optionally writes `trace.png` and `corner.png`, and always
+`plot_diagnostics` optionally writes `trace.png`, `corner.png`, and `tracks.png`
+(when track plotting is enabled), and always
 returns a dictionary of Matplotlib Figures. Existing files require explicit
 `overwrite=True`; choose a new directory for each run. Missing requested outputs
 must be included via `output_keys` when sampling.
@@ -184,7 +267,8 @@ conventions. Labels carry the physical meaning and units.
 For MultiNest, use the same operations with `runner` or
 `fit.to_inference_data(runner)`. Conversion reconstructs registered deterministic
 outputs from the equal-weight posterior once; saved/reloaded data then need no
-model. `plot_diagnostics` returns only `corner`, and summaries omit MCMC Rhat/ESS.
+model for trace/corner. `plot_diagnostics` omits `trace` and returns `corner`
+plus `tracks` when enabled; summaries omit MCMC Rhat/ESS.
 The run record includes `logZ`/`logZerr`. MultiNest output, posterior, summary and
 figures share the same result directory. `save_result` keeps MultiNest files
 already there in place; saving to another directory copies them alongside the

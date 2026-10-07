@@ -1,4 +1,4 @@
-"""Deterministic isochrone predictions, independent of observations and priors."""
+"""Deterministic MIST predictions, independent of observations and priors."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from jaxstar.grid import GridResult, RectilinearGrid
 from ._data import _MistGridData
 from .mistgrid.isochrone import load_isochrones
+from .mistgrid.tracks import load_tracks
 
 
 __all__ = ["MistModel"]
@@ -25,13 +26,12 @@ _ALIASES = {
     "feh_surface": "feh_photosphere",
     "feh": "feh_photosphere",
 }
-_COORDINATES = ("logage", "feh_init", "eep", "distance")
 
 
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True, eq=False, init=False)
 class MistModel:
-    """A reusable, immutable isochrone model backed by all stored grid fields.
+    """A reusable, immutable isochrone or evolutionary-track model.
 
     Normally construct with ``MistModel.from_isochrones(path)``. Direct
     ``MistModel(grid)`` accepts a RectilinearGrid for tests/custom grids; a
@@ -40,6 +40,10 @@ class MistModel:
     ``feh_init`` (dex), and ``eep``. ``distance`` (kpc) is required only for
     apparent magnitudes, parallax (mas), or distance itself. Coordinates can
     be scalars or broadcastable arrays. All returned arrays share that shape.
+    ``from_tracks(path)`` instead takes ``mass_init`` (solar masses),
+    ``feh_init``, and ``eep``; logage is then an interpolated output. It reads
+    a complete prebuilt track NPZ and requires JAX x64. Track Teff/radius/age
+    are exponentiated AFTER interpolating their logarithms.
 
     ``keys`` is a name, an ordered sequence, or None for all available public
     outputs. The result is an immutable GridResult. Selection never changes
@@ -58,6 +62,8 @@ class MistModel:
     Values are linearly interpolated. ``dmdeep`` is the separately stored,
     centered-difference initial-mass derivative (solar masses per EEP), NOT
     autodiff of the mass interpolant. The model imposes no mass/age prior.
+    Tracks expose the analogous centered ``dtdeep`` in Gyr per EEP, computed
+    from native physical ages on loading, before applying inference bounds.
 
     Both modes use RectilinearGrid's inclusive endpoints and out-of-domain
     -inf fill. Output NaNs become -inf; other infinities are left unchanged.
@@ -82,6 +88,8 @@ class MistModel:
         grid = data.grid
         if not isinstance(legacy_interpolation, bool):
             raise TypeError("legacy_interpolation must be a bool")
+        if data.kind == "track" and legacy_interpolation:
+            raise ValueError("legacy_interpolation is only supported for isochrones")
         if legacy_interpolation and any(kind != "regular" for kind in grid.axis_kinds):
             raise ValueError("legacy_interpolation requires regular axes with at least two nodes")
         object.__setattr__(self, "data", data)
@@ -99,6 +107,19 @@ class MistModel:
             raise TypeError("legacy_interpolation must be a bool")
         return cls(load_isochrones(path), legacy_interpolation=legacy_interpolation)
 
+    @classmethod
+    def from_tracks(cls, path):
+        """Load a complete track NPZ with precomputed UBVRIplus photometry.
+
+        An explicit path and JAX x64 are required. No automatic download or
+        grid generation is performed. Subsequent calls do no I/O. Native
+        scalar fields and all 14 bands are retained; *_abs denotes absolute
+        magnitudes. The raw age_gyr field is linearly interpolated physical
+        age; public age instead comes from interpolated logage, as in the
+        validated track prototype.
+        """
+        return cls(load_tracks(path))
+
     @property
     def grid(self):
         """The immutable numerical grid; raw photometric fields are absolute."""
@@ -106,8 +127,14 @@ class MistModel:
 
     @property
     def kind(self):
-        """The source parameterization (currently only 'isochrone')."""
+        """The source parameterization: 'isochrone' or 'track'."""
         return self.data.kind
+
+    @property
+    def input_keys(self):
+        """Required intrinsic coordinates; distance is conditional on outputs."""
+        return (("logage", "feh_init", "eep") if self.kind == "isochrone"
+                else ("mass_init", "feh_init", "eep"))
 
     @jax.jit
     def eep_given_mass(self, logage, feh_init, mass_init):
@@ -120,6 +147,8 @@ class MistModel:
         needed, no mass-range/monotonicity policy is added, and inverse upper
         endpoints or invalid cells may produce NaNs/nonfinite gradients.
         """
+        if self.kind != "isochrone":
+            raise ValueError("eep_given_mass requires an isochrone model")
         if any(jnp.ndim(value) != 0 for value in (logage, feh_init, mass_init)):
             raise ValueError("logage, feh_init, and mass_init must be scalars; use jax.vmap for batches")
         eep = self.grid.axis("eep")
@@ -140,10 +169,24 @@ class MistModel:
         for name, mass in (("rho", "star_mass"), ("rho_initial", "mass")):
             if mass in self.grid.field_names and "radius" in self.grid.field_names:
                 specs[name] = ("density", (mass, "radius"))
-        for name in _COORDINATES:
+        for name in (*self.input_keys, "distance"):
             specs[name] = ("coordinate", ())
         specs["age"] = ("age", ())
         specs["parallax"] = ("parallax", ())
+        if self.kind == "track":
+            specs.update({
+                "mass": ("initial_mass", ()),
+                "logt": ("field", ("logTeff",)),
+                "logl": ("field", ("logL",)),
+                "teff": ("exp10", ("logTeff",)),
+                "radius": ("exp10", ("logR",)),
+                "age": ("track_age", ("logage",)),
+                "rho": ("track_density", ("star_mass", "logR")),
+                "rho_initial": ("track_initial_density", ("logR",)),
+                "feh_photosphere": ("field", ("cmd_surface_feh",)),
+                "feh_surface": ("field", ("cmd_surface_feh",)),
+                "feh": ("field", ("cmd_surface_feh",)),
+            })
         return specs
 
     @property
@@ -158,7 +201,7 @@ class MistModel:
 
     def __call__(self, params, *, keys=None):
         if not isinstance(params, Mapping):
-            raise TypeError("params must be a mapping with logage, feh_init, and eep")
+            raise TypeError(f"params must be a mapping with {', '.join(self.input_keys)}")
         specs = self._output_specs()
         selected = tuple(specs) if keys is None else ((keys,) if isinstance(keys, str) else tuple(keys))
         if not selected:
@@ -170,7 +213,7 @@ class MistModel:
         for key in selected:
             if key not in specs:
                 raise KeyError(f"unknown MistModel output: {key}")
-        required = ["logage", "feh_init", "eep"]
+        required = list(self.input_keys)
         needs_parallax = any(specs[key][0] in ("apparent", "parallax") for key in selected)
         if needs_parallax or "distance" in selected:
             required.append("distance")
@@ -179,10 +222,11 @@ class MistModel:
             raise ValueError(f"missing MistModel parameters: {', '.join(missing)}")
         values = dict(zip(required, jnp.broadcast_arrays(*(jnp.asarray(params[key]) for key in required))))
         field_keys = tuple(dict.fromkeys(field for key in selected for field in specs[key][1]))
-        raw = self._interpolate(
-            {"age": values["logage"], "feh": values["feh_init"], "eep": values["eep"]},
-            field_keys,
-        ) if field_keys else GridResult((), ())
+        coordinates = ({"age": values["logage"], "feh": values["feh_init"], "eep": values["eep"]}
+                       if self.kind == "isochrone" else
+                       {"initial_mass": values["mass_init"], "initial_feh": values["feh_init"],
+                        "eep": values["eep"]})
+        raw = self._interpolate(coordinates, field_keys) if field_keys else GridResult((), ())
         parallax = 1. / values["distance"] if needs_parallax else None
         outputs = []
         for key in selected:
@@ -199,6 +243,16 @@ class MistModel:
                 value = mass / radius**3
             elif operation == "apparent":
                 value = raw[fields[0]] - 5 * jnp.log10(parallax) + 10
+            elif operation == "initial_mass":
+                value = values["mass_init"]
+            elif operation == "exp10":
+                value = 10 ** raw[fields[0]]
+            elif operation == "track_age":
+                value = 10 ** (raw["logage"] - 9)
+            elif operation == "track_density":
+                value = raw["star_mass"] / (10 ** raw["logR"])**3
+            elif operation == "track_initial_density":
+                value = values["mass_init"] / (10 ** raw["logR"])**3
             else:
                 value = raw[fields[0]]
             outputs.append(jnp.where(jnp.isnan(value), -jnp.inf, value))

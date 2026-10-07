@@ -70,7 +70,7 @@ def _grid_record(model):
     schema = {"axes": list(model.grid.axis_names), "axis_kinds": list(model.grid.axis_kinds),
               "fields": {k: list(model.grid.field(k).dims) for k in model.grid.field_names}}
     digest.update(json.dumps(schema, sort_keys=True).encode())
-    for leaf in jax.tree_util.tree_leaves(model.grid):
+    for leaf in jax.tree_util.tree_leaves(model.data):
         array = np.ascontiguousarray(leaf)
         digest.update(str((array.dtype.str, array.shape)).encode())
         digest.update(memoryview(array).cast("B"))
@@ -81,13 +81,13 @@ def _grid_record(model):
 
 
 def _model_record(model, args, kwargs):
-    from .inference import MistObservations, model_isochrone
+    from .inference import MistObservations, _default_model
     from .model import MistModel
 
     owner = getattr(model, "__self__", None)
     if isinstance(getattr(owner, "physical_model", None), MistModel):
         args = (owner.observations, owner.physical_model, *args)
-        model = model_isochrone
+        model = _default_model(owner.physical_model)
     try:
         bound = inspect.signature(model).bind(*args, **kwargs)
         bound.apply_defaults()
@@ -117,6 +117,7 @@ def _new_run_record(sampler, model, args, kwargs):
     source_root = Path(__file__).resolve().parents[1]
     source_hashes = {str(path.relative_to(source_root)): _file_hash(path) for path in (
         source_root / "mistfit" / "model.py", source_root / "mistfit" / "inference.py",
+        source_root / "mistfit" / "_data.py", source_root / "mistfit" / "mistgrid" / "tracks.py",
         source_root / "mistfit" / "gyrochrone_likelihood.py", source_root / "grid" / "core.py",
     ) if path.is_file()}
     return {"format_version": _FORMAT_VERSION, "sampler": sampler, "source_sha256": source_hashes,
@@ -157,6 +158,7 @@ def _quantity_info(key):
         "rho": ("Density (current mass)", "rho_sun"),
         "rho_initial": ("Density (initial mass)", "rho_sun"),
         "dmdeep": ("d(initial mass)/dEEP", "M_sun / EEP"),
+        "dtdeep": ("d(age)/dEEP", "Gyr / EEP"),
     }
     if key in known:
         name, units = known[key]
