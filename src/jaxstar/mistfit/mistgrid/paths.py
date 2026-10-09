@@ -9,6 +9,17 @@ from platformdirs import user_cache_path
 MISTGRID_ENV_VAR = "JAXSTAR_MISTGRID_PATH"
 MISTGRID_FILENAME = "mistgrid_iso.npz"
 MISTGRID_CACHE_VERSION = "MIST_v1.2_vvcrit0.4_UBVRIplus"
+MIST_RAW_ENV_VAR = "JAXSTAR_MIST_RAW_DIR"
+
+
+def resolve_mist_raw_dir(cache_dir=None) -> Path:
+    """Raw archives shared by grid outputs and jaxstar package versions."""
+    if cache_dir is not None:
+        return Path(cache_dir).expanduser()
+    configured = os.environ.get(MIST_RAW_ENV_VAR)
+    if configured:
+        return Path(configured).expanduser()
+    return user_cache_path("jaxstar", appauthor=False) / "mist" / "raw"
 
 
 def default_mistgrid_path() -> Path:

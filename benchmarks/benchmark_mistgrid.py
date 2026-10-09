@@ -1,4 +1,4 @@
-"""Measure the current ``MistGridIso.values`` interpolation path.
+"""Measure the frozen legacy ``MistGridIso.values`` interpolation path.
 
 Run from the repository root, for example:
 
@@ -21,7 +21,7 @@ import jaxlib
 import numpy as np
 
 from jaxstar.grid import Field, RectilinearGrid
-from jaxstar.mistfit import MistGridIso
+from _mistgrid_reference import MistGridIso
 
 
 GRID_SHAPE = (48, 16, 256)

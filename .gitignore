@@ -32,3 +32,6 @@ __pycache__/
 # Legacy local files already excluded from package builds
 /src/jaxstar/jaxstar_version.py
 /src/jaxstar/mistfit/mistgrid/__init__.py
+
+# Generated MistFit results
+/examples/mistfit/results/
