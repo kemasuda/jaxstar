@@ -45,7 +45,7 @@ def load_ird_order8(reference_root, artifact_path, *, rv_initial, stride=4):
     flux, error = np.asarray(frame.normed_flux), np.asarray(frame.flux_error)
     mask = np.asarray(frame.all_mask, dtype=bool) | ~np.isfinite(flux) | ~np.isfinite(error) | (error <= 0)
     obs = Observation(wave[None, :], flux[None, :], error[None, :], mask[None, :],
-                      region=(8,), order=(8,), exposure="IRDA00042313_H")
+                      region=(8,), exposure="IRDA00042313_H")
     atmosphere = {name: dist.Uniform(float(model.spectra.grid.axis(name)[0]),
                                     float(model.spectra.grid.axis(name)[-1]))
                   for name in model.spectra.grid.axis_names}
