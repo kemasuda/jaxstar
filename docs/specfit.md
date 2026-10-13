@@ -131,7 +131,7 @@ describes the defaults and options.
 
 ```python
 p_fit = sf.run_svi(
-    rng_key=jax.random.PRNGKey(0), model=model, step_size=0.1, num_steps=1000,
+    rng_key=jax.random.PRNGKey(0), model=model, step_size=0.1, num_steps=2000,
 )
 point_figures = sf.plot_models(point=p_fit, model=model, show_gp=True)
 display(pd.DataFrame(sf.residual_diagnostics(point=p_fit, model=model)))
@@ -165,7 +165,7 @@ point directly as the NUTS initialization:
 ```python
 mcmc = sf.run_nuts(
     rng_key=jax.random.PRNGKey(2), model=model,
-    num_warmup=500, num_samples=500, num_chains=num_chains,
+    num_warmup=500, num_samples=1000, num_chains=num_chains,
     nuts_kwargs={
         "init_strategy": init_to_value(values=p_fit),
         "target_accept_prob": 0.90, "dense_mass": True, "max_tree_depth": 6,
@@ -175,7 +175,7 @@ mcmc.print_summary(exclude_deterministic=True)
 samples = mcmc.get_samples()
 ```
 
-These are the notebook's settings: two chains with 500 warmup and 500 retained
+These are the notebook's settings: two chains with 500 warmup and 1,000 retained
 draws each. Inspect convergence, effective sample sizes and divergences, along
 with the plots below, and adjust the run length or sampler settings as needed.
 
@@ -946,6 +946,3 @@ use `gp_continuum_posterior` and `gp_conditional_mean` with the fitted GP settin
   sibling `jaxspec` checkout; see the notebook's setup instructions.
 - [Continuum](tutorials/specfit/continuum.ipynb) is a self-contained synthetic
   demonstration of marginalization, shrinkage and jitter.
-- [Synthetic SpecFit workflow](../dev_notebooks/specfit/specfit_end_to_end.ipynb) uses
-  synthetic data to demonstrate initialization, fit masks, NUTS and diagnostics
-  without external spectral data.

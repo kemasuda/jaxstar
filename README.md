@@ -55,8 +55,9 @@ priors. `SpecFit` combines it with `Observation` for sampling, fit masks and
 diagnostics. Use the supplied `model_single` or your own NumPyro model.
 
 - [SpecFit guide](docs/specfit.md): spectral data, predictions, continuum and NUTS.
-- [SpecFit workflow](dev_notebooks/specfit/specfit_end_to_end.ipynb): a synthetic
-  example of initialization, fitting, masks and diagnostics.
+- [Coelho fitting example](examples/specfit/coelho.ipynb): fit an IRD spectrum
+  using the included grids and observation data, from CCF and SVI through
+  masking, NUTS, diagnostics and result saving.
 - [SpecModel tutorial](docs/tutorials/specfit/specmodel.ipynb): physical spectra and
   multiple stellar components; requires the external reference data described
   in the notebook.
