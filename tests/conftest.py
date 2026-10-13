@@ -25,3 +25,25 @@ def x64_context():
                 jax.config.update("jax_enable_x64", previous)
 
     return context
+
+
+@pytest.fixture
+def arviz_from_dict():
+    """Build external posterior data using either installed ArviZ API."""
+    import arviz as az
+
+    def convert(*, coords=None, dims=None, **groups):
+        if int(az.__version__.split(".", 1)[0]) >= 1:
+            return az.from_dict(groups, coords=coords, dims=dims)
+        return az.from_dict(**groups, coords=coords, dims=dims)
+
+    return convert
+
+
+@pytest.fixture
+def arviz_data_type():
+    import arviz as az
+    if int(az.__version__.split(".", 1)[0]) >= 1:
+        from xarray import DataTree
+        return DataTree
+    return az.InferenceData

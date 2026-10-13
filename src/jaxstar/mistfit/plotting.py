@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
+from jaxstar._arviz import uses_datatree
 from .results import to_inference_data, get_run_metadata, _quantity_info
 from .model import MistModel, _MAGNITUDES
 
@@ -64,8 +65,9 @@ def plot_trace(result, *, keys=None, labels=None, show_observations=True,
     """Return a Matplotlib Figure with separate-chain traces and marginals.
 
     Defaults to sampled latent sites; divergence marks use saved sample_stats.
-    Accepts MCMC or reloaded InferenceData. MultiNest samples have no MCMC trace.
-    Additional kwargs are forwarded to arviz.plot_trace (Matplotlib backend).
+    Accepts MCMC or reloaded InferenceData/DataTree. MultiNest samples have no
+    MCMC trace. Additional kwargs go to arviz.plot_trace (0.x) or
+    arviz.plot_trace_dist (1.x), using the Matplotlib backend.
     """
     import arviz as az
     idata = to_inference_data(result)
@@ -74,12 +76,22 @@ def plot_trace(result, *, keys=None, labels=None, show_observations=True,
     keys = _keys(idata, keys, trace=True)
     if "var_names" in kwargs or "backend" in kwargs:
         raise ValueError("use keys for variable selection; plots use the Matplotlib backend")
-    options = {"compact": False, "combined": False, "legend": True,
-               "divergences": "bottom", "show": False,
+    options = {"compact": False, "combined": False,
                "labeller": az.labels.MapLabeller(var_name_map=_labels(idata, keys, labels))}
     options.update(kwargs)
-    axes = np.asarray(az.plot_trace(idata, var_names=list(keys), backend="matplotlib", **options))
-    fig = axes.flat[0].figure
+    if uses_datatree():
+        legend = options.pop("legend", True)
+        collection = az.plot_trace_dist(idata, var_names=list(keys), backend="matplotlib",
+                                        **{"kind": "kde", **options})
+        if legend:
+            collection.add_legend("chain")
+        fig = collection.get_viz("figure")
+        axes = np.asarray([[collection.get_viz("plot", var_name=key, column=column)
+                            for column in ("dist", "trace")] for key in keys])
+    else:
+        options = {"legend": True, "divergences": "bottom", "show": False, **options}
+        axes = np.asarray(az.plot_trace(idata, var_names=list(keys), backend="matplotlib", **options))
+        fig = axes.flat[0].figure
     if show_observations:
         reference = _references(idata)
         for i, key in enumerate(keys):
@@ -103,7 +115,7 @@ def plot_corner(result, *, keys=None, labels=None, show_observations=True,
     try:
         import corner
     except ImportError as exc:
-        raise ImportError('Corner plots require corner; install jaxstar[mistfit-diagnostics]') from exc
+        raise ImportError('Corner plots require corner; install jaxstar with its dependencies') from exc
     idata = to_inference_data(result)
     keys = _keys(idata, keys)
     if "weights" in kwargs:

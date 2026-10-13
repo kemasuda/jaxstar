@@ -174,7 +174,8 @@ NumPyro's default initialization unless an `init_strategy` is supplied.
 
 ## Save results and inspect diagnostics
 
-Install the `mistfit-diagnostics` extra as shown in the [README](../README.md).
+Plotting and result-storage dependencies are included in the standard
+installation described in the [README](../README.md#installation).
 Convert a sampler result once when using it for several operations:
 
 ```python
@@ -193,8 +194,12 @@ summary = summarize(loaded)
 settings = get_run_metadata(loaded)
 ```
 
-`save_result` writes `posterior.nc` (ArviZ InferenceData), `run.json` and
+`save_result` writes `posterior.nc` (ArviZ result data), `run.json` and
 `summary.csv` (mean, standard deviation, 68% HDI and MCMC Rhat/ESS).
+`to_inference_data` and `load_result` return `InferenceData` with ArviZ 0.x,
+or `xarray.DataTree` with ArviZ 1.x. Conversion, summaries and trace plots use
+the installed version's API. The summary keeps the requested HDI probability
+in both versions; column labels follow ArviZ's naming conventions.
 The run record includes observations, configuration, RNG information and model
 provenance. Saved results support later analysis and plotting; they contain
 neither sampler state nor the implementations of custom callables.
@@ -303,6 +308,10 @@ library. `outputfiles_basename` sets the filename prefix: the example writes
 files such as `results/star_multinest/run-stats.dat`. Use a short relative prefix
 because older MultiNest libraries truncate filenames at 100 characters, and
 choose a fresh directory for each independent run.
+
+Gamma prior sites, including the default distance prior, use SciPy's inverse
+CDF in the CPU MultiNest callback and do not require TensorFlow Probability.
+User-supplied `site_overrides` take precedence over these automatic transforms.
 
 Conversion reconstructs deterministic outputs from the equal-weight posterior
 once. MultiNest diagnostics omit MCMC traces and Rhat/ESS, while metadata records

@@ -274,12 +274,14 @@ def test_invalid_track_inference_options(track_path, option):
 def test_invalid_dynamic_options_are_rejected_under_jit(track_path):
     model = MistModel.from_tracks(track_path)
     observations = MistObservations((), (), ())
+    # Substituted values must also use JAX when their support bounds are traced.
+    params = jax.tree_util.tree_map(jnp.asarray, LATENTS)
     density = jax.jit(lambda m, lower: log_density(model_track, (observations, m),
-                      dict(OPTIONS, massmin=lower), LATENTS)[0])
+                      dict(OPTIONS, massmin=lower), params)[0])
     assert np.isfinite(density(model, .85))
     assert np.isneginf(density(model, .7))
     bounded = jax.jit(lambda upper, width: log_density(model_track, (observations, model),
-                     dict(OPTIONS, age_min=1., age_max=upper, age_bound_width=width), LATENTS)[0])
+                     dict(OPTIONS, age_min=1., age_max=upper, age_bound_width=width), params)[0])
     assert np.isfinite(bounded(13.8, .1))
     for upper, width in ((.5, .1), (np.inf, .1), (13.8, 0.)):
         assert np.isneginf(bounded(upper, width))

@@ -4,6 +4,7 @@ __all__ = ["MistObservations", "model_isochrone", "model_track", "find_initial",
            "run_nuts", "run_multinest"]
 
 from dataclasses import dataclass
+from functools import partial
 import inspect
 import os
 from pathlib import Path
@@ -541,6 +542,34 @@ def run_nuts(model, rng_key, *, model_args=(), model_kwargs=None,
     return mcmc
 
 
+def _gamma_quantile(probability, *, concentration, rate):
+    """CPU prior callback; no differentiation or TFP is needed by MultiNest."""
+    from scipy.special import gammaincinv
+
+    dtype = np.dtype(jnp.result_type(probability, float))
+    probability = np.asarray(probability, dtype=dtype)
+    limits = np.finfo(dtype)
+    probability = np.clip(probability, limits.tiny, 1. - limits.eps)
+    return gammaincinv(concentration, probability) / rate
+
+
+def _multinest_prior_overrides(model, model_args, options, site_overrides):
+    """Supply Gamma quantiles through the runner's public override interface."""
+    overrides = dict(site_overrides or {})
+    trace = numpyro.handlers.trace(numpyro.handlers.seed(model, random.PRNGKey(0)))
+    for name, site in trace.get_trace(*model_args, **options).items():
+        if site["type"] != "sample" or site["is_observed"] or name in overrides:
+            continue
+        distribution = site["fn"]
+        while isinstance(distribution, (dist.Independent, dist.ExpandedDistribution, dist.MaskedDistribution)):
+            distribution = distribution.base_dist
+        if isinstance(distribution, dist.Gamma):
+            overrides[name] = partial(_gamma_quantile,
+                                       concentration=np.array(distribution.concentration, copy=True),
+                                       rate=np.array(distribution.rate, copy=True))
+    return overrides
+
+
 def run_multinest(model, *, outputfiles_basename, model_args=(), model_kwargs=None,
                   site_overrides=None, **run_kwargs):
     """Run the optional MultiNestRunner with the same NumPyro probability model.
@@ -551,14 +580,18 @@ def run_multinest(model, *, outputfiles_basename, model_args=(), model_kwargs=No
     directory. Short relative prefixes avoid older MultiNest filename limits.
     Requires numpyro-inferutils plus PyMultiNest and its native MultiNest library;
     none are imported by the NUTS or prediction paths.
+    Gamma sites (including the default distance prior) use SciPy's inverse CDF
+    in the CPU prior callback, without a TensorFlow Probability dependency.
+    Explicit site_overrides take precedence over these automatic transforms.
     """
     try:
         from numpyro_inferutils.experimental import MultiNestRunner
     except ImportError as exc:
         raise ImportError(
-            "MultiNest requires the optional numpyro-inferutils package") from exc
+            "MultiNest requires numpyro-inferutils with experimental.MultiNestRunner support") from exc
     model_args, options = tuple(model_args), dict(model_kwargs or {})
     record = _new_run_record("multinest", model, model_args, options)
+    site_overrides = _multinest_prior_overrides(model, model_args, options, site_overrides)
     runner = MultiNestRunner(model, model_args=model_args,
                              model_kwargs=options, site_overrides=site_overrides)
     # Keep the user's short relative prefix for the native call. Expanding it

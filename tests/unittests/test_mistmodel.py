@@ -319,23 +319,25 @@ def test_disabled_and_partial_optional_likelihoods(grid_path, extra):
 
 
 @pytest.mark.parametrize("backend", ["legacy", "named"])
-def test_fit_key_changes_do_not_mutate_or_reuse_stale_physical_selection(grid_path, backend, monkeypatch):
-    fit = make_fit(MistFit, grid_path, backend)
-    model = fit.physical_model
-    monkeypatch.setattr(np, "load", lambda *a, **kw: pytest.fail("changing output keys must not reload data"))
-    params = {"age": 10**PARAMS["logage"] / 1e9, **{k: v for k, v in PARAMS.items() if k != "logage"}}
-    log_density(fit.model, (), OPTIONS, params)
-    _, trace = log_density(fit.model, (), dict(OPTIONS, output_keys=(
-        "umag", "kmag_abs", "mass_current", "age", "parallax", "feh")), params)
-    assert "kmag_abs" in trace and "mass_current" in trace
-    fit = MistFit(model=model, observations=MistObservations(
-        ["kmag_abs", "mass_current", "feh_init", "age", "parallax"],
-        [4., 1., -.1, 2., 8.4], [.1, .1, .1, .2, .1]))
-    _, trace = log_density(fit.model, (), OPTIONS, params)
-    assert fit.physical_model is model
-    assert "umag" not in trace  # Additional outputs belonged only to the preceding call.
-    expected = model(PARAMS, keys=fit.observations.keys)
-    np.testing.assert_allclose(trace["obs"]["fn"].loc, [expected[k] for k in fit.observations.keys], rtol=1e-6)
+def test_fit_key_changes_do_not_mutate_or_reuse_stale_physical_selection(grid_path, backend, monkeypatch, x64_context):
+    # Key selection should not depend on float32 age-to-logage roundoff.
+    with x64_context():
+        fit = make_fit(MistFit, grid_path, backend)
+        model = fit.physical_model
+        monkeypatch.setattr(np, "load", lambda *a, **kw: pytest.fail("changing output keys must not reload data"))
+        params = {"age": 10**PARAMS["logage"] / 1e9, **{k: v for k, v in PARAMS.items() if k != "logage"}}
+        log_density(fit.model, (), OPTIONS, params)
+        _, trace = log_density(fit.model, (), dict(OPTIONS, output_keys=(
+            "umag", "kmag_abs", "mass_current", "age", "parallax", "feh")), params)
+        assert "kmag_abs" in trace and "mass_current" in trace
+        fit = MistFit(model=model, observations=MistObservations(
+            ["kmag_abs", "mass_current", "feh_init", "age", "parallax"],
+            [4., 1., -.1, 2., 8.4], [.1, .1, .1, .2, .1]))
+        _, trace = log_density(fit.model, (), OPTIONS, params)
+        assert fit.physical_model is model
+        assert "umag" not in trace  # Additional outputs belonged only to the preceding call.
+        expected = model(PARAMS, keys=fit.observations.keys)
+        np.testing.assert_allclose(trace["obs"]["fn"].loc, [expected[k] for k in fit.observations.keys], rtol=1e-6)
 
 
 @pytest.mark.parametrize("backend", ["legacy", "named"])

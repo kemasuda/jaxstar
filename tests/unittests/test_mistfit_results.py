@@ -4,7 +4,6 @@ from hashlib import sha256
 import json
 from pathlib import Path
 
-import arviz as az
 import jax
 import numpy as np
 import numpyro
@@ -64,7 +63,8 @@ def test_nuts_portable_roundtrip_and_grid_free_redraw(nuts_run, tmp_path, monkey
     # Reload after removing the source file: neither loading nor plotting needs a grid.
     Path(source['path']).unlink()
     loaded = load_result(directory)
-    for group in idata.groups():
+    groups = idata.groups() if callable(idata.groups) else (g.strip('/') for g in idata.groups if g != '/')
+    for group in groups:
         for name in getattr(idata, group).data_vars:
             a, b = getattr(idata, group)[name], getattr(loaded, group)[name]
             assert a.dtype == b.dtype
@@ -89,9 +89,9 @@ def test_nuts_portable_roundtrip_and_grid_free_redraw(nuts_run, tmp_path, monkey
 
 
 @pytest.mark.parametrize('sampler', ['nuts', 'multinest'])
-def test_summary_accepts_string_list_and_tuple_keys(sampler):
+def test_summary_accepts_string_list_and_tuple_keys(sampler, arviz_from_dict):
     rng = np.random.default_rng(5)
-    idata = az.from_dict(posterior={key: rng.normal(size=(4, 64))
+    idata = arviz_from_dict(posterior={key: rng.normal(size=(4, 64))
                                     for key in ('mass', 'radius', 'age', 'eep')})
     idata.attrs['jaxstar_run_metadata'] = json.dumps({'sampler': sampler})
     keys = ('mass', 'radius', 'age')  # The selection shown in the notebook.
@@ -102,6 +102,8 @@ def test_summary_accepts_string_list_and_tuple_keys(sampler):
     assert tuple(summarize(idata, keys='mass').index) == ('mass',)
     assert tuple(summarize(idata).index) == tuple(idata.posterior.data_vars)
     assert ('r_hat' in actual.columns) == (sampler == 'nuts')
+    assert len([key for key in actual.columns if key.startswith('hdi')]) == 2
+    assert not any(key.startswith('eti') for key in actual.columns)
 
 
 def test_corrupt_bundle_is_rejected(nuts_run, tmp_path):
@@ -174,7 +176,7 @@ def test_multinest_equal_weight_draws_evidence_native_files_and_reload(nested_ru
         np.testing.assert_array_equal(idata.posterior[name].values[0], runner.result['samples'][:, i])
     np.testing.assert_allclose(idata.posterior.rho, idata.posterior.star_mass / idata.posterior.radius**3)
     assert get_run_metadata(idata)['evidence'] == {'logZ': -123.45, 'logZerr': .12}
-    assert 'sample_stats' not in idata.groups()
+    assert not hasattr(idata, 'sample_stats')
     table = summarize(idata)
     assert not {'r_hat', 'ess_bulk', 'ess_tail'} & set(table.columns)
     directory = save_result(idata, tmp_path / 'nested')
@@ -194,11 +196,11 @@ def test_multinest_equal_weight_draws_evidence_native_files_and_reload(nested_ru
     assert get_run_metadata(load_result(second)) == get_run_metadata(loaded)
 
 
-def test_plot_references_respect_physical_keys_and_allow_constant_output():
+def test_plot_references_respect_physical_keys_and_allow_constant_output(arviz_from_dict):
     rng = np.random.default_rng(1)
     draws = {k: rng.normal(center, .01, (2, 40)) for k, center in {'feh': 0., 'feh_init': .05, 'kmag': 8., 'kmag_abs': 3.}.items()}
     draws['constant'] = np.ones((2, 40))
-    idata = az.from_dict(posterior=draws, sample_stats={'diverging': np.zeros((2,40), dtype=bool)})
+    idata = arviz_from_dict(posterior=draws, sample_stats={'diverging': np.zeros((2,40), dtype=bool)})
     record = {'sampler': 'nuts', 'model': {'observations': {'keys': ['feh', 'kmag'], 'values': [0., 8.], 'errors': [.1, .03]}}}
     idata.attrs['jaxstar_run_metadata'] = json.dumps(record)
     keys = ['feh', 'feh_init', 'kmag', 'kmag_abs']
@@ -215,7 +217,7 @@ def test_plot_references_respect_physical_keys_and_allow_constant_output():
         plot_trace(idata, keys=['feh', 'feh'])
     with pytest.raises(ValueError, match='equal-weight'):
         plot_corner(idata, keys='feh', weights=np.ones(80))
-    bad = az.from_dict(posterior={'vector': np.ones((2, 40, 3)), 'bad': np.full((2,40), np.nan)})
+    bad = arviz_from_dict(posterior={'vector': np.ones((2, 40, 3)), 'bad': np.full((2,40), np.nan)})
     with pytest.raises(ValueError, match='scalar'):
         plot_trace(bad, keys='vector')
     with pytest.raises(ValueError, match='nonfinite'):

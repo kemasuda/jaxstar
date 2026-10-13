@@ -2,7 +2,6 @@
 
 import json
 
-import arviz as az
 import jax
 import matplotlib
 matplotlib.use('Agg')
@@ -22,13 +21,13 @@ def close_figures():
 
 
 @pytest.fixture
-def posterior(track_path):
+def posterior(track_path, arviz_from_dict):
     model = MistModel.from_tracks(track_path)
     rng = np.random.default_rng(53)
     mass = rng.uniform(.85, 1.35, (2, 40))
     draws = dict(mass=mass, feh_init=.6*(mass-1.1),
                  distance=.1+.2*(mass-.8), eep=rng.uniform(320., 480., (2, 40)))
-    idata = az.from_dict(posterior=draws)
+    idata = arviz_from_dict(posterior=draws)
     truth = model(PARAMS, keys=('teff', 'jmag', 'kmag', 'feh'))
     observed = dict(keys=list(truth), values=[float(v) for v in truth.values()], errors=[80., .02, .03, .1])
     idata.attrs['jaxstar_run_metadata'] = json.dumps(dict(sampler='nuts', latent_names=list(draws),

@@ -112,15 +112,58 @@ def test_standalone_nuts_accepts_model_args_and_keeps_extra_fields():
     assert options == {'width': .3}
 
 
-def test_multinest_missing_optional_dependency_has_actionable_error(monkeypatch):
+def test_multinest_unavailable_runner_has_actionable_error(monkeypatch):
     original = builtins.__import__
     def unavailable(name, *args, **kwargs):
         if name.startswith('numpyro_inferutils'):
             raise ModuleNotFoundError(name)
         return original(name, *args, **kwargs)
     monkeypatch.setattr(builtins, '__import__', unavailable)
-    with pytest.raises(ImportError, match='optional numpyro-inferutils'):
+    with pytest.raises(ImportError, match=r'numpyro-inferutils with experimental\.MultiNestRunner support'):
         run_multinest(lambda: None, outputfiles_basename='unused/')
+
+
+@pytest.mark.parametrize('x64', [False, True])
+def test_multinest_gamma_quantiles_without_tfp_preserve_explicit_overrides(
+        tmp_path, monkeypatch, x64_context, x64):
+    from scipy.special import gammainc
+    from jaxstar.mistfit import get_run_metadata
+    mn = pytest.importorskip('numpyro_inferutils.experimental.multinest')
+    original = builtins.__import__
+
+    def without_tfp(name, *args, **kwargs):
+        if name.startswith('tensorflow_probability'):
+            pytest.fail('MultiNest Gamma transforms must not require TFP')
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', without_tfp)
+
+    def model():
+        numpyro.sample('distance', dist.Gamma(3, rate=.7))
+        numpyro.sample('vector', dist.Gamma(jnp.array([.5, 2.7]),
+                                           rate=jnp.array([2., .3])).to_event(1))
+        numpyro.sample('custom', dist.Gamma(2., rate=1.))
+
+    def fake_solve(**kwargs):
+        theta = kwargs['Prior'](np.full(kwargs['n_dims'], .5))
+        assert np.isfinite(kwargs['LogLikelihood'](theta))
+        return {'samples': np.stack([theta, theta])}
+
+    monkeypatch.setattr(mn, '_import_pymultinest', lambda: (fake_solve, None))
+    overrides = {'custom': lambda q: jnp.full_like(q, 1.25)}
+    with x64_context(x64):
+        runner = run_multinest(model, outputfiles_basename=str(tmp_path / 'gamma-'),
+                                site_overrides=overrides, n_live_points=8, resume=False)
+        for probability in (.0001, .05, .5, .95, .9999):
+            theta = runner.prior(np.full(runner.ndim, probability))
+            np.testing.assert_allclose(gammainc([3., .5, 2.7], theta[:3] * [.7, 2., .3]),
+                                       probability, rtol=2e-6 if not x64 else 1e-12,
+                                       atol=1e-8 if not x64 else 1e-14)
+            assert theta[3] == 1.25
+        assert runner.site_overrides['custom'] is overrides['custom']
+        assert set(overrides) == {'custom'}
+        recorded = get_run_metadata(runner)['site_overrides']
+        assert set(recorded) == {'distance', 'vector', 'custom'}
 
 
 @pytest.mark.parametrize('linear_age', [False, True])

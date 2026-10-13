@@ -16,6 +16,8 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 
+from jaxstar._arviz import from_dict as _arviz_from_dict, is_inference_data, uses_datatree
+
 _FORMAT_VERSION = 1
 _METADATA_ATTR = "jaxstar_run_metadata"
 # MultiNest's documented output suffixes, including INS and resume state. Never
@@ -186,19 +188,18 @@ def _multinest_samples(runner):
 
 
 def to_inference_data(result):
-    """Convert native MCMC/MultiNest results, or return existing InferenceData.
+    """Convert native results, or return existing InferenceData/DataTree.
 
     MCMC conversion only copies saved arrays. MultiNest additionally evaluates
     its registered deterministic sites once per conversion. Nested samples have
     one storage chain, explicitly marked as equal-weight, non-MCMC draws.
     No pointwise likelihood is recomputed (the model contains prior factors).
     """
-    import arviz as az
     from numpyro.infer import MCMC
 
-    if isinstance(result, az.InferenceData):
+    if is_inference_data(result):
         if not hasattr(result, "posterior"):
-            raise ValueError("InferenceData must contain a posterior group")
+            raise ValueError("InferenceData/DataTree must contain a posterior group")
         return result
     record = get_run_metadata(result)
     stats = None
@@ -223,15 +224,18 @@ def to_inference_data(result):
             if str(result.outputfiles_basename).endswith(os.sep):
                 record["native_output_prefix"] = record["native_output_prefix"].rstrip(os.sep) + os.sep
     else:
-        raise TypeError("expected NumPyro MCMC, MultiNestRunner or ArviZ InferenceData")
+        raise TypeError("expected NumPyro MCMC, MultiNestRunner or ArviZ InferenceData/DataTree")
     observed = record.get("model", {}).get("observations")
-    extra = {}
+    groups = {"posterior": {k: np.asarray(v) for k, v in samples.items()}}
+    if stats:
+        groups["sample_stats"] = stats
+    coords, dims = {}, {}
     if observed:
-        extra = dict(observed_data={"value": np.asarray(observed["values"])},
-                     constant_data={"error": np.asarray(observed["errors"])},
-                     coords={"observable": observed["keys"]},
-                     dims={"value": ["observable"], "error": ["observable"]})
-    idata = az.from_dict(posterior={k: np.asarray(v) for k, v in samples.items()}, sample_stats=stats, **extra)
+        groups.update(observed_data={"value": np.asarray(observed["values"])},
+                      constant_data={"error": np.asarray(observed["errors"])})
+        coords = {"observable": observed["keys"]}
+        dims = {"value": ["observable"], "error": ["observable"]}
+    idata = _arviz_from_dict(groups, coords=coords, dims=dims)
     idata.attrs[_METADATA_ATTR] = json.dumps(record, allow_nan=False, sort_keys=True)
     for key in idata.posterior:
         idata.posterior[key].attrs.update(_quantity_info(key))
@@ -247,7 +251,8 @@ def summarize(result, *, keys=None, hdi_prob=0.68):
     # xarray treats a tuple as one compound variable name, not a selection.
     names = None if keys is None else ([keys] if isinstance(keys, str) else list(keys))
     nested = get_run_metadata(idata).get("sampler") == "multinest"
-    return az.summary(idata, var_names=names, hdi_prob=hdi_prob,
+    interval = dict(ci_prob=hdi_prob, ci_kind="hdi") if uses_datatree() else dict(hdi_prob=hdi_prob)
+    return az.summary(idata, var_names=names, **interval,
                       kind="stats" if nested else "all", round_to="none")
 
 
@@ -329,8 +334,9 @@ def save_result(result, directory, *, overwrite=False, hdi_prob=0.68, copy_nativ
 def load_result(path):
     """Load a saved directory (with integrity check) or a standalone posterior.nc.
 
-    Returns fully loaded InferenceData, independent of the grid, fitter and
-    native samplers. Read provenance with get_run_metadata(result).
+    Returns fully loaded InferenceData (ArviZ 0.x) or DataTree (1.x), independent
+    of the grid, fitter and native samplers. Read provenance with
+    get_run_metadata(result).
     """
     import arviz as az
     path = Path(path).expanduser().resolve()
