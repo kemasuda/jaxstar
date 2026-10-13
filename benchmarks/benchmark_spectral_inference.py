@@ -1,6 +1,6 @@
 """Known-truth spectral recovery using ONE NumPyro model for SVI and NUTS.
 
-Run from the checkout with PYTHONPATH=src and the spectral-inference extra.
+Install the checkout with pip install -e . and run with PYTHONPATH=src.
 CPU/GPU selection uses JAX_PLATFORMS before Python starts, not a library toggle.
 This longer validation is intentionally outside CI; use --help for run options.
 """

@@ -27,12 +27,9 @@ install from the repository root:
 python -m pip install -e .
 ```
 
-Optional dependencies for MistFit plots and saved results, or spectral inference:
-
-```bash
-python -m pip install -e ".[mistfit-diagnostics]"
-python -m pip install -e ".[spectral-inference]"
-```
+This source installation includes the dependencies for MistFit diagnostics and
+result saving, and SpecFit inference, plotting and residual GPs. The only extra
+is `test`, which adds pytest for development (see below).
 
 ## MistFit
 

@@ -134,11 +134,11 @@ def _gp_setup(observation, model_flux, gp_amplitude, gp_scale, jitter, gp_solver
 
 
 def _region_gp(obs, region, indices, amplitude, scale, jitter, dtype, solver):
-    # Optional dependency: iid users need not import/install tinygp.
+    # Import lazily so iid calculations do not load the GP implementation.
     try:
         import tinygp
     except ImportError as exc:
-        raise ImportError("GP functions require tinygp; install jaxstar[spectral-inference]") from exc
+        raise ImportError("GP functions require tinygp; install jaxstar with its dependencies") from exc
     index = jnp.asarray(indices, dtype=jnp.int32)
     wave = jnp.atleast_2d(jnp.asarray(obs.wavelength, dtype=dtype))
     origin = wave[region, 0]

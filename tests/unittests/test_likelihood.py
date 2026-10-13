@@ -7,8 +7,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-pytest.importorskip("tinygp")
-
 from jaxstar.specfit import (
     Observation, apply_continuum, chebyshev_basis, continuum_posterior,
     continuum_prior, gp_conditional_mean, gp_continuum_posterior,
@@ -379,10 +377,12 @@ def test_iid_move_signature_imports_and_pre_move_numerical_reference(dtype, valu
     actual, grads = jax.value_and_grad(fn, argnums=(0, 1))(f, np.asarray([.015, .03], dtype=dtype))
     # Captured from 0de1c5c's original continuum.py before moving the function.
     np.testing.assert_allclose(actual, value, rtol=1e-7, atol=1e-11)
-    np.testing.assert_allclose(grads[1], jitter_gradient, rtol=1e-7, atol=1e-11)
+    # JAX/XLA versions can differ by a few float32 ULPs in this gradient.
+    gradient_rtol = 2 * np.finfo(np.float32).eps if dtype == np.float32 else 1e-7
+    np.testing.assert_allclose(grads[1], jitter_gradient, rtol=gradient_rtol, atol=1e-11)
 
 
-def test_optional_tinygp_dependency_does_not_affect_iid(monkeypatch):
+def test_lazy_tinygp_import_does_not_affect_iid(monkeypatch):
     import builtins
     original = builtins.__import__
     def without_tinygp(name, *args, **kwargs):
@@ -392,7 +392,7 @@ def test_optional_tinygp_dependency_does_not_affect_iid(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", without_tinygp)
     obs, flux = problem()
     assert np.isfinite(marginalized_continuum_log_likelihood(obs, flux, sigma_constant=.1, sigma_continuum=.03))
-    with pytest.raises(ImportError, match=r"jaxstar\[spectral-inference\]"):
+    with pytest.raises(ImportError, match="install jaxstar with its dependencies"):
         gp_marginalized_continuum_log_likelihood(obs, flux, **OPTIONS)
 
 
