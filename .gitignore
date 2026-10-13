@@ -35,3 +35,6 @@ __pycache__/
 
 # Generated MistFit results
 /examples/mistfit/results/
+
+# Generated SpecFit results
+/examples/specfit/results/
