@@ -31,22 +31,25 @@ def test_single_region_values_shapes_properties_and_default_mask():
     np.testing.assert_array_equal(obs.mask, np.zeros(3, dtype=bool))
     np.testing.assert_array_equal(obs.valid, np.ones(3, dtype=bool))
     assert obs.mask.dtype == bool
-    assert obs.region is obs.order is obs.exposure is None
+    assert obs.region is obs.exposure is None
 
 
-def test_rectangular_regions_and_distinct_region_order_metadata():
+@pytest.mark.parametrize('region,expected,changed', [
+    (['blue', 'red'], ('blue', 'red'), 'changed'),
+    (np.array([8, 8], dtype=np.int32), (8, 8), 9),
+])
+def test_rectangular_regions_and_metadata(region, expected, changed):
     wave, flux, error = arrays(regions=2)
-    region, order = ['blue', 'red'], np.array([8, 8], dtype=np.int32)
     obs = Observation(wave, flux, error, [[False, True, False], [True, False, False]],
-                      region=region, order=order, exposure='epoch1')
+                      region=region, exposure='epoch1')
     assert obs.shape == (2, 3) and obs.ndim == 2
     assert obs.n_regions == 2 and obs.n_pixels == 3
-    assert obs.region == ('blue', 'red') and obs.order == (8, 8)
-    assert all(type(label) is int for label in obs.order)
+    assert obs.region == expected
+    assert all(type(label) in (str, int) for label in obs.region)
     assert obs.exposure == 'epoch1'
     np.testing.assert_array_equal(obs.valid, [[True, False, True], [False, True, True]])
-    region[0], order[0] = 'changed', 9
-    assert obs.region == ('blue', 'red') and obs.order == (8, 8)
+    region[0] = changed
+    assert obs.region == expected
 
 
 @pytest.mark.parametrize('shape', [(), (0,), (2, 0), (0, 3), (1, 1, 3)])
@@ -206,32 +209,31 @@ def test_immutable_jax_inputs():
 
 
 def test_pytree_roundtrip_jit_dynamic_arrays_and_device_put():
-    obs = Observation(*arrays(), mask=[False, True, False], region=('segment',), order=(8,), exposure='epoch1')
+    obs = Observation(*arrays(), mask=[False, True, False], region=('segment',), exposure='epoch1')
     leaves, structure = jax.tree_util.tree_flatten(obs)
     assert len(leaves) == 4 and all(hasattr(leaf, 'shape') for leaf in leaves)
     restored = jax.tree_util.tree_unflatten(structure, leaves)
-    assert restored.region == ('segment',) and restored.order == (8,) and restored.exposure == 'epoch1'
+    assert restored.region == ('segment',) and restored.exposure == 'epoch1'
     for name in ('wavelength', 'flux', 'uncertainty', 'mask'):
         np.testing.assert_array_equal(getattr(restored, name), getattr(obs, name))
     compiled = jax.jit(lambda o: jnp.where(o.valid, o.flux, 0).sum())
     np.testing.assert_allclose(compiled(obs), obs.flux[obs.valid].sum())
     changed = Observation(obs.wavelength, obs.flux*2, obs.uncertainty, obs.mask,
-                          region=obs.region, order=obs.order, exposure=obs.exposure)
+                          region=obs.region, exposure=obs.exposure)
     np.testing.assert_allclose(compiled(changed), compiled(obs)*2)
     device_obs = jax.device_put(obs)
     assert all(isinstance(leaf, jax.Array) for leaf in jax.tree_util.tree_leaves(device_obs))
     output = jax.jit(lambda o: o)(device_obs)
-    assert output.region == obs.region and output.order == obs.order and output.exposure == obs.exposure
+    assert output.region == obs.region and output.exposure == obs.exposure
     np.testing.assert_array_equal(output.mask, obs.mask)
     program = jax.make_jaxpr(lambda o: jnp.where(o.valid, o.flux, 0).sum())(obs)
     assert not program.consts
 
 
-@pytest.mark.parametrize('name', ['region', 'order'])
 @pytest.mark.parametrize('labels', [8, 'blue', (), ('a', 'b'), (('nested',),), (True,), (1.5,), (None,)])
-def test_invalid_identifier_metadata(name, labels):
-    with pytest.raises(ValueError, match=name):
-        Observation(*arrays(), **{name: labels})
+def test_invalid_region_metadata(labels):
+    with pytest.raises(ValueError, match='region'):
+        Observation(*arrays(), region=labels)
 
 
 @pytest.mark.parametrize('label', ['', 1, ('epoch1',), ['epoch1']])
@@ -243,7 +245,7 @@ def test_invalid_exposure_metadata(label):
 def test_no_physical_parameters_and_direct_specmodel_composition():
     from test_specmodel import make_library, observations, parameters
 
-    assert set(Observation.__dataclass_fields__) == {'wavelength', 'flux', 'uncertainty', 'mask', 'region', 'order', 'exposure'}
+    assert set(Observation.__dataclass_fields__) == {'wavelength', 'flux', 'uncertainty', 'mask', 'region', 'exposure'}
     with pytest.raises(TypeError, match='resolving_power'):
         Observation(*arrays(), resolving_power=70000.)
     library = make_library(np.float32)

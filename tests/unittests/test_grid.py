@@ -8,6 +8,67 @@ import pytest
 from jaxstar.grid import Axis, Field, GridResult, RectilinearGrid
 
 
+@pytest.mark.parametrize("x64", [False, True])
+def test_legacy_interpolation_retains_input_precision_spacing_through_jit(x64_context, x64):
+    from jax.scipy.ndimage import map_coordinates
+
+    with x64_context(x64):
+        x = np.array([8., 8.05, 8.1, 8.15])
+        y = np.array([.2, .3, .4])
+        nodes = np.array([[0., 1., 4.], [1., 3., 7.], [4., 6., 10.], [9., 11., 15.]])
+        grid = RectilinearGrid(axes={"x": x, "y": y},
+                               fields={"f": Field(nodes, ("x", "y"))})
+        point = jnp.array([8.073, .337])
+
+        def evaluate(grid, p):
+            return grid.interpolate(dict(zip(("x", "y"), p)), keys="f",
+                                    legacy_interpolation=True)["f"]
+
+        def historical(p):
+            indices = [(p[i] - axis[0]) / (axis[1] - axis[0])
+                       for i, axis in enumerate((x, y))]
+            return map_coordinates(jnp.asarray(nodes), indices, order=1, cval=-jnp.inf)
+
+        # Passing the grid dynamically also checks spacing survives PyTree roundtrip.
+        actual = jax.jit(jax.value_and_grad(evaluate, argnums=1))(grid, point)
+        expected = jax.jit(jax.value_and_grad(historical))(point)
+        for a, b in zip(actual, expected):
+            np.testing.assert_array_equal(a, b)
+        if not x64:
+            assert grid._axis_first_steps[0] != grid.axis("x")[1] - grid.axis("x")[0]
+
+
+@pytest.mark.parametrize("bad_x", [np.nan, np.inf, -np.inf])
+def test_legacy_option_disables_input_protection_but_keeps_output_mask(bad_x):
+    nodes = np.array([[0., 2.], [1., 3.]])
+    grid = RectilinearGrid(axes={"x": [0., 1.], "y": [0., 1.]},
+                           fields={"f": Field(nodes, ("x", "y"))})
+    def evaluate(p, legacy):
+        return grid.interpolate(dict(zip(("x", "y"), p)), keys="f",
+                                legacy_interpolation=legacy)["f"]
+
+    compiled = jax.jit(jax.value_and_grad(evaluate), static_argnames="legacy")
+    for legacy in (False, True):
+        endpoint, _ = compiled(jnp.array([1., 1.]), legacy)
+        np.testing.assert_allclose(endpoint, 3.)
+        outside, outside_grad = compiled(jnp.array([1.1, .4]), legacy)
+        assert np.isneginf(outside)
+        np.testing.assert_array_equal(outside_grad, [0., 0.])
+        invalid, invalid_grad = compiled(jnp.array([bad_x, .4]), legacy)
+        assert np.isneginf(invalid)
+        if legacy:
+            assert np.any(~np.isfinite(invalid_grad))
+        else:
+            np.testing.assert_array_equal(invalid_grad, [0., 0.])
+
+
+@pytest.mark.parametrize("axis", [[0.], [0., 1., 3.]])
+def test_legacy_interpolation_rejects_nonregular_axes(axis):
+    grid = RectilinearGrid(axes={"x": axis}, fields={"f": Field(np.array(axis), ("x",))})
+    with pytest.raises(ValueError, match="regular axes"):
+        grid.interpolate({"x": 0.}, legacy_interpolation=True)
+
+
 @pytest.fixture
 def named_grid():
     """A small grid with one regular and one visibly nonuniform axis."""

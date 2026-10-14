@@ -155,8 +155,8 @@ def test_small_svi_and_nuts_same_model(case):
     assert not {"norm", "slope", "coefficients"}.intersection(samples)
 
 
-def test_inferutils_optional_smoke(case):
-    inferutils = pytest.importorskip("numpyro_inferutils")
+def test_inferutils_smoke(case):
+    import numpyro_inferutils as inferutils
     obs, model, kwargs, point, _ = case
     estimate = inferutils.find_map_svi(model_single, .04, 100,
         rng_key=jax.random.PRNGKey(0), p_initial={"teff": 5600.}, progress_bar=False,
@@ -202,7 +202,6 @@ def test_single_region_1d_observation(case):
 
 @pytest.fixture
 def gp_case(x64_context):
-    pytest.importorskip("tinygp")
     with x64_context():
         obs, model, kwargs, point, physical = _case()
         mask = obs.mask.copy()
@@ -244,7 +243,6 @@ def test_gp_fixed_factor_and_compact_trace(gp_case, solver):
 @pytest.mark.parametrize("solver", ["quasisep", "direct"])
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 def test_gp_sampled_sites_concrete_jit_and_joint_density(solver, dtype, x64_context):
-    pytest.importorskip("tinygp")
     with x64_context(dtype == "float64"):
         obs, model, kwargs, point, physical = _case()
         data = prepare_gp_observation(obs)

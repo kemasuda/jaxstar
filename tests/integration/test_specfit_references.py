@@ -15,7 +15,7 @@ from scipy.stats import median_abs_deviation
 from jaxstar.grid import Field, RectilinearGrid
 from jaxstar.specfit import Observation, SpecFit, SpecModel, single_star_params
 from jaxstar.specfit._data import _SpectralLibrary
-from jaxstar.specfit.fit import _compute_ccf, _extend_mask
+from jaxstar.specfit.specfit import _compute_ccf, _extend_mask
 
 ROOT = os.environ.get("JAXSPEC_REFERENCE_ROOT")
 pytestmark = pytest.mark.skipif(not ROOT, reason="set JAXSPEC_REFERENCE_ROOT for frozen SpecFit parity")
@@ -104,5 +104,7 @@ def test_frozen_check_ccf_and_outlier_mask(x64_context):
         sm.mask_fit = np.zeros_like(masks)
         old_outliers(legacy, {"fluxmodel": physical, "vsini": 6.})
         fit = SpecFit(Observation(wave, flux, np.full_like(flux, .01)), model)
-        np.testing.assert_array_equal(fit.mask_outliers(prediction=physical, mask_v=6.), sm.mask_fit)
+        prediction_model = SimpleNamespace(predict=lambda point, observation, specmodel: {
+            "continuum_flux": specmodel(point, observation.wavelength), "params": point})
+        np.testing.assert_array_equal(fit.mask_outliers(point=params, model=prediction_model), sm.mask_fit)
         plt.close("all")

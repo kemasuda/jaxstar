@@ -131,7 +131,10 @@ def test_private_carrier_is_an_immutable_dynamic_pytree(prepared):
     name, axes, paths, _, _ = prepared
     library = LOADERS[name](paths)
     leaves, structure = jax.tree_util.tree_flatten(library)
-    assert len(leaves) == len(axes) + 3
+    # Grid leaves contain each axis, its input-precision first spacing (except
+    # singleton axes), flux and fill; the carrier adds one wavelength array.
+    step_count = sum(len(values) > 1 for values in axes.values())
+    assert len(leaves) == len(axes) + step_count + 3
     assert all(isinstance(leaf, jax.Array) for leaf in leaves)
     restored = jax.tree_util.tree_unflatten(structure, leaves)
     assert restored.regions == library.regions

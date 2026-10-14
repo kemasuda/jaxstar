@@ -78,8 +78,9 @@ class Observation:
     their dtypes. JAX arrays retain their dtype/device. Construction validates
     concrete data before JIT; the four arrays are dynamic PyTree leaves.
     JAX transformations follow the caller's precision configuration; this class
-    never enables x64. Region/order tuples and a nonempty exposure string are
-    optional static labels. Region identifiers need not be order identifiers.
+    never enables x64. A region tuple and a nonempty exposure string are
+    optional static labels. A region can represent a whole spectral order or
+    any selected wavelength segment.
 
     Resolving power and other physical/instrument parameters belong to the
     forward model, not this container. No evaluation, fitting or file I/O.
@@ -90,7 +91,6 @@ class Observation:
     uncertainty: object
     mask: object = None
     region: tuple[str | int, ...] | None = field(default=None, kw_only=True)
-    order: tuple[str | int, ...] | None = field(default=None, kw_only=True)
     exposure: str | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
@@ -115,12 +115,11 @@ class Observation:
             raise ValueError("uncertainty must be finite and positive on usable (unmasked) pixels")
         count = 1 if wavelength.ndim == 1 else wavelength.shape[0]
         region = _identifiers(self.region, "region", count)
-        order = _identifiers(self.order, "order", count)
         if self.exposure is not None and (not isinstance(self.exposure, str) or not self.exposure):
             raise ValueError("exposure must be a nonempty string or None")
         for name, value in (("wavelength", wavelength), ("flux", flux),
                             ("uncertainty", uncertainty), ("mask", mask),
-                            ("region", region), ("order", order)):
+                            ("region", region)):
             object.__setattr__(self, name, value)
 
     @property
@@ -144,14 +143,14 @@ class Observation:
         return ~self.mask
 
     def tree_flatten(self):
-        return (self.wavelength, self.flux, self.uncertainty, self.mask), (self.region, self.order, self.exposure)
+        return (self.wavelength, self.flux, self.uncertainty, self.mask), (self.region, self.exposure)
 
     @classmethod
     def tree_unflatten(cls, metadata, children):
         # JIT/vmap may supply tracers or abstract placeholders; validate only at
         # public construction, not while JAX reconstructs the numerical PyTree.
         result = object.__new__(cls)
-        for name, value in zip(("wavelength", "flux", "uncertainty", "mask", "region", "order", "exposure"),
+        for name, value in zip(("wavelength", "flux", "uncertainty", "mask", "region", "exposure"),
                                (*children, *metadata)):
             object.__setattr__(result, name, value)
         return result

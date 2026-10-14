@@ -1,4 +1,4 @@
-"""Compare MistGridIso and NamedMistGridIso, including both MistFit backends.
+"""Compare the frozen MistGridIso and current MistModel, including both fit settings.
 
 Run from the repository root with a working project environment:
 
@@ -9,7 +9,7 @@ Run from the repository root with a working project environment:
     PYTHONPATH=src python benchmarks/compare_mistgrid_adapter.py --grid /path/to/mistgrid_iso.npz --inverse --rounds 200
 
 The optional real-grid comparison reads an existing NPZ and never generates or
-downloads one. MistGridIso remains the legacy numerical baseline.
+downloads one. The test-only frozen MistGridIso is the legacy numerical baseline.
 Known differences are printed rather than treated as compatibility checks.
 
 Runtime results are warm-call medians with JAX work synchronized. ``direct``
@@ -27,6 +27,7 @@ they may be nonfinite in both implementations.
 """
 
 import argparse
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
@@ -35,7 +36,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jaxstar.mistfit import MistFit, MistGridIso, NamedMistGridIso
+from jaxstar.mistfit import MistFit, MistModel, MistObservations
+from _mistgrid_reference import MistGridIso
 
 
 TYPICAL_MISTFIT_FIELDS = (
@@ -44,23 +46,34 @@ TYPICAL_MISTFIT_FIELDS = (
 )
 
 
+@partial(jax.jit, static_argnames=("keys",))
+def raw_values(grid, age, feh, eep, *, keys):
+    return grid.interpolate({"age": age, "feh": feh, "eep": eep}, keys=keys)
+
+
+@partial(jax.jit, static_argnames=("keys",))
+def raw_values_given_mass(model, logage, feh_init, mass_init, *, keys):
+    eep = model.eep_given_mass(logage, feh_init, mass_init)
+    return raw_values(model.grid, logage, feh_init, eep, keys=keys)
+
+
 class NamedGridAdapter:
     """Expose legacy-shaped calls solely to reuse interpolation comparisons.
 
-    This wraps the public named API; set_keys only records the next selection.
-    MistFit comparisons below use grid_backend directly and need no adapter.
+    This wraps the model grid; set_keys only records the next selection here.
+    MistFit comparisons below use legacy_interpolation and need no adapter.
     """
 
     def __init__(self, path):
-        self.named = NamedMistGridIso(path=path)
-        self._grid = self.named._grid
+        self.model = MistModel.from_isochrones(path)
+        self._grid = self.model.grid
         self.keys = None
 
     def set_keys(self, keys):
         self.keys = tuple(keys)
 
     def values(self, age, feh, eep):
-        result = self.named.values(age, feh, eep, keys=self.keys)
+        result = raw_values(self._grid, age, feh, eep, keys=self.keys)
         return [result[name] for name in self.keys]
 
 
@@ -356,9 +369,13 @@ def compare_real_grid(path, rounds, batch_size, typical_fields):
 
 
 def compare_inverse(path, rounds):
-    """Use the same scalar mass queries and retained interp() in both classes."""
+    """Compare the retained scalar inverse and raw fields at the inferred EEP."""
     fields = ("mass", "teff", "kmag")
-    legacy, named = MistGridIso(path=path), NamedMistGridIso(path=path)
+    legacy, named = MistGridIso(path=path), MistModel.from_isochrones(path)
+
+    def current_values_given_mass(logage, feh_init, mass_init, *, keys):
+        return raw_values_given_mass(named, logage, feh_init, mass_init, keys=keys)
+
     legacy.set_keys(fields)
     age, feh = 9.275, -0.125  # Same interior age/metallicity as compare_mistfit.
     # Include two low-mass brackets near the invalid prefix and two ordinary
@@ -368,7 +385,7 @@ def compare_inverse(path, rounds):
         old_eep = legacy.eep_given_mass(*point)[0]
         new_eep = named.eep_given_mass(*point)
         old_fields = legacy.values_given_mass(*point)
-        new_fields = named.values_given_mass(*point, keys=fields)
+        new_fields = current_values_given_mass(*point, keys=fields)
         tolerance = (
             dict(rtol=1e-7, atol=1e-8) if jax.config.read("jax_enable_x64")
             else dict(rtol=1e-5, atol=1e-4)
@@ -395,7 +412,7 @@ def compare_inverse(path, rounds):
     new_eep = jax.jit(jax.vmap(lambda p: named.eep_given_mass(*p)))(points)
     old_values = jax.jit(jax.vmap(lambda p: legacy.values_given_mass(*p)))(points)
     new_values = jax.jit(jax.vmap(
-        lambda p: named.values_given_mass(*p, keys=fields)
+        lambda p: current_values_given_mass(*p, keys=fields)
     ))(points)
     print("inverse diagnostic: 32 scalar queries from finite increasing mass intervals; "
           f"age={age}, feh={feh}")
@@ -427,7 +444,7 @@ def compare_inverse(path, rounds):
     old = legacy.eep_given_mass(age, feh, mass)[0]
     new = named.eep_given_mass(age, feh, mass)
     old_fields = np.asarray(legacy.values_given_mass(age, feh, mass))
-    new_fields = named.values_given_mass(age, feh, mass, keys=fields)
+    new_fields = current_values_given_mass(age, feh, mass, keys=fields)
     print(f"inverse unusual mass={mass}: EEP legacy={float(old)}, named={float(new)}; "
           f"fields legacy={old_fields}, named={np.asarray(list(new_fields.values()))}")
 
@@ -437,7 +454,7 @@ def compare_inverse(path, rounds):
         ("eep_given_mass", lambda p: legacy.eep_given_mass(*p)[0],
          lambda p: named.eep_given_mass(*p)),
         ("values_given_mass", lambda p: legacy.values_given_mass(*p),
-         lambda p: named.values_given_mass(*p, keys=fields)),
+         lambda p: current_values_given_mass(*p, keys=fields)),
     )
     arguments = tuple(scalar)  # Split coordinates before timing Python calls.
     for operation, old, new in operations:
@@ -459,14 +476,13 @@ def compare_inverse(path, rounds):
 
 
 def compare_mistfit(path, rounds):
-    """Compare both public MistFit backends with the actual default model."""
+    """Compare both MistFit interpolation settings with the actual default model."""
     from numpyro.infer import MCMC, NUTS, init_to_value
     from numpyro.infer.util import initialize_model, unconstrain_fn
 
-    legacy_fit = MistFit(path=path)
-    named_fit = MistFit(path=path, grid_backend="named")
-    fits = (legacy_fit, named_fit)
-    labels = ("legacy", "named")
+    models = (MistModel.from_isochrones(path, legacy_interpolation=True),
+              MistModel.from_isochrones(path))
+    labels = ("legacy_interpolation=True", "named")
 
     # Three nearby interior points, away from grid nodes and invalid cells.
     # age is in Gyr, matching model()'s default linear_age=True parameterization.
@@ -479,18 +495,15 @@ def compare_mistfit(path, rounds):
         )
     ]
     reference = points[0]
-    legacy_fit.mg.set_keys(("teff", "logg", "feh_photosphere", "kmag"))
-    teff, logg, feh, kmag = map(float, legacy_fit.mg.values(
-        np.log10(reference["age"] * 1e9), reference["feh_init"], reference["eep"]
-    ))
     obskeys = ("teff", "logg", "feh", "kmag", "parallax")
-    obsvals = (teff, logg, feh, kmag + 5 * np.log10(reference["distance"]) + 10,
-               1 / reference["distance"])
+    predicted = models[0](
+        {"logage": np.log10(reference["age"] * 1e9),
+         **{k: reference[k] for k in ("feh_init", "eep", "distance")}}, keys=obskeys,
+    )
+    obsvals = tuple(float(predicted[k]) for k in obskeys)
     obserrs = (100.0, 0.1, 0.1, 0.03, 0.1)
-    # Fresh legacy instance: set_keys after the first JIT call can retain old keys.
-    legacy_fit.mg = MistGridIso(path=path)
-    for fit in fits:
-        fit.set_data(obskeys, obsvals, obserrs)
+    observations = MistObservations(obskeys, obsvals, obserrs)
+    fits = tuple(MistFit(model=model, observations=observations) for model in models)
 
     infos = [
         initialize_model(
@@ -500,7 +513,7 @@ def compare_mistfit(path, rounds):
         for fit in fits
     ]
     functions = [jax.jit(jax.value_and_grad(info.potential_fn)) for info in infos]
-    arguments = [unconstrain_fn(legacy_fit.model, (), {}, point) for point in points]
+    arguments = [unconstrain_fn(fits[0].model, (), {}, point) for point in points]
     print("MistFit: synthetic observations; default model; 3 interior points")
     print(f"observations: {dict(zip(obskeys, obsvals))}")
     print("potential = negative log joint including unconstraining Jacobians")
@@ -572,7 +585,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument(
         "--typical-fields", action="store_true",
-        help="also time the 12 fields selected by MistFit.set_data()",
+        help="also time the 12 default physical outputs saved by MistFit",
     )
     parser.add_argument(
         "--mistfit", action="store_true",

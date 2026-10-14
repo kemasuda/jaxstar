@@ -16,6 +16,7 @@ import numpy as np
 
 from jaxstar.grid import Field, RectilinearGrid
 from ._data import _SpectralLibrary, _validate_wavelength
+from .observation import _identifiers
 from .sampling import _sampling_mode, _target_wavelengths
 
 
@@ -26,6 +27,69 @@ _SCHEMAS = {
              ("alpha", "agrid"), ("carbon", "cgrid"), ("vmic", "vgrid")),
     "tlusty": (("teff", "tgrid"), ("logg", "ggrid"), ("logZ", "zgrid")),
 }
+
+
+def select_grid_paths(gridpath, wavelength, *, wav_margin=3., pattern="*.npz",
+                      regions=None):
+    """Select one legacy NPZ per requested wavelength region, in input row order.
+
+    ``wavelength`` is a positive increasing array in Angstrom, shaped (pixel,)
+    or (region, pixel). All pixels, including any observation's masked pixels,
+    must be covered with at least ``wav_margin`` Angstrom on EACH side.
+    Only stored ``wavgrid`` arrays are inspected, never filenames or flux data.
+    ``pattern`` filters filenames within ``gridpath`` (e.g. '*_normed.npz').
+    Optional ``regions`` labels identify rows in selection errors.
+
+    Return a list of pathlib.Path objects. A file can serve several regions;
+    zero or multiple covering candidates for any row raise ValueError. No
+    matching files raise FileNotFoundError. Malformed candidates fail with
+    their path. Common-format NPZs and raw atmosphere files are not supported.
+    Wavelength medium/units are not converted or inferred from the files.
+    """
+    wave = np.asarray(wavelength)
+    if wave.dtype.kind not in "fiu":
+        raise TypeError("wavelength must contain real numeric values")
+    if wave.ndim not in (1, 2):
+        raise ValueError("wavelength must have shape (pixel,) or (region, pixel)")
+    wave = np.atleast_2d(wave)
+    _validate_wavelength(wave, ndim=2)
+    labels = _identifiers(regions, "regions", len(wave))
+    if labels is None:
+        labels = tuple(range(len(wave)))
+    margin = np.asarray(wav_margin)
+    if (margin.ndim != 0 or margin.dtype.kind not in "fiu"
+            or not np.isfinite(margin) or margin < 0):
+        raise ValueError("wav_margin must be finite nonnegative Angstrom")
+    margin = float(margin)
+    if not isinstance(pattern, str) or not pattern:
+        raise ValueError("pattern must be a non-empty glob pattern")
+    root = Path(gridpath).expanduser()
+    paths = sorted(path for path in root.glob(pattern) if path.is_file())
+    if not paths:
+        raise FileNotFoundError(f"No grids matching {pattern!r} in {root}")
+    candidates = []
+    for path in paths:
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                stored = data["wavgrid"]
+                if stored.dtype.kind not in "fiu":
+                    raise ValueError("wavgrid must contain real numeric values")
+                _validate_wavelength(stored, ndim=1)
+                candidates.append((path, float(stored[0]), float(stored[-1])))
+        except (KeyError, ValueError, OSError) as exc:
+            raise ValueError(f"{path}: cannot read a valid legacy wavgrid: {exc}") from exc
+    selected = []
+    for label, row in zip(labels, wave):
+        low, high = float(row[0]) - margin, float(row[-1]) + margin
+        matches = [path for path, left, right in candidates if left <= low and right >= high]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Region {label!r}: expected one covering grid, found {len(matches)} "
+                f"for [{low:g}, {high:g}] Angstrom including wav_margin={margin:g}. "
+                f"Matches: {[str(path) for path in matches]}. "
+                f"Candidates: {[(str(path), left, right) for path, left, right in candidates]}")
+        selected.append(matches[0])
+    return selected
 
 
 def load_coelho(paths, *, pixel_slices=None, regions=None,

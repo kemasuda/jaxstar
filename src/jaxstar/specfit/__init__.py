@@ -1,6 +1,7 @@
 """Spectral grids, physical models, observations and Gaussian likelihoods."""
 
 from .libraries import (
+    select_grid_paths,
     load_bosz,
     load_coelho,
     load_tlusty,
@@ -9,11 +10,16 @@ from .libraries import (
     prepare_tlusty,
 )
 from .storage import load_spectral_grid, save_spectral_grid
+from .results import FitResult, load_fit_result, save_fit_result
+from .plotting import plot_mcmc_diagnostics
 from .sampling import is_log_uniform, resample_spectral_grid
 from .model import SpecModel, SpectralDecomposition
 from .observation import Observation
-from .fit import SpecFit
+from .specfit import SpecFit
+from .configured_model import ConfiguredModel
+from .reconstruction import reconstruct_single
 from .numpyro_model import (
+    make_model_single,
     model_single,
     single_star_params,
     physical_logg_max,
@@ -39,12 +45,16 @@ from .likelihood import (
 )
 
 __all__ = [
+    "select_grid_paths",
     "load_coelho", "load_bosz", "load_tlusty",
     "prepare_coelho", "prepare_bosz", "prepare_tlusty",
     "load_spectral_grid", "save_spectral_grid",
+    "FitResult", "load_fit_result", "save_fit_result",
+    "plot_mcmc_diagnostics",
     "is_log_uniform", "resample_spectral_grid",
     "SpecModel", "SpectralDecomposition",
     "Observation", "SpecFit",
+    "ConfiguredModel", "make_model_single", "reconstruct_single",
     "model_single", "single_star_params",
     "physical_logg_max", "empirical_vmic", "empirical_vmacro_valenti_fischer2005",
     "ContinuumPrior", "ContinuumPosterior",

@@ -129,6 +129,44 @@ class SpecModel:
     vmax: float
     broadening_operator: object
 
+    @classmethod
+    def from_grid(cls, gridpath, wavelength, *, regions=None, library="coelho",
+                  pattern="*.npz", wav_margin=3., pixels=None, velocity_step=None,
+                  vmax=50., wavelength_medium="unknown", flux_kind="as_stored",
+                  broadening_operator=None):
+        """Select legacy NPZ regions, resample to log wavelength and build a model.
+
+        ``wavelength`` (Angstrom; 1D or region-by-pixel) is used only to select
+        files, via :func:`select_grid_paths`. ``regions`` labels the selected
+        rows. ``library`` chooses 'coelho', 'bosz' or 'tlusty'; paths must satisfy
+        the corresponding loader's shared-axis, dtype and pixel-count rules.
+        Raw atmosphere files and common-format saved grids are not inputs here.
+
+        Specify exactly one of ``pixels`` or ``velocity_step`` (km/s). Each
+        selected file's full wavelength span is resampled, independently of
+        the requested detector pixels. The observation is not stored. Medium
+        and flux kind are declarations passed to the loader; neither wavelength
+        conversion nor flux normalization is performed. Selection/resampling
+        and file I/O happen once, outside JIT. No data are downloaded.
+        """
+        from .libraries import select_grid_paths, load_coelho, load_bosz, load_tlusty
+        from .observation import _identifiers
+        from .sampling import _sampling_mode, resample_spectral_grid
+
+        loaders = {"coelho": load_coelho, "bosz": load_bosz, "tlusty": load_tlusty}
+        if library not in loaders:
+            raise ValueError("library must be 'coelho', 'bosz' or 'tlusty'")
+        _sampling_mode("log", pixels, velocity_step)
+        regions = None if regions is None else tuple(regions)
+        paths = select_grid_paths(gridpath, wavelength, wav_margin=wav_margin,
+                                  pattern=pattern, regions=regions)
+        regions = _identifiers(regions, "regions", len(paths))
+        spectra = loaders[library](paths, regions=regions,
+                                   wavelength_medium=wavelength_medium, flux_kind=flux_kind)
+        spectra = resample_spectral_grid(spectra, sampling="log", pixels=pixels,
+                                         velocity_step=velocity_step)
+        return cls(spectra, vmax=vmax, broadening_operator=broadening_operator)
+
     def __init__(self, spectra, *, vmax=50., broadening_operator=None):
         if not isinstance(spectra, _SpectralLibrary):
             raise TypeError("spectra must be a spectral-library loader/preparer result")
