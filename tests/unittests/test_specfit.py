@@ -423,9 +423,12 @@ def test_dtype_region_jitter_and_fixed_physical_point(dtype, x64_context):
         diagnostics = fit.residual_diagnostics(point={}, model=model)
         assert len(diagnostics) == 2
         assert all(np.isfinite(row["standardized_rms"]) for row in diagnostics)
+        # RMS(residual / sigma) and RMS(residual) / sigma round differently.
+        rtol = max(1e-7, 2 * np.finfo(dtype).eps)
         for row, jitter in zip(diagnostics, config["jitter"]):
             np.testing.assert_allclose(row["standardized_rms"],
-                                       row["rms"] / np.hypot(dtype(.01), jitter))
+                                       row["rms"] / np.hypot(dtype(.01), jitter),
+                                       rtol=rtol)
 
 
 @pytest.mark.parametrize("gp", [False, True])
