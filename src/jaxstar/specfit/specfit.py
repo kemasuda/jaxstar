@@ -212,7 +212,7 @@ class SpecFit:
     def from_grid(cls, gridpath, observation, *, library="coelho", pattern="*.npz",
                   wav_margin=3., pixels=None, velocity_step=None, vmax=50.,
                   wavelength_medium="unknown", flux_kind="as_stored",
-                  broadening_operator=None):
+                  broadening_operator=None, fixed_ip=None):
         """Prepare a SpecModel from legacy NPZs and associate an Observation.
 
         Delegates to ``SpecModel.from_grid`` using the observation's wavelengths
@@ -227,7 +227,7 @@ class SpecFit:
             library=library, pattern=pattern, wav_margin=wav_margin,
             pixels=pixels, velocity_step=velocity_step, vmax=vmax,
             wavelength_medium=wavelength_medium, flux_kind=flux_kind,
-            broadening_operator=broadening_operator)
+            broadening_operator=broadening_operator, fixed_ip=fixed_ip)
         return cls(observation, model)
 
     def __init__(self, observation, specmodel):
