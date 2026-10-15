@@ -77,12 +77,13 @@ def empirical_vmacro_valenti_fischer2005(teff, *, sigma=1.0):
     return dist.TruncatedNormal(loc=location, scale=sigma, low=0.)
 
 
-def single_star_params(atmosphere, *, vsini, vmacro, q1, q2, rv, resolving_power):
+def single_star_params(atmosphere, *, vsini, vmacro, q1, q2, rv, resolving_power=None):
     """Build one-component physical params, retaining frozen q1/q2 convention.
 
     This pure JAX helper is also useful in custom NumPyro models and outside
     inference when reconstructing spectra from a sample-site dictionary.
     Atmosphere coordinates are scalar; other values may be scalar or per region.
+    Omit resolving_power when the SpecModel has a fixed_ip calibration.
     """
     q1, q2 = jnp.asarray(q1), jnp.asarray(q2)
     _require(jnp.all(jnp.isfinite(q1) & (q1 >= 0) & (q1 <= 1))
@@ -92,7 +93,8 @@ def single_star_params(atmosphere, *, vsini, vmacro, q1, q2, rv, resolving_power
     u2 = jnp.sqrt(q1) - u1
     return {"components": ({"atmosphere": dict(atmosphere),
                             "broadening": {"vsini": vsini, "vmacro": vmacro, "u1": u1, "u2": u2},
-                            "rv": rv},), "instrument": {"resolving_power": resolving_power}}
+                            "rv": rv},), "instrument": (
+                                {} if resolving_power is None else {"resolving_power": resolving_power})}
 
 
 def _draw(name, prior_or_value, *, regions=None, infer=None):
@@ -195,7 +197,15 @@ def _validate_gp_config(axes, gp_amplitude, gp_scale):
     return True
 
 
-def model_single(observation, specmodel, *, resolving_power,
+def _check_ip_choice(specmodel, resolving_power):
+    if specmodel.fixed_ip is not None:
+        if resolving_power is not None:
+            raise ValueError("omit resolving_power when SpecModel has fixed_ip")
+    elif resolving_power is None:
+        raise ValueError("resolving_power is required unless SpecModel has fixed_ip")
+
+
+def model_single(observation, specmodel, *, resolving_power=None,
                  atmosphere_bounds=None, rv_bounds=None, vsini_max=None,
                  vmacro_bounds=(0., 10.), fixed=None,
                  sigma_constant=.2 / np.sqrt(3), sigma_continuum=.1 / np.sqrt(3),
@@ -215,7 +225,8 @@ def model_single(observation, specmodel, *, resolving_power,
     uniform q1/q2, uniform or empirical vmacro, and log-uniform jitter/GP.
     Singleton atmosphere axes are fixed. ``fixed`` maps native site names to
     fixed values. Resolving power and continuum scales may also be supplied as
-    numeric values or NumPyro distributions.
+    numeric values or NumPyro distributions. With SpecModel(fixed_ip=...), omit
+    resolving_power; no instrumental parameter sites are created.
 
     The explicit ``atmosphere``, ``broadening``, ``rv``, ``jitter`` and GP
     arguments remain available for low-level distribution overrides. Explicit
@@ -239,6 +250,7 @@ def model_single(observation, specmodel, *, resolving_power,
     before computing spectra or likelihoods. It supports check_prior. Normal
     evaluation returns the same params after recording the spectrum factor.
     """
+    _check_ip_choice(specmodel, resolving_power)
     fixed = dict(fixed or {})
     empirical_vmic_active = (specmodel.spectra.library == "bosz"
                              if use_empirical_vmic is None else use_empirical_vmic)
@@ -354,8 +366,9 @@ def model_single(observation, specmodel, *, resolving_power,
     q1 = _draw("q1", broadening["q1"], regions=n_regions)
     q2 = _draw("q2", broadening["q2"], regions=n_regions)
     rv = _draw("rv", rv, regions=n_regions)
-    resolving_power = _draw(
-        "resolving_power", resolving_power, regions=n_regions)
+    if resolving_power is not None:
+        resolving_power = _draw(
+            "resolving_power", resolving_power, regions=n_regions)
 
     # Continuum prior scales and additive noise; coefficients are marginalized.
     sigma_constant = _draw("sigma_constant", sigma_constant, regions=n_regions)
@@ -419,7 +432,7 @@ def _bound_pair(value, name, *, shape=(), positive=False, singleton=False):
     return (float(low), float(high)) if not shape else (low, high)
 
 
-def make_model_single(sf, *, resolving_power, atmosphere_bounds=None, rv_bounds=None,
+def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bounds=None,
                       vsini_max=None, vmacro_bounds=(1., 15.), fixed=None,
                       degree=4, basis=None, use_gp=True, gp_solver="auto",
                       use_physical_logg_max=False, use_empirical_vmic=None,
@@ -437,7 +450,8 @@ def make_model_single(sf, *, resolving_power, atmosphere_bounds=None, rv_bounds=
     {"logg": 4.4, "vmacro": 0.}. Atmosphere coordinates must be scalar; broadening,
     RV and jitter may be shared or per region. GP hyperparameters are shared.
     Resolving power is required, as a positive scalar/region value or a NumPyro
-    distribution. Infinity disables the Gaussian instrumental profile.
+    distribution. Infinity disables the Gaussian instrumental profile. With a
+    fixed_ip SpecModel, omit resolving_power; its fixed mixture is used instead.
 
     CCF is required only when RV or vsini still needs a default. RV has one
     Uniform per region centered on median CCF RV, with half-width 5 km/s if
@@ -509,17 +523,19 @@ def make_model_single(sf, *, resolving_power, atmosphere_bounds=None, rv_bounds=
         if name.startswith("gp_") and np.any(value <= 0):
             raise ValueError(f"fixed {name} must be positive")
 
-    if isinstance(resolving_power, dist.Distribution):
-        shape = resolving_power.batch_shape + resolving_power.event_shape
-    else:
-        resolving_power = np.array(resolving_power, copy=True)
-        shape = resolving_power.shape
-        if resolving_power.dtype.kind not in "fiu" or not np.all(
-                (resolving_power > 0) & ~np.isnan(resolving_power)):
-            raise ValueError(
-                "resolving_power must be positive (infinity disables Gaussian IP)")
-    if shape not in ((), (count,)):
-        raise ValueError(f"resolving_power must be scalar or shape ({count},)")
+    _check_ip_choice(sf.specmodel, resolving_power)
+    if resolving_power is not None:
+        if isinstance(resolving_power, dist.Distribution):
+            shape = resolving_power.batch_shape + resolving_power.event_shape
+        else:
+            resolving_power = np.array(resolving_power, copy=True)
+            shape = resolving_power.shape
+            if resolving_power.dtype.kind not in "fiu" or not np.all(
+                    (resolving_power > 0) & ~np.isnan(resolving_power)):
+                raise ValueError(
+                    "resolving_power must be positive (infinity disables Gaussian IP)")
+        if shape not in ((), (count,)):
+            raise ValueError(f"resolving_power must be scalar or shape ({count},)")
 
     needs_rv = rv_bounds is None and "rv" not in fixed
     needs_vsini = vsini_max is None and "vsini" not in fixed

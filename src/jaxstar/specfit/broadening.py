@@ -1,8 +1,9 @@
-"""Combined rigid-rotation, radial-tangential macro and Gaussian broadening.
+"""Combined rotation, radial-tangential macro and instrumental broadening.
 
 Numerical Fourier kernel ported from frozen jaxspec kernels.py (3b4ab913).
 Small coefficient tuples retain precision across JAX x64 configuration changes.
-No observation, continuum, Doppler shift or general IP abstraction lives here.
+Includes Gaussian and fixed two-Gaussian instrumental Fourier factors.
+Observation, continuum and stellar RV sampling live in their own modules.
 """
 
 import jax
@@ -54,9 +55,24 @@ def _j0(x):
 
     return ret
 
+def double_gaussian_fourier(varr, mu1_kms, mu2_kms, sigma1_kms, sigma2_kms, fraction2):
+    """Fixed mixture factor on the kernel's frequency grid; positive mu is redward.
+
+    The kernel is reconstructed with fft, so the shift phase has a positive
+    sign. Each Gaussian has unit area; fraction2 weights the second component.
+    """
+    frequency = jnp.fft.fftfreq(len(varr), d=jnp.median(jnp.diff(varr)))
+
+    def gaussian(mu, sigma):
+        return jnp.exp(-2 * jnp.pi**2 * sigma**2 * frequency**2
+                       + 2j * jnp.pi * frequency * mu)
+    return ((1 - fraction2) * gaussian(mu1_kms, sigma1_kms)
+            + fraction2 * gaussian(mu2_kms, sigma2_kms))
+
+
 # Hirano et al. (2011) ApJ 742, 69
-# unlike in the paper, beta here is the Gaussian width
-def combined_kernel(varr, vmacro, vsini, u1, u2, beta, Nt=500):
+# Unlike in the paper, beta here is the Gaussian standard deviation.
+def combined_kernel(varr, vmacro, vsini, u1, u2, beta, Nt=500, *, ip_fourier=None):
     """broadening kernel due to radial-tangential macroturbulence & vsini
     from Hirano et al. (2011) ApJ 742, 69, Appendix A, B
 
@@ -70,6 +86,7 @@ def combined_kernel(varr, vmacro, vsini, u1, u2, beta, Nt=500):
                 where beta is not a normal scale parameter of a Gaussian (sqrt(2) larger).
                 beta in this function *is* defined as a scale parameter (standard deviation) of a Gaussian.
             Nt: length of grid to evalulate Fourier transform
+            ip_fourier: optional precomputed instrumental factor replacing beta
 
         Returns:
             kernel whose sum is normalized to unity
@@ -88,9 +105,14 @@ def combined_kernel(varr, vmacro, vsini, u1, u2, beta, Nt=500):
     projd = jnp.sqrt(omint2)
     ldfactor = (1. - (1. - projd) * (u1 + u2*(1. - projd))) / (1. - u1/3. - u2/6.) # limb-darkening
     rt = jnp.exp(-piz2*sig2*omint2) + jnp.exp(-piz2*sig2*t2) # macroturbulence
-    ip = jnp.exp(-2*jnp.pi*jnp.pi*beta*beta*sig2) # instrumental profile (another convolution w/ Gaussian)
-    ys = ldfactor * rt * ip * _j0(2*jnp.pi*sigmas*vsini*t) * t
-    kernel_ft = trapz(ys.T)
+    if ip_fourier is None:
+        ip = jnp.exp(-2*jnp.pi*jnp.pi*beta*beta*sig2)
+        ys = ldfactor * rt * ip * _j0(2*jnp.pi*sigmas*vsini*t) * t
+        kernel_ft = trapz(ys.T)
+    else:
+        # Integrate the real stellar factor once, then apply the fixed IP.
+        ys = ldfactor * rt * _j0(2*jnp.pi*sigmas*vsini*t) * t
+        kernel_ft = trapz(ys.T) * ip_fourier
 
     kernel = jnp.fft.fft(kernel_ft)
     kernel = jnp.real(kernel)
@@ -99,7 +121,8 @@ def combined_kernel(varr, vmacro, vsini, u1, u2, beta, Nt=500):
     return kernel / jnp.sum(kernel)
 
 
-def default_broadening(wavelength, flux, *, broadening, resolving_power, velocity_grid):
+def default_broadening(wavelength, flux, *, broadening, resolving_power, velocity_grid,
+                       ip_fourier=None):
     """Apply the combined kernel once per region, returning valid (wave, flux).
 
     Inputs have (region, pixel) layout; broadening values and resolving_power
@@ -107,12 +130,16 @@ def default_broadening(wavelength, flux, *, broadening, resolving_power, velocit
     both edges, so no zero padding enters requested model spectra. A replacement
     callable uses this signature and returns its own safe wavelength/flux arrays;
     it need not construct a convolution kernel or retain this output length.
+    The built-in operator alone also accepts precomputed ip_fourier with shape
+    (region, kernel_pixel), which replaces the resolving_power Gaussian.
     """
-    def one(row, vsini, vmacro, u1, u2, resolution, velocity):
-        kernel = combined_kernel(velocity, vmacro, vsini, u1, u2, gaussian_sigma(resolution))
+    def one(row, vsini, vmacro, u1, u2, resolution, velocity, ip):
+        kernel = combined_kernel(velocity, vmacro, vsini, u1, u2, gaussian_sigma(resolution),
+                                 ip_fourier=ip)
         return jnp.convolve(row, kernel, mode="valid")
 
-    values = jax.vmap(one)(flux, broadening["vsini"], broadening["vmacro"],
-                           broadening["u1"], broadening["u2"], resolving_power, velocity_grid)
+    values = jax.vmap(one, in_axes=(0, 0, 0, 0, 0, 0, 0, None if ip_fourier is None else 0))(
+        flux, broadening["vsini"], broadening["vmacro"], broadening["u1"], broadening["u2"],
+        resolving_power, velocity_grid, ip_fourier)
     half = velocity_grid.shape[-1] // 2
     return wavelength[:, half:-half], values

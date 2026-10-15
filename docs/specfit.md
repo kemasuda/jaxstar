@@ -423,6 +423,93 @@ For multiple stars, supply a tuple of `components` plus nonnegative
 [SpecModel tutorial](tutorials/specfit/specmodel.ipynb) includes SB2/SB3
 examples. Use a custom NumPyro model to fit multiple stellar components.
 
+### Fixed two-Gaussian instrumental profile
+
+The example below uses `parameters.csv` generated from a ThAr spectrum with
+[gaoesrvip](https://github.com/ryunosukeoishi/gaoesrvip):
+
+```python
+from gaoesrvip import analyze_thar_ip_2g
+
+result = analyze_thar_ip_2g(
+    thar=thar,
+    wavelength_file=wavelength_file,
+    output_dir="thar_ip_analysis_for_jaxstar/",
+    orders=[104, 105],
+    gain=1.935,
+    read_noise=4.0,
+    saturation=5000,
+    warmup=1000,
+    samples=1000,
+    chains=2,
+)
+```
+
+Use the resulting `thar_ip_analysis_for_jaxstar/parameters.csv` as the IP
+calibration file, with the same wavelength calibration used for the science
+spectrum.
+
+An externally calibrated IP can replace the resolving-power Gaussian. Supply
+the association between spectral regions and calibration orders yourself; the
+labels need not match and the number of selected regions is arbitrary. For
+example, if the prepared library has regions `("blue_part", "red_part")`:
+
+```python
+from jaxstar.specfit import read_ip_calibration, SpecModel, SpecFit, make_model_single
+
+dir_name = "thar_ip_analysis_for_jaxstar/"
+order_for_region = {"blue_part": 104, "red_part": 105}
+region_orders = [order_for_region[region] for region in spectra.regions]
+ip_calibration = read_ip_calibration(dir_name, orders=region_orders)
+specmodel = SpecModel(spectra, vmax=50., fixed_ip=ip_calibration.median)
+sf = SpecFit(obs, specmodel)
+model = make_model_single(sf, rv_bounds=(-5., 5.), vsini_max=15., use_gp=False)
+```
+
+The reader opens exactly `dir_name/parameters.csv`. Required columns are
+`order, parameter, median`; each selected order must have one row for each of
+`mu1_kms`, `mu2_kms`, `sigma1_kms`, `sigma2_kms`, and `fraction2`. It returns
+read-only `median` arrays in the supplied order, plus `orders` and the `source`
+path. CSV row order is irrelevant. An explicit sequence such as
+`orders=[105, 104, 104]` is also valid: the last two spectral regions share the
+same order's IP. Missing or duplicate selected entries raise an error.
+Additional columns (including `p16`/`p84`) and derived parameter rows (`R`,
+`delta_kms`, `centroid_kms`, `intrinsic_fwhm_kms`) are ignored.
+
+The fixed instrumental kernel is
+`(1 - fraction2) * G(mu1_kms, sigma1_kms) + fraction2 * G(mu2_kms, sigma2_kms)`.
+Each Gaussian has unit integrated area, so `fraction2` is the **area fraction of
+component 2**, not its peak height. Shifts and standard deviations are in km/s;
+sigmas must be positive and the fraction must be in `[0, 1]`. Positive shifts
+move spectral lines redward in the log-wavelength grid. Shifts refer to the
+wavelength calibration used for the spectrum; the IP centroid is retained.
+
+`fixed_ip` also accepts a manually constructed mapping of these five names to
+scalars or arrays of length `n_region`. Values are copied at construction, and
+the instrumental Fourier factor is precomputed. The same IP is applied to all
+stellar components in each region. `SpecModel.from_grid` and `SpecFit.from_grid`
+also accept `fixed_ip` in the selected region order.
+
+With fixed IP, omit `resolving_power` in `single_star_params`, `model_single`,
+and `make_model_single`; physical params can omit `instrument` or supply `{}`.
+Specifying both modes raises an error, as does combining `fixed_ip` with a
+custom `broadening_operator`. No IP sample sites or priors are added. Omitting
+`fixed_ip` preserves the existing resolving-power mode, including sampled R.
+
+Choose model velocity sampling fine enough to resolve the IP. Each active
+Gaussian must fit `abs(mu) + 5*sigma` within the actual kernel half-support;
+increase `vmax` if this check fails. Allow additional room for stellar rotation
+and macroturbulence, and check convergence as support/sampling change. Prepared
+wavelength coverage must still accommodate the kernel and stellar RV.
+
+The [Coelho IP comparison notebook](../examples/specfit/coelho_ip_comparison.ipynb)
+uses the included two-region grid and sample calibration to compare line shapes
+at R=65,000 versus fixed IP, then fits the same synthetic observation under both
+assumptions, including atmosphere parameters and broadening. The current
+settings use S/N=200; change `SNR` to choose a different noise level.
+Outputs are saved under `results/ip_comparison/`, with a new `run_*` directory
+per execution.
+
 ### Observations and continuum
 
 Observed arrays must have identical 1D or 2D shapes and use the same region
@@ -524,7 +611,8 @@ Bounds are in physical units; omitted atmosphere axes keep their grid bounds.
 one lower/upper endpoint per region. `fixed` maps native site names to numeric
 values. Atmosphere and GP sites are scalar; broadening, RV and jitter can be
 scalar or region vectors. Resolving power is required as a positive scalar,
-region vector or NumPyro distribution; infinity disables Gaussian IP. CCF is
+region vector or NumPyro distribution; infinity disables Gaussian IP. For a
+`SpecModel` with `fixed_ip`, omit resolving power instead. CCF is
 unnecessary when RV and vsini are both supplied explicitly through bounds or
 fixed values. The continuum/noise defaults assume normalized flux.
 
@@ -825,9 +913,13 @@ that cannot be described numerically are marked as not serialized.
 
 Grid provenance includes source paths, atmosphere axes, actual prepared
 wavelength/velocity sampling, broadening settings and a fingerprint of the
-in-memory grid. The large grid flux array and executable model code are not
-bundled; use `save_spectral_grid` separately if a portable grid artifact is
-needed. Loading results and plotting posterior traces/corners require no grid.
+in-memory grid. Fixed IP values are recorded under `metadata["grid"]["fixed_ip"]`
+in spectral region order; they are model settings, not posterior sample sites.
+For reconstruction, extract each parameter's `"values"` and pass that mapping
+as `fixed_ip` when recreating the `SpecModel`. The large grid flux array and
+executable model code are not bundled; use `save_spectral_grid` separately if a
+portable grid artifact is needed. Loading results and plotting posterior
+traces/corners require no grid.
 This bundle supports reuse of saved results, not continuation of a running NUTS
 chain. RNG seeds and additional run context can be supplied in `metadata`.
 
@@ -872,9 +964,10 @@ including for derived deterministic sites. The inspection tool does not infer
 symbolic dependencies from a single execution.
 
 The physical IP kernel belongs to `SpecModel`/its broadening operator, while its
-parameter priors belong to the NumPyro model. Non-Gaussian IPs with additional
-instrument parameters still require extending that physical interface. Neither
-those kernels nor a built-in sampled-continuum model are added by this API.
+parameter priors belong to the NumPyro model. The fixed two-Gaussian IP above is
+supported by the built-in physical model. Sampling additional IP parameters or
+using other IP families requires extending that interface. This custom-model
+API does not add a built-in sampled-continuum model.
 
 `model_single` is an ordinary NumPyro model. Supply fixed numbers or NumPyro
 distributions for the physical and noise parameters. Fixed values are recorded

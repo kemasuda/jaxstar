@@ -113,6 +113,7 @@ def _grid_record(specmodel):
         "velocity_grid": _describe(specmodel.velocity_grid),
         "flux_shape": list(flux.values.shape), "flux_dtype": str(flux.values.dtype),
         "vmax": specmodel.vmax, "broadening_operator": _describe(specmodel.broadening_operator),
+        "fixed_ip": _describe(specmodel.fixed_ip),
     }
 
 
