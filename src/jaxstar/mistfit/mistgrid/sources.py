@@ -1,7 +1,7 @@
 """Version-specific MIST archive catalogue, independent of transport/parsers.
 
-Catalogue: https://mist.science/model_grids.html (checked 2026-10-07).
-Only v1.2 UBVRIplus CMDs/BCs and native EEP archives are registered here.
+Catalogue: https://mist.science/model_grids.html (checked 2026-10-15).
+Isochrones use v1.2; native EEP tracks and UBVRIplus BCs support v1.2/v2.5.
 Adding a release requires an explicit catalogue and separate parser/physics
 validation; substituting a version in a URL is not sufficient.
 """
@@ -43,6 +43,25 @@ class MistArchive:
 _BASE = "https://mist.science"
 _V12_FEH = (-4., -3.5, -3., -2.5, -2., -1.75, -1.5, -1.25,
             -1., -.75, -.5, -.25, 0., .25, .5)
+_V25_FEH = (-4., -3.5, -3., -2.75, -2.5, -2.25, -2., -1.75, -1.5,
+            -1.25, -1., -.75, -.5, -.25, 0., .25, .5)
+_V25_AFE = (-.2, 0., .2, .4, .6)
+
+
+def _track_selection(version, afe, rotation=None, photometry=None):
+    if version == "1.2":
+        _v12(version, afe, rotation, photometry)
+        return _V12_FEH
+    if version != "2.5":
+        raise ValueError("MIST track version must be '1.2' or '2.5'")
+    if afe not in _V25_AFE:
+        raise ValueError(f"MIST v2.5 afe must be one of {_V25_AFE}")
+    if rotation is not None and rotation not in (0., .4):
+        raise ValueError("MIST v2.5 rotation must be 0.0 or 0.4")
+    if photometry is not None and photometry != "UBVRIplus":
+        raise ValueError("Only UBVRIplus photometry is currently registered")
+    # No published track archive at FeH=+0.5, alpha=+0.6.
+    return _V25_FEH[:-1] if afe == .6 else _V25_FEH
 
 
 def _v12(version, afe, rotation=None, photometry=None):
@@ -66,13 +85,13 @@ def isochrone_archive(*, version="1.2", rotation=.4, afe=0., photometry="UBVRIpl
 
 def track_metallicities(*, version="1.2", rotation=.4, afe=0., feh=None):
     """Validate a native EEP archive selection; None selects the full catalogue."""
-    _v12(version, afe, rotation)
-    metallicities = _V12_FEH if feh is None else tuple(feh)
+    available = _track_selection(version, afe, rotation)
+    metallicities = available if feh is None else tuple(feh)
     if not metallicities or len(set(metallicities)) != len(metallicities):
         raise ValueError("feh must be a nonempty sequence of distinct metallicities")
     for value in metallicities:
-        if value not in _V12_FEH:
-            raise ValueError(f"Unavailable MIST v1.2 FeH: {value}; choose from {_V12_FEH}")
+        if value not in available:
+            raise ValueError(f"Unavailable MIST v{version} FeH: {value} at afe={afe}; choose from {available}")
     return metallicities
 
 
@@ -85,15 +104,22 @@ def track_archives(*, version="1.2", rotation=.4, afe=0., feh=None):
     metallicities = track_metallicities(version=version, rotation=rotation, afe=afe, feh=feh)
     result = []
     for value in metallicities:
-        token = ("m" if value < 0 else "p") + f"{abs(value):.2f}"
-        filename = f"MIST_v{version}_feh_{token}_afe_p0.0_vvcrit{rotation:.1f}_EEPS.txz"
+        if version == "1.2":
+            token = ("m" if value < 0 else "p") + f"{abs(value):.2f}"
+            alpha, directory = "p0.0", f"tarballs_v{version}"
+        else:
+            token = ("m" if value < 0 else "p") + f"{round(abs(value)*100):03d}"
+            alpha = ("m" if afe < 0 else "p") + str(round(abs(afe)*10))
+            directory = f"tarballs_v{version}/eeps"
+        filename = f"MIST_v{version}_feh_{token}_afe_{alpha}_vvcrit{rotation:.1f}_EEPS.txz"
         result.append(MistArchive(version, "tracks", filename,
-                                  f"{_BASE}/data/tarballs_v{version}/{filename}"))
+                                  f"{_BASE}/data/{directory}/{filename}"))
     return tuple(result)
 
 
 def bolometric_correction_archive(*, version="1.2", afe=0., photometry="UBVRIplus"):
     """BC table shared by all track masses, FeH values and rotation rates."""
-    _v12(version, afe, photometry=photometry)
+    _track_selection(version, afe, photometry=photometry)
+    bc_version = "v1" if version == "1.2" else "v2"
     return MistArchive(version, "bolometric-corrections", f"{photometry}.txz",
-                       f"{_BASE}/BC_tables/v1/{photometry}.txz")
+                       f"{_BASE}/BC_tables/{bc_version}/{photometry}.txz")

@@ -31,6 +31,11 @@ BANDS = (
 
 def read_track(stream):
     """Read one native EEP member; reconstruct EEP labels from its header."""
+    return _read_track(stream, version="1.2", composition_columns=("log_surf_z", "surface_h1"))
+
+
+def _read_track(stream, *, version, composition_columns):
+    """Shared EEP container validation; each release supplies its chemistry columns."""
     text = stream.read().decode("ascii")
     header = []
     for line in text.splitlines():
@@ -41,9 +46,9 @@ def read_track(stream):
             break
     else:
         raise ValueError("Missing track column header")
-    if not any("MIST version number" in line and line.split("=")[-1].strip() == "1.2"
+    if not any("MIST version number" in line and line.split("=")[-1].strip() == version
                for line in header):
-        raise ValueError("Track parser requires MIST v1.2")
+        raise ValueError(f"Track parser requires MIST v{version}")
     metadata = composition = primary = None
     try:
         for i, line in enumerate(header):
@@ -76,7 +81,7 @@ def read_track(stream):
         raise ValueError("Track rows do not match the declared EEP range")
     data = {name: values[:, i] for i, name in enumerate(columns)}
     required = ("star_age", "star_mass", "log_Teff", "log_g", "log_L", "log_R",
-                "log_surf_z", "surface_h1")
+                *composition_columns)
     for name in required:
         if name not in data:
             raise ValueError(f"Missing required track column: {name}")

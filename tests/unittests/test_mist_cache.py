@@ -61,7 +61,7 @@ def test_catalogue_paths_and_unsupported_releases():
     assert bc.url == "https://mist.science/BC_tables/v1/UBVRIplus.txz"
     assert bc.cache_key != replace(bc, version="2.5").cache_key
     assert bc.cache_key != replace(bc, kind="isochrones").cache_key
-    for options in ({"version": "2.5"}, {"rotation": .2}, {"afe": .2},
+    for options in ({"version": "9.9"}, {"rotation": .2}, {"afe": .2},
                     {"feh": [.1]}, {"feh": []}, {"feh": [0., 0.]}):
         with pytest.raises(ValueError):
             track_archives(**options)

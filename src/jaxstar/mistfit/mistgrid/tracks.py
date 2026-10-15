@@ -166,6 +166,12 @@ def load_tracks(path):
     if (primary.ndim != 1 or not np.all(np.isfinite(primary))
             or np.any(primary <= 0) or np.any(primary != np.floor(primary))):
         raise ValueError("Primary EEP metadata must contain positive integer labels")
+    provenance = {key: metadata[key] for key in (
+        "format_version", "mist_version", "rotation", "afe", "photometry", "Av", "Rv",
+        "BC_recipe", "chemistry", "Zsun", "Xsun", "Mbol_sun", "implementation_sha256", "inputs",
+        "include_structure", "native_columns",
+    ) if metadata is not None and key in metadata}
     return _MistGridData(grid, kind="track", sources=(str(path),),
                          validity=None if masks is None else tuple(masks[k] for k in grid.field_names),
-                         primary_eeps=tuple(int(eep) for eep in primary))
+                         primary_eeps=tuple(int(eep) for eep in primary),
+                         metadata_json=json.dumps(provenance, sort_keys=True, allow_nan=False))

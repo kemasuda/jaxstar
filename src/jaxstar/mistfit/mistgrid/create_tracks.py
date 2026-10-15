@@ -1,4 +1,4 @@
-"""Build a photometric track NPZ from cached MIST v1.2 EEP archives.
+"""Build a photometric track NPZ from cached MIST v1.2 or v2.5 EEP archives.
 
 Run ``python -m jaxstar.mistfit.mistgrid.create_tracks --help`` for the CLI.
 By default retain all native masses and EEPs, with explicit missing cells.
@@ -18,6 +18,7 @@ import tempfile
 import numpy as np
 
 from . import _tracks_v12 as v12
+from . import _tracks_v25 as v25
 from .cache import fetch_archive
 from .sources import bolometric_correction_archive, track_archives, track_metallicities
 
@@ -45,7 +46,8 @@ def _file_record(path):
             "size_bytes": path.stat().st_size}
 
 
-def _read_archive(path, expected_feh, rotation, afe, mass_range, eep_range, bc_axes, bc_fields, allow_missing):
+def _read_archive(path, expected_feh, rotation, afe, mass_range, eep_range, bc_axes, bc_fields,
+                  allow_missing, release=v12, extra_columns=()):
     tracks, records = {}, []
     native_found = False
     with tarfile.open(path, "r|xz") as archive:
@@ -61,10 +63,19 @@ def _read_archive(path, expected_feh, rotation, afe, mass_range, eep_range, bc_a
                 continue
             try:
                 with archive.extractfile(member) as stream:
-                    data, eep, info = v12.read_track(stream)
-                mass, composition = info["initial_mass"], info["composition"]
-                if mass != named_mass:
+                    data, eep, info = release.read_track(stream)
+                missing_columns = set(extra_columns) - data.keys()
+                if missing_columns:
+                    raise ValueError(f"Missing requested native columns: {sorted(missing_columns)}")
+                header_mass, composition = info["initial_mass"], info["composition"]
+                # v2.5 high-mass headers can differ from their nominal file
+                # labels by ~1e-9 Msun. Do not create duplicate nearly equal
+                # mass axes across FeH planes; retain the original in metadata.
+                matches = (np.isclose(header_mass, named_mass, rtol=0., atol=1e-8)
+                           if release is v25 else header_mass == named_mass)
+                if not matches:
                     raise ValueError("Initial mass disagrees with the member filename")
+                mass = named_mass
                 if (composition["[Fe/H]"], composition["[a/Fe]"], composition["v/vcrit"]) != (
                         expected_feh, afe, rotation):
                     raise ValueError("Track composition/rotation disagrees with the requested archive")
@@ -79,8 +90,13 @@ def _read_archive(path, expected_feh, rotation, afe, mass_range, eep_range, bc_a
                         or not np.all(np.diff(age) > 0)
                         or not np.all(np.isfinite(hydrogen) & (hydrogen > 0))):
                     raise ValueError("Selected ages must increase; ages and surface hydrogen must be positive/finite")
-                bc_z = np.minimum(selected["log_surf_z"]-np.log10(v12.ZSUN), expected_feh+.1)
-                bc_z = np.where(np.isfinite(selected["log_surf_z"]), bc_z, np.nan)
+                if release is v25:
+                    bc_z, surface_feh = v25.surface_composition(selected, expected_feh)
+                else:
+                    bc_z = np.minimum(selected["log_surf_z"]-np.log10(v12.ZSUN), expected_feh+.1)
+                    bc_z = np.where(np.isfinite(selected["log_surf_z"]), bc_z, np.nan)
+                    valid_h = np.where(np.isfinite(hydrogen) & (hydrogen > 0), hydrogen, np.nan)
+                    surface_feh = bc_z-np.log10(valid_h/v12.XSUN)
                 queries = np.column_stack((bc_z, selected["log_Teff"], selected["log_g"]))
                 supported = v12.bc_coverage(bc_axes, queries)[1]
                 if not allow_missing and not np.all(supported):
@@ -92,11 +108,11 @@ def _read_archive(path, expected_feh, rotation, afe, mass_range, eep_range, bc_a
                 magnitudes[supported] = (v12.MBOL_SUN - 2.5*selected["log_L"][supported, None]
                                         - v12.track_bc(bc_axes, bc_fields, queries[supported]))
                 age = np.where(np.isfinite(age) & (age > 0), age, np.nan)
-                hydrogen = np.where(np.isfinite(hydrogen) & (hydrogen > 0), hydrogen, np.nan)
                 scalar_values = (np.log10(age), age/1e9, selected["log_Teff"], selected["log_g"],
                                  selected["log_L"], selected["log_R"], selected["star_mass"],
-                                 bc_z, bc_z-np.log10(hydrogen/v12.XSUN))
-                values = np.column_stack((*scalar_values, magnitudes))
+                                 bc_z, surface_feh)
+                values = np.column_stack((*scalar_values,
+                                          *(selected[name] for name in extra_columns), magnitudes))
                 if not allow_missing and not np.all(np.isfinite(values)):
                     raise ValueError("Nonfinite selected stellar fields or photometry")
                 values[~np.isfinite(values)] = np.nan
@@ -108,6 +124,8 @@ def _read_archive(path, expected_feh, rotation, afe, mass_range, eep_range, bc_a
                                 "primary_eeps": info["primary_eeps"],
                                 "selected_nodes": len(age), "unsupported_bc_nodes": int((~supported).sum()),
                                 "nonincreasing_age_steps": int(np.count_nonzero(np.diff(age) <= 0))})
+                if header_mass != mass:
+                    records[-1]["header_initial_mass"] = header_mass
             except ValueError as exc:
                 raise ValueError(f"{path.name}, mass={named_mass:g}, FeH={expected_feh:g}, "
                                  f"member={member.name}: {exc}") from exc
@@ -119,7 +137,7 @@ def _read_archive(path, expected_feh, rotation, afe, mass_range, eep_range, bc_a
 
 def create_track_grid(path, *, mass_range=None, eep_range=None, feh=None, version="1.2",
                       rotation=.4, afe=0., raw_cache_dir=None, local_dir=None,
-                      offline=False, overwrite=False, allow_missing=True):
+                      offline=False, overwrite=False, allow_missing=True, include_structure=False):
     """Create a float64 NPZ compatible with MistModel.from_tracks; return its Path.
 
     mass_range=None and eep_range=None retain the union of all native masses
@@ -127,7 +145,17 @@ def create_track_grid(path, *, mass_range=None, eep_range=None, feh=None, versio
     eep_range is an inclusive integer pair (at least three nodes). Every EEP
     is retained. feh=None selects all published metallicities, or supply at
     least two distinct catalogue values. Both rotation rates are accepted.
-    Version 1.2, afe=0, UBVRIplus, Av=0 and Rv=3.1 are currently supported.
+    Versions 1.2 (default) and 2.5, afe=0, UBVRIplus, Av=0 and Rv=3.1 are
+    supported. Nonzero v2.5 alpha is catalogued but its CMD chemistry is not
+    yet validated for building photometric grids.
+
+    include_structure=True (v2.5 only) also retains all 66 native non-isotope
+    columns under their original names and units. star_mass is already stored;
+    the remaining 65 are added alongside the existing fields and photometry.
+    Nonfinite values remain missing per field. Finite source sentinels/zeros
+    are preserved, and phase is a linearly interpolated diagnostic, not a
+    categorical label. Additional columns do not change the inference outputs
+    or likelihood unless explicitly requested/used.
 
     Archives are reused from the shared raw cache. local_dir may contain the
     official archive filenames for import; otherwise missing inputs download
@@ -150,11 +178,20 @@ def create_track_grid(path, *, mass_range=None, eep_range=None, feh=None, versio
     eep_range = None if eep_range is None else _bounds(eep_range, "eep_range")
     if not isinstance(allow_missing, bool):
         raise TypeError("allow_missing must be a bool")
+    if not isinstance(include_structure, bool):
+        raise TypeError("include_structure must be a bool")
+    if include_structure and version != "2.5":
+        raise ValueError("include_structure currently requires MIST v2.5")
+    extra_columns = tuple(name for name in v25.STRUCTURE_COLUMNS if name not in _SCALARS) if include_structure else ()
+    scalar_names = (*_SCALARS, *extra_columns)
     if eep_range is not None and (any(value != int(value) for value in eep_range)
                                   or eep_range[1]-eep_range[0] < 2):
         raise ValueError("eep_range must select at least three consecutive integer EEPs")
     # Resolve version/composition before any disk writes or downloads.
     metallicities = sorted(track_metallicities(version=version, rotation=rotation, afe=afe, feh=feh))
+    if afe != 0.:
+        raise ValueError("Photometric track grids currently require afe=0; nonzero v2.5 alpha chemistry is not validated")
+    release = v25 if version == "2.5" else v12
     if len(metallicities) < 2:
         raise ValueError("A rectangular track grid needs at least two FeH values")
     bc_source = bolometric_correction_archive(version=version, afe=afe)
@@ -178,11 +215,12 @@ def create_track_grid(path, *, mass_range=None, eep_range=None, feh=None, versio
         inputs.append({"source": asdict(source), **_file_record(archive)})
         return archive
 
-    bc_axes, bc_fields = v12.read_bc_archive(acquire(bc_source))
+    bc_axes, bc_fields = release.read_bc_archive(acquire(bc_source))
     tracks, records = {}, []
     for source, metallicity in zip(sources, metallicities):
         members, metadata = _read_archive(acquire(source), metallicity, rotation, afe,
-                                          mass_range, eep_range, bc_axes, bc_fields, allow_missing)
+                                          mass_range, eep_range, bc_axes, bc_fields, allow_missing,
+                                          release, extra_columns)
         tracks.update({(mass, metallicity): values for mass, values in members.items()})
         records.extend(metadata)
     masses = sorted({mass for mass, _ in tracks})
@@ -200,7 +238,7 @@ def create_track_grid(path, *, mass_range=None, eep_range=None, feh=None, versio
     if len(eeps) < 3:
         raise ValueError("At least three native EEPs are required")
     shape = (len(masses), len(metallicities), len(eeps))
-    values = np.full((*shape, len(_SCALARS)+len(v12.BANDS)), np.nan)
+    values = np.full((*shape, len(scalar_names)+len(v12.BANDS)), np.nan)
     present = np.zeros(shape, dtype=bool)
     for i, mass in enumerate(masses):
         for j, z in enumerate(metallicities):
@@ -213,23 +251,30 @@ def create_track_grid(path, *, mass_range=None, eep_range=None, feh=None, versio
     if not allow_missing and not present.all():
         raise ValueError("Native EEP coverage is incomplete; choose a complete domain")
     arrays = dict(initial_mass=np.array(masses), initial_feh=np.array(metallicities), eep=eeps,
-                  **{name: values[..., i] for i, name in enumerate(_SCALARS)},
-                  absolute_magnitudes=values[..., len(_SCALARS):], bands=np.array(v12.BANDS))
+                  **{name: values[..., i] for i, name in enumerate(scalar_names)},
+                  absolute_magnitudes=values[..., len(scalar_names):], bands=np.array(v12.BANDS))
     metadata = {
         "format_version": 2 if allow_missing else 1, "kind": "track", "mist_version": version,
         "allow_missing": allow_missing,
         "coverage": {"present_nodes": int(present.sum()), "total_nodes": int(present.size),
                      "missing_mass_feh": missing,
                      "finite_nodes": {name: int(np.isfinite(values[..., i]).sum())
-                                      for i, name in enumerate((*_SCALARS, *v12.BANDS))}},
+                                      for i, name in enumerate((*scalar_names, *v12.BANDS))}},
         "rotation": rotation, "afe": afe, "photometry": "UBVRIplus", "Av": 0., "Rv": 3.1,
         "mass_range": mass_range, "eep_range": eep_range, "feh": metallicities,
         "shape": list(values.shape[:3]), "native_tracks": len(records), "inputs": inputs,
-        "tracks": records, "BC_recipe": "v1.2 Steffen logT (linear edges) / linear logg / Steffen metallicity (three-point edges)",
-        "Zsun": v12.ZSUN, "Xsun": v12.XSUN, "Mbol_sun": v12.MBOL_SUN,
+        "tracks": records, "BC_recipe": f"v{version} Steffen logT (linear edges) / linear logg / Steffen metallicity (three-point edges)",
+        "chemistry": {"surface_feh": "CMD log(Z/Zsun) - log(X/Xsun)",
+                      "bc_cap": "initial_feh + 0.1", "log_z_column":
+                      "log_surf_cell_z" if version == "2.5" else "log_surf_z"},
+        "Zsun": release.ZSUN, "Xsun": release.XSUN, "Mbol_sun": release.MBOL_SUN,
         "implementation_sha256": {p.name: _file_record(p)["sha256"] for p in
-                                  (Path(__file__), Path(v12.__file__))},
+                                  ((Path(__file__), Path(v12.__file__)) +
+                                   ((Path(v25.__file__),) if version == "2.5" else ()))},
     }
+    if include_structure:
+        metadata["include_structure"] = True
+        metadata["native_columns"] = list(v25.STRUCTURE_COLUMNS)
     if allow_missing:
         arrays["track_present"] = present
     arrays["metadata_json"] = np.array(json.dumps(metadata, sort_keys=True, allow_nan=False))
@@ -266,6 +311,8 @@ def main(argv=None):
     parser.add_argument("--local-dir", type=Path, help="existing official archive filenames")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--include-structure", action="store_true",
+                        help="v2.5: retain all 66 native non-isotope columns (original names/units)")
     parser.add_argument("--strict", dest="allow_missing", action="store_false",
                         help="require a complete finite grid with increasing ages")
     args = vars(parser.parse_args(argv))

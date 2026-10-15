@@ -1,6 +1,7 @@
 """Private association of a numerical MIST grid with its kind and provenance."""
 
 from dataclasses import dataclass
+import json
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +27,8 @@ class _MistGridData:
     validity: tuple | None = None
     # Sorted union of native primary EEP labels; plotting metadata only.
     primary_eeps: tuple[int, ...] = ()
+    # Small immutable provenance record, without the per-track coverage lists.
+    metadata_json: str = "{}"
 
     def __post_init__(self):
         if not isinstance(self.grid, RectilinearGrid):
@@ -42,6 +45,8 @@ class _MistGridData:
             raise TypeError("sources must be a sequence of path strings")
         object.__setattr__(self, "sources", tuple(self.sources))
         object.__setattr__(self, "primary_eeps", tuple(self.primary_eeps))
+        if not isinstance(self.metadata_json, str) or not isinstance(json.loads(self.metadata_json), dict):
+            raise ValueError("MIST metadata must be a JSON object string")
         if self.kind == "track":
             age = self.grid.field("logage")
             if age.dims != axes["track"]:
@@ -56,7 +61,7 @@ class _MistGridData:
             object.__setattr__(self, "validity", masks)
 
     def tree_flatten(self):
-        return (self.grid, self.validity), (self.kind, self.sources, self.primary_eeps)
+        return (self.grid, self.validity), (self.kind, self.sources, self.primary_eeps, self.metadata_json)
 
     @classmethod
     def tree_unflatten(cls, metadata, children):
@@ -66,5 +71,6 @@ class _MistGridData:
         object.__setattr__(data, "kind", metadata[0])
         object.__setattr__(data, "sources", metadata[1])
         object.__setattr__(data, "primary_eeps", metadata[2])
+        object.__setattr__(data, "metadata_json", metadata[3])
         object.__setattr__(data, "validity", children[1])
         return data
