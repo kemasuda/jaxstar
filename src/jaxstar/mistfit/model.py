@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import json
 
 import jax
 import jax.numpy as jnp
@@ -147,6 +148,15 @@ class MistModel:
         extend beyond a cropped grid. They do not change interpolation/priors.
         """
         return self.data.primary_eeps
+
+    @property
+    def metadata(self):
+        """A copy of the grid's release, composition and photometry provenance.
+
+        Older grids without provenance return an empty mapping. Changing this
+        mapping does not change the immutable model or its source NPZ.
+        """
+        return json.loads(self.data.metadata_json)
 
     @property
     def input_keys(self):

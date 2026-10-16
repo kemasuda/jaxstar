@@ -179,7 +179,8 @@ def test_interp_alternatives_are_not_mixed_with_native_tracks(inputs, tmp_path):
 @pytest.mark.parametrize("options", [{"mass_range": (1., .8)}, {"mass_range": (0., 1.)},
                                     {"eep_range": (2., 3.)}, {"eep_range": (2.1, 4.1)},
                                     {"feh": [0.]}, {"feh": [-.25, -.25]},
-                                    {"version": "2.5"}, {"rotation": .2}, {"afe": .2}])
+                                    {"version": "9.9"}, {"rotation": .2}, {"afe": .2},
+                                    {"version": "2.5", "afe": .4}])
 def test_invalid_options_fail_before_acquiring_inputs(tmp_path, monkeypatch, options):
     monkeypatch.setattr(create_tracks, "fetch_archive", lambda *a, **k: pytest.fail("unexpected acquisition"))
     with pytest.raises(ValueError):

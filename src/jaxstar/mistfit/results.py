@@ -77,6 +77,7 @@ def _grid_record(model):
         digest.update(str((array.dtype.str, array.shape)).encode())
         digest.update(memoryview(array).cast("B"))
     return {"kind": model.kind, "legacy_interpolation": model.legacy_interpolation,
+            "metadata": model.metadata,
             "grid_sha256": digest.hexdigest(), "grid_schema": schema,
             "sources": [{"path": str(path), "sha256": _file_hash(path) if Path(path).is_file() else None}
                         for path in model.data.sources]}
