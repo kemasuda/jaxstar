@@ -83,7 +83,10 @@ For the optional historical full-grid regression test:
 JAXSTAR_MISTGRID_PATH=/path/to/mistgrid_iso.npz python -m pytest -m full_grid
 ```
 
-## Reference
+## References
 
-The original isochrone-fitting method is described in
-[Masuda (2022)](https://arxiv.org/abs/2209.03279).
+- **MistFit:** The original isochrone-fitting method is described in
+  [Masuda (2022)](https://ui.adsabs.harvard.edu/abs/2022ApJ...937...94M/abstract).
+- **SpecFit:** SpecFit builds on `jaxspec`, the stellar spectral-fitting code
+  introduced in
+  [Tomoyoshi et al. (2024)](https://ui.adsabs.harvard.edu/abs/2024ApJ...977..151T/abstract).
