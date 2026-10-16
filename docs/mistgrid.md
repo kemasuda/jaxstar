@@ -9,8 +9,8 @@ rebuilding an NPZ or updating jaxstar reuses existing downloads.
 
 ## Build a track grid
 
-The builder supports **MIST v1.2 (default) and v2.5**, with rotation `0.0` or `0.4`, `afe=0`,
-and UBVRIplus BCs with Av=0 and Rv=3.1. Choose a rotation rate; the default
+The builder supports **MIST v1.2 (default) and v2.5**, with rotation `0.0` or `0.4`
+and `afe=0` only. It uses UBVRIplus BCs with Av=0 and Rv=3.1. Choose a rotation rate; the default
 includes all published FeH archives and all native masses and EEPs for that
 selection.
 
@@ -39,7 +39,7 @@ To build a smaller region, select published FeH values and native mass/EEP bound
 
 ```python
 path = create_track_grid(
-    "mistgrid_tracks_v25_small.npz", version="2.5",
+    "mistgrid_tracks_v25_small.npz", version="2.5", afe=0.,
     feh=[-0.25, 0.], mass_range=(0.8, 1.2), eep_range=(202, 550),
 )
 ```
@@ -50,6 +50,11 @@ Mass/EEP bounds reduce the generated grid but each selected FeH archive is
 downloaded in full. Nonzero v2.5 `afe` is registered in the source catalogue,
 but the photometric builder rejects it until its composition conversion has
 been validated. See the [v2.5 validation record](../benchmarks/mist_v25/README.md).
+
+For an end-to-end example at `afe=0`, see the
+[MIST v2.5 track notebook](../examples/mistfit/fit_track_v25.ipynb). It starts
+with a grid-building command using `--include-structure`, then runs NUTS and
+plots selected structural quantities from the posterior.
 
 The same builder is available from the command line:
 

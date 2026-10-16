@@ -41,8 +41,11 @@ NUTS, result saving and posterior track plots.
   sampling and diagnostics.
 - [MIST grid guide](docs/mistgrid.md): build a full track grid, reuse downloads,
   and configure the data cache.
-- [Track fitting notebook](examples/mistfit/fit_track.ipynb): an end-to-end
-  fitting example; set its grid path to your prepared NPZ.
+- [MIST v1.2 track notebook](examples/mistfit/fit_track.ipynb): an end-to-end
+  fitting example using the bundled small grid.
+- [MIST v2.5 track notebook](examples/mistfit/fit_track_v25.ipynb) (`afe=0` only):
+  grid creation, NUTS fitting, comparison with the saved v1.2 posterior, and
+  corner plots of structural quantities.
 
 Isochrone fitting remains available for comparison and existing analyses; see
 the [isochrone guide section](docs/mistfit.md#isochrone-fitting) and

@@ -10,6 +10,13 @@ equivalent evolutionary point (EEP), and age is an output. The
 using a small v1.2 grid included in the repository, with no grid download or
 build needed. Its [data notes](../examples/mistfit/data/README.md) give the
 coverage, sources, and regeneration command.
+
+The [MIST v2.5 track notebook](../examples/mistfit/fit_track_v25.ipynb) includes
+the grid-building command, NUTS fitting, and posterior predictions of structural
+quantities such as envelope thickness and convective turnover times. It also
+overlays the saved v1.2 posterior from `fit_track.ipynb` on a shared corner plot.
+Track-grid construction currently supports `afe=0` only.
+
 [Isochrone fitting](#isochrone-fitting) uses the same interface with different
 coordinates and prior options.
 
@@ -18,7 +25,7 @@ coordinates and prior options.
 **Create the grid once, then reuse it.** First
 [build a track grid](mistgrid.md#build-a-track-grid) or choose an existing track
 NPZ. In the example below, `"mistgrid_tracks.npz"` is the path to that saved file.
-The track builder accepts `version="2.5"` with `afe=0`; v1.2 remains the default.
+The track builder accepts `version="2.5"` only with `afe=0`; v1.2 remains the default.
 Both use the same prediction and fitting API. `model.metadata` records the
 release and composition when the NPZ supplies them.
 `from_tracks` requires an explicit path and JAX x64; it does not download or
