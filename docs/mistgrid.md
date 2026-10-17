@@ -45,7 +45,14 @@ path = create_track_grid(
 ```
 
 This is an initial validation example, not a built-in domain restriction.
-Omit `mass_range`, `eep_range` and `feh` to retain the full native v2.5 selection.
+Alternatively, use `feh_range=(-0.75, 0.5)` to include **all published FeH points
+in that range**, including both endpoints: `-0.75, -0.5, -0.25, 0, 0.25, 0.5`.
+The bounds need not coincide with published points; they must be finite and
+increasing, and select at least two points. This selects native archives and
+does not generate interpolated FeH planes. `feh` and `feh_range` cannot be
+combined. The requested range and selected values are recorded in grid metadata.
+
+Omit `mass_range`, `eep_range`, `feh` and `feh_range` to retain the full native v2.5 selection.
 Mass/EEP bounds reduce the generated grid but each selected FeH archive is
 downloaded in full. Nonzero v2.5 `afe` is registered in the source catalogue,
 but the photometric builder rejects it until its composition conversion has
@@ -62,7 +69,8 @@ The same builder is available from the command line:
 python -m jaxstar.mistfit.mistgrid.create_tracks mistgrid_tracks.npz --rotation 0.4 --afe 0
 ```
 
-Optional flags include `--version 2.5`, `--feh -0.25 0 0.25`, `--mass-range 0.8 1.5`,
+Optional flags include `--version 2.5`, `--feh -0.25 0 0.25` or
+`--feh-range -0.75 0.5` (mutually exclusive), `--mass-range 0.8 1.5`,
 `--eep-range 202 550`, `--raw-cache-dir /path/to/cache`,
 `--local-dir /path/to/archives`, `--offline` and `--overwrite`.
 

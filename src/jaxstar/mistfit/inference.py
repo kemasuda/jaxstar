@@ -1,9 +1,9 @@
 """NumPyro isochrone/track models and shared NUTS/MultiNest inference functions."""
 
-__all__ = ["MistObservations", "model_isochrone", "model_track", "find_initial", "make_init_strategy",
+__all__ = ["MistObservations", "InitialGridSearch", "model_isochrone", "model_track", "find_initial", "make_init_strategy",
            "run_nuts", "run_multinest"]
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 import inspect
 import os
@@ -388,9 +388,56 @@ def _initial_axis(axis, low, high, name):
     return nodes
 
 
-def find_initial(observations, physical_model, *, feh_init=0., distance=None,
-                 model_kwargs=None):
-    """Find constrained NUTS starting values on a fixed-FeH/distance grid.
+@dataclass(frozen=True)
+class InitialGridSearch:
+    """In-memory search scores and their target, for optional coverage checks.
+
+    Scores are constrained joint log densities, not marginalized probabilities.
+    log_density is the maximum over feh_values at each two-dimensional node;
+    best_feh retains its maximizing FeH (NaN where no slice has finite density).
+    log_density_by_feh has shape (FeH, first axis, EEP).
+    Axes are mass/EEP for tracks or log10(age/yr)/EEP for isochrones. Holding
+    the model here shares its existing arrays; it does not duplicate the grid.
+    """
+
+    axis_names: tuple
+    axes: tuple
+    bounds: tuple
+    log_density: np.ndarray = field(repr=False)
+    fixed_values: dict
+    observations: MistObservations = field(repr=False)
+    physical_model: object = field(repr=False)
+    model_kwargs: dict = field(repr=False)
+    feh_values: np.ndarray
+    feh_step: object
+    log_density_by_feh: np.ndarray = field(repr=False)
+    best_feh: np.ndarray = field(repr=False)
+
+
+def _feh_scan_axis(axis, low, high, step, extra=None):
+    """Step-spaced dex nodes anchored at zero, plus an optional starting value."""
+    fallback = _initial_axis(axis, low, high, 'FeH')
+    if (isinstance(step, (bool, np.bool_)) or np.ndim(step)
+            or not np.isfinite(step) or step <= 0):
+        raise ValueError('feh_step must be a finite positive scalar')
+    left, right = max(low, float(axis[0])), min(high, float(axis[-1]))
+    nodes = step * np.arange(np.ceil(left / step), np.floor(right / step) + 1)
+    # Correct grid-edge roundoff, but keep starts away from open prior endpoints.
+    nodes = np.clip(nodes, left, right)
+    tolerance = 4 * np.finfo(float).eps * max(1., abs(low), abs(high))
+    nodes = nodes[(nodes > low + tolerance) & (nodes < high - tolerance)]
+    if not nodes.size:
+        nodes = np.array([left + (right - left) / 2])
+        if not low < nodes[0] < high:
+            nodes = fallback
+    if extra is not None:
+        nodes = np.r_[nodes, extra]
+    return np.unique(nodes)
+
+
+def find_initial(observations, physical_model, *, feh_init=None, distance=None,
+                 model_kwargs=None, return_grid=False, feh_step=None):
+    """Find constrained NUTS starting values, optionally scanning initial FeH.
 
     Search all native initial-mass x EEP nodes for tracks, or log-age x EEP
     nodes for isochrones, within the sampling bounds in model_kwargs. Uniform
@@ -398,15 +445,58 @@ def find_initial(observations, physical_model, *, feh_init=0., distance=None,
     A range containing no interior native node uses its overlap midpoint.
     Isochrone mass bounds remain soft and only affect the score.
 
-    feh_init defaults to zero (initial, not surface FeH). distance is in kpc;
+    With feh_init=None, use observed surface FeH (feh, feh_surface, then
+    feh_photosphere), or zero if absent. This is only an approximate initial
+    FeH starting value; it does not equate the initial and surface abundances
+    in the inference model. An explicit feh_init overrides this choice.
+    With feh_step=None this FeH is fixed and must lie inside the open prior
+    bounds and the grid. feh_step=0.1 instead scans multiples of 0.1 dex within
+    their overlap, adding the chosen FeH if supported. Interpolation evaluates
+    intermediate values without rebuilding the NPZ. Unsupported automatic
+    FeH guesses are skipped during a scan; explicit invalid feh_init raises.
+    A range containing no step-aligned interior node uses its midpoint.
+    distance is in kpc;
     when omitted, use the reciprocal of a positive observed parallax in mas.
-    Both are fixed only during this search. Rank candidates by the existing
+    Distance is fixed only during this search. Rank candidates by the existing
     model's constrained joint log density, including all enabled likelihood
     and prior factors, and return the best with finite density and gradients.
     The returned dict contains only latent sample sites, including age in Gyr
     or logage for isochrones according to linear_age. No SVI is performed;
     this starting point does not guarantee discovery of all posterior modes.
+    return_grid=True returns (initial, InitialGridSearch) so the same scores
+    can be compared with posterior draws without repeating the search.
     """
+    search = _search_grid(observations, physical_model, feh_init=feh_init,
+                          distance=distance, model_kwargs=model_kwargs, feh_step=feh_step)
+    model = _default_model(physical_model)
+
+    def score(grid_model, point):
+        return log_density(model, (observations, grid_model), search.model_kwargs, point)[0]
+
+    scores = search.log_density_by_feh
+    finite = np.flatnonzero(np.isfinite(scores.ravel()))
+    ranked = finite[np.argsort(-scores.ravel()[finite], kind="stable")]
+    value_and_grad = jax.jit(jax.value_and_grad(score, argnums=1))
+    for index in ranked:
+        k, i, j = np.unravel_index(index, scores.shape)
+        name, value = search.axis_names[0], search.axes[0][i]
+        if name == 'logage' and search.model_kwargs.get('linear_age', True):
+            name, value = 'age', 10.**value / 1e9
+        point = {name: jnp.asarray(value), 'eep': jnp.asarray(search.axes[1][j]),
+                 'feh_init': jnp.asarray(search.feh_values[k]),
+                 'distance': jnp.asarray(search.fixed_values['distance'])}
+        value, gradient = value_and_grad(physical_model, point)
+        if np.isfinite(value) and all(np.isfinite(v) for v in gradient.values()):
+            initial = {key: float(value) for key, value in point.items()}
+            return (initial, search) if return_grid else initial
+    raise ValueError("grid initialization found no candidate with finite density and gradients; "
+                     "check model bounds/data, change feh_init or distance via init_kwargs, "
+                     "or supply init_strategy explicitly")
+
+
+def _search_grid(observations, physical_model, *, feh_init=None, distance=None,
+                 model_kwargs=None, feh_step=None):
+    """Score the grid for initialization or diagnostics, without selecting a start."""
     model = _default_model(physical_model)
     options = dict(model_kwargs or {})
     bound = inspect.signature(model).bind(observations, physical_model, **options)
@@ -428,46 +518,66 @@ def find_initial(observations, physical_model, *, feh_init=0., distance=None,
     axes = [physical_model.grid.axis(name) for name in axis_names]
     first = _initial_axis(axes[0], *limits[0], axis_names[0])
     eeps = _initial_axis(axes[2], *limits[2], "EEP")
-    # Validate the fixed FeH in both the grid and the open sampling support.
+    measured = dict(zip(observations.keys, observations.values))
+    explicit_feh = feh_init is not None
+    if not explicit_feh:
+        feh_init = next((measured[key] for key in
+                        ('feh', 'feh_surface', 'feh_photosphere') if key in measured), 0.)
+    # Validate explicit/fixed FeH; scans may proceed without an automatic guess.
     _initial_axis(axes[1], *limits[1], "FeH")
-    if (np.ndim(feh_init) or not np.isfinite(feh_init)
-            or not limits[1][0] < feh_init < limits[1][1]
-            or not float(axes[1][0]) <= feh_init <= float(axes[1][-1])):
+    valid_feh = (not np.ndim(feh_init) and np.isfinite(feh_init)
+                 and limits[1][0] < feh_init < limits[1][1]
+                 and float(axes[1][0]) <= feh_init <= float(axes[1][-1]))
+    if not valid_feh and (explicit_feh or feh_step is None):
         raise ValueError("feh_init must be finite, inside the open FeH prior bounds and within the grid; "
                          "choose a different feh_init for initialization")
+    fehs = (np.array([feh_init], dtype=float) if feh_step is None else
+            _feh_scan_axis(axes[1], *limits[1], feh_step, extra=feh_init if valid_feh else None))
     if distance is None:
-        measured = dict(zip(observations.keys, observations.values))
         parallax = measured.get("parallax", 0.)
         if parallax <= 0:
-            raise ValueError("grid initialization requires positive parallax; provide distance "
-                             "via init_kwargs or supply init_strategy explicitly")
+            raise ValueError("grid search requires positive parallax; provide distance explicitly. "
+                             "For NUTS initialization, alternatively supply init_strategy.")
         distance = 1. / parallax
     if np.ndim(distance) or not np.isfinite(distance) or distance <= 0:
         raise ValueError("initial distance must be a finite positive scalar in kpc")
 
+    search_axes = (first, eeps)
+    search_bounds = tuple((max(lo, float(axis[0])), min(hi, float(axis[-1])))
+                          for axis, (lo, hi) in ((axes[0], limits[0]), (axes[2], limits[2])))
     first, eeps = (jnp.asarray(a.ravel()) for a in np.meshgrid(first, eeps, indexing="ij"))
     if physical_model.kind == "isochrone" and settings["linear_age"]:
         latent, first = "age", 10.**first / 1e9
     points = {latent: first, "eep": eeps,
-              "feh_init": jnp.full_like(first, feh_init),
+              "feh_init": jnp.full_like(first, fehs[0]),
               "distance": jnp.full_like(first, distance)}
 
     def score(grid_model, point):
         return log_density(model, (observations, grid_model), options, point)[0]
 
     # Pass the large grid as a dynamic PyTree, not an embedded JIT constant.
-    scores = np.asarray(jax.jit(jax.vmap(score, in_axes=(None, 0)))(physical_model, points))
-    finite = np.flatnonzero(np.isfinite(scores))
-    ranked = finite[np.argsort(-scores[finite], kind="stable")]
-    value_and_grad = jax.jit(jax.value_and_grad(score, argnums=1))
-    for index in ranked:
-        point = {key: values[index] for key, values in points.items()}
-        value, gradient = value_and_grad(physical_model, point)
-        if np.isfinite(value) and all(np.isfinite(v) for v in gradient.values()):
-            return {key: float(value) for key, value in point.items()}
-    raise ValueError("grid initialization found no candidate with finite density and gradients; "
-                     "check model bounds/data, change feh_init or distance via init_kwargs, "
-                     "or supply init_strategy explicitly")
+    # Evaluate one FeH plane at a time, keeping intermediate model arrays bounded.
+    evaluate = jax.jit(jax.vmap(score, in_axes=(None, 0)))
+    scores = []
+    for feh in fehs:
+        points['feh_init'] = jnp.full_like(first, feh)
+        scores.append(np.asarray(evaluate(physical_model, points)))
+    shape = tuple(len(axis) for axis in search_axes)
+    by_feh = np.stack(scores).reshape((len(fehs), *shape))
+    supported = np.where(np.isfinite(by_feh), by_feh, -np.inf)
+    profile = supported.max(axis=0)
+    best_feh = np.where(np.isfinite(profile), fehs[supported.argmax(axis=0)], np.nan)
+    fixed = dict(distance=float(distance))
+    if feh_step is None:
+        fixed['feh_init'] = float(fehs[0])
+    return InitialGridSearch(
+        axis_names=('mass' if physical_model.kind == 'track' else 'logage', 'eep'),
+        axes=search_axes, bounds=search_bounds,
+        log_density=profile, fixed_values=fixed,
+        observations=observations, physical_model=physical_model, model_kwargs=options,
+        feh_values=fehs, feh_step=None if feh_step is None else float(feh_step),
+        log_density_by_feh=by_feh, best_feh=best_feh,
+    )
 
 
 def make_init_strategy(observations):

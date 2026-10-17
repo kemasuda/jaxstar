@@ -29,11 +29,12 @@ _SCALARS = ("logage", "age_gyr", "logTeff", "logg", "logL", "logR",
             "star_mass", "bc_metallicity", "cmd_surface_feh")
 
 
-def _bounds(value, name):
+def _bounds(value, name, *, positive=True):
     bounds = np.asarray(value, dtype=float)
     if (bounds.shape != (2,) or not np.all(np.isfinite(bounds))
-            or not 0 < bounds[0] < bounds[1]):
-        raise ValueError(f"{name} must contain two positive increasing finite bounds")
+            or bounds[0] >= bounds[1] or (positive and bounds[0] <= 0)):
+        qualifier = "positive " if positive else ""
+        raise ValueError(f"{name} must contain two {qualifier}increasing finite bounds")
     return tuple(bounds.tolist())
 
 
@@ -135,7 +136,7 @@ def _read_archive(path, expected_feh, rotation, afe, mass_range, eep_range, bc_a
     return tracks, records
 
 
-def create_track_grid(path, *, mass_range=None, eep_range=None, feh=None, version="1.2",
+def create_track_grid(path, *, mass_range=None, eep_range=None, feh=None, feh_range=None, version="1.2",
                       rotation=.4, afe=0., raw_cache_dir=None, local_dir=None,
                       offline=False, overwrite=False, allow_missing=True, include_structure=False):
     """Create a float64 NPZ compatible with MistModel.from_tracks; return its Path.
@@ -143,8 +144,11 @@ def create_track_grid(path, *, mass_range=None, eep_range=None, feh=None, versio
     mass_range=None and eep_range=None retain the union of all native masses
     and EEPs. Optional mass bounds are inclusive, in solar masses; optional
     eep_range is an inclusive integer pair (at least three nodes). Every EEP
-    is retained. feh=None selects all published metallicities, or supply at
-    least two distinct catalogue values. Both rotation rates are accepted.
+    is retained. Supply feh with at least two distinct catalogue values, or
+    feh_range=(min, max) to select every published metallicity in that inclusive
+    range. The bounds need not be catalogue values; at least two values must
+    be selected. These options are mutually exclusive. Omitting both selects
+    all published metallicities. Both rotation rates are accepted.
     Versions 1.2 (default) and 2.5, afe=0, UBVRIplus, Av=0 and Rv=3.1 are
     supported. Nonzero v2.5 alpha is catalogued but its CMD chemistry is not
     yet validated for building photometric grids.
@@ -176,6 +180,9 @@ def create_track_grid(path, *, mass_range=None, eep_range=None, feh=None, versio
     """
     mass_range = None if mass_range is None else _bounds(mass_range, "mass_range")
     eep_range = None if eep_range is None else _bounds(eep_range, "eep_range")
+    if feh is not None and feh_range is not None:
+        raise ValueError("feh and feh_range are mutually exclusive")
+    feh_range = None if feh_range is None else _bounds(feh_range, "feh_range", positive=False)
     if not isinstance(allow_missing, bool):
         raise TypeError("allow_missing must be a bool")
     if not isinstance(include_structure, bool):
@@ -189,10 +196,15 @@ def create_track_grid(path, *, mass_range=None, eep_range=None, feh=None, versio
         raise ValueError("eep_range must select at least three consecutive integer EEPs")
     # Resolve version/composition before any disk writes or downloads.
     metallicities = sorted(track_metallicities(version=version, rotation=rotation, afe=afe, feh=feh))
+    if feh_range is not None:
+        metallicities = [value for value in metallicities if feh_range[0] <= value <= feh_range[1]]
     if afe != 0.:
         raise ValueError("Photometric track grids currently require afe=0; nonzero v2.5 alpha chemistry is not validated")
     release = v25 if version == "2.5" else v12
     if len(metallicities) < 2:
+        if feh_range is not None:
+            raise ValueError(f"feh_range {feh_range} selects {len(metallicities)} published FeH values; "
+                             "a rectangular track grid needs at least two")
         raise ValueError("A rectangular track grid needs at least two FeH values")
     bc_source = bolometric_correction_archive(version=version, afe=afe)
     sources = track_archives(version=version, rotation=rotation, afe=afe, feh=metallicities)
@@ -261,7 +273,7 @@ def create_track_grid(path, *, mass_range=None, eep_range=None, feh=None, versio
                      "finite_nodes": {name: int(np.isfinite(values[..., i]).sum())
                                       for i, name in enumerate((*scalar_names, *v12.BANDS))}},
         "rotation": rotation, "afe": afe, "photometry": "UBVRIplus", "Av": 0., "Rv": 3.1,
-        "mass_range": mass_range, "eep_range": eep_range, "feh": metallicities,
+        "mass_range": mass_range, "eep_range": eep_range, "feh": metallicities, "feh_range": feh_range,
         "shape": list(values.shape[:3]), "native_tracks": len(records), "inputs": inputs,
         "tracks": records, "BC_recipe": f"v{version} Steffen logT (linear edges) / linear logg / Steffen metallicity (three-point edges)",
         "chemistry": {"surface_feh": "CMD log(Z/Zsun) - log(X/Xsun)",
@@ -303,7 +315,11 @@ def main(argv=None):
     parser.add_argument("path", type=Path, help="output NPZ")
     parser.add_argument("--mass-range", nargs=2, type=float, metavar=("MIN", "MAX"), help="default: all native masses")
     parser.add_argument("--eep-range", nargs=2, type=int, metavar=("MIN", "MAX"), help="default: all native EEPs")
-    parser.add_argument("--feh", nargs="+", type=float, help="default: all published FeH values")
+    feh_options = parser.add_mutually_exclusive_group()
+    feh_options.add_argument("--feh", nargs="+", type=float,
+                             help="explicit published FeH values; default: all published values")
+    feh_options.add_argument("--feh-range", nargs=2, type=float, metavar=("MIN", "MAX"),
+                             help="select all published FeH values in this inclusive range (at least two)")
     parser.add_argument("--version", default="1.2")
     parser.add_argument("--rotation", type=float, default=.4)
     parser.add_argument("--afe", type=float, default=0.)

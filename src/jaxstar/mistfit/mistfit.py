@@ -60,15 +60,21 @@ class MistFit:
         """Default NumPyro model selected by the physical model's kind."""
         return _default_model(self.physical_model)(self.observations, self.physical_model, *args, **kwargs)
 
-    def find_initial(self, *, feh_init=0., distance=None, model_kwargs=None):
-        """Return latent starting values from a fixed-FeH/distance grid search.
+    def find_initial(self, *, feh_init=None, distance=None, model_kwargs=None, return_grid=False,
+                     feh_step=None):
+        """Return latent starting values, optionally scanning initial FeH.
 
         Pass the same model_kwargs as the intended run. Track searches use
         native mass x EEP; isochrone searches use native log-age x EEP.
+        FeH defaults to the observed surface value, or zero if absent.
+        feh_step=0.1 scans the allowed initial FeH range at 0.1 dex intervals,
+        also including this starting value when supported. Distance stays fixed.
+        return_grid=True also returns the search for optional coverage checks.
         See inference.find_initial for scoring, bounds and distance defaults.
         """
         return find_initial(self.observations, self.physical_model,
-                            feh_init=feh_init, distance=distance, model_kwargs=model_kwargs)
+                            feh_init=feh_init, distance=distance, model_kwargs=model_kwargs,
+                            return_grid=return_grid, feh_step=feh_step)
 
     def run_nuts(self, rng_key, *, output_keys=None, model_kwargs=None,
                  grid_init=True, init_kwargs=None, init_strategy=None, **sampler_kwargs):
@@ -77,7 +83,7 @@ class MistFit:
         output_keys adds deterministic outputs for this run. model_kwargs holds
         prior/likelihood options; sampler_kwargs holds run_nuts sampler options.
         By default, search once with find_initial and use that start for all
-        chains. init_kwargs can set feh_init and distance for this search only.
+        chains. init_kwargs can set feh_init, distance and feh_step for this search only.
         grid_init=False retains the historical parallax/NumPyro fallback rule.
         Explicit init_strategy or init_params bypass automatic initialization
         (including init_kwargs), and do not require a parallax observation.
@@ -94,6 +100,31 @@ class MistFit:
 
     # Retain the familiar name with the new single-call/result-returning API.
     run_hmc = run_nuts
+
+    def check_missed_modes(self, result, *, feh_step=0.1, feh_init=None, distance=None,
+                            threshold=5., min_samples=5, neighbor_cells=1,
+                            max_unvisited_fraction=0.1, batch_size=512):
+        """Scan independently of NUTS initialization for potentially missed modes.
+
+        result is a jaxstar-recorded MCMC result or saved InferenceData. Recover
+        the exact scientific options from its run metadata and require matching
+        observations and physical grid. No model_kwargs need to be repeated.
+        By default scan FeH at 0.1 dex, including the observed FeH guess, with
+        distance fixed to inverse observed parallax. feh_init and distance
+        override the scan's guess/slice only; feh_step=None fixes FeH.
+
+        The returned dict includes grid_search (the full InitialGridSearch),
+        sample scores/counts and region flags. Use recheck_missed_modes to
+        change diagnostic thresholds without scanning or scoring again.
+        Sampling and this immutable fitter are unchanged. See the standalone
+        check_missed_modes for flag definitions and projection limitations.
+        """
+        from .diagnostics import _check_fit_missed_modes
+        return _check_fit_missed_modes(
+            self, result, feh_step=feh_step, feh_init=feh_init, distance=distance,
+            threshold=threshold, min_samples=min_samples, neighbor_cells=neighbor_cells,
+            max_unvisited_fraction=max_unvisited_fraction, batch_size=batch_size,
+        )
 
     def run_multinest(self, *, outputfiles_basename, output_keys=None, model_kwargs=None,
                       **sampler_kwargs):

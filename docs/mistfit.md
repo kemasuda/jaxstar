@@ -156,8 +156,9 @@ saved-only output can be `-inf` without changing the inference target.
 
 ### Initialization
 
-`run_nuts` performs a grid search by default. At fixed initial
-FeH = 0 and distance = 1 / observed positive parallax, it searches native
+`run_nuts` performs a grid search by default. It uses observed surface FeH
+as an approximate initial FeH (zero if absent), and fixes distance to
+1 / observed positive parallax during the search. It searches native
 mass × EEP nodes within the run's bounds and scores the joint log density,
 including priors and optional constraints. It uses all EEP nodes. The best
 candidate with finite density and gradients initializes all chains; all sampled
@@ -173,17 +174,98 @@ mcmc = fit.run_nuts(
 )
 ```
 
-`init_kwargs` changes the quantities fixed during the search only. Choose
-`feh_init` inside the configured FeH bounds. Without a positive observed
+`init_kwargs` changes the quantities fixed during the search only. An explicit
+`feh_init` overrides the observation; the observed keys are tried in order
+`feh`, `feh_surface`, `feh_photosphere`. This initialization approximation does
+not change the model's distinction between initial and surface FeH. The chosen
+value must lie inside the open FeH prior bounds and within the grid; values
+outside raise an error rather than silently clipping. Without a positive observed
 parallax, provide a starting distance or explicit initialization. An explicit
 `init_strategy` or unconstrained `init_params` takes precedence and bypasses the
 search. Selected starting values are included in the run metadata.
+
+Set `feh_step=0.1` in `find_initial` (or in `run_nuts`'s `init_kwargs`) to scan
+initial FeH at multiples of 0.1 dex within the grid and open prior bounds.
+The observed/explicit initial FeH guess is included as an extra point if it is
+supported. Unsupported automatic guesses are skipped during a scan; explicit
+out-of-bounds guesses still raise. If no step-aligned point fits, use the
+overlap midpoint. This evaluates the existing interpolation and does not
+require new native FeH planes. Distance remains fixed during this search;
+NUTS then samples all latent parameters. Omitting `feh_step` keeps the fixed-FeH
+search described above.
 
 `grid_init=False` disables the search and initializes matching latent sites from
 the observations, using NumPyro's fallback for unspecified sites. This option
 requires a parallax observation: distance starts at its reciprocal when positive,
 or at 8 kpc otherwise. The standalone `jaxstar.mistfit.run_nuts` function uses
 NumPyro's default initialization unless an `init_strategy` is supplied.
+
+#### Potentially missed modes
+
+After sampling, `MistFit.check_missed_modes` independently scans for candidate
+regions that NUTS may have missed. Initialization stays inside `run_nuts`, at
+fixed observed FeH by default.
+
+```python
+from jaxstar.mistfit import plot_missed_modes, recheck_missed_modes
+
+mcmc = fit.run_nuts(jax.random.PRNGKey(1), model_kwargs=options)
+mode_check = fit.check_missed_modes(mcmc, feh_step=0.1, threshold=5.)
+fig = plot_missed_modes(mode_check)
+
+# Change criteria without repeating the scan or evaluating log densities.
+broader = recheck_missed_modes(mode_check, threshold=10.)
+fig = plot_missed_modes(broader)
+```
+
+The method accepts a native MCMC result or saved InferenceData from
+`load_result`. It recovers the scientific options from the run metadata and
+requires matching observations and physical grid. Distance is fixed to inverse
+observed parallax; `distance` and `feh_init` can override the diagnostic slice
+and FeH guess independently of the initialization settings.
+
+`mode_check["grid_search"]` retains the full `InitialGridSearch`, including axes,
+bounds, `log_density_by_feh`, the FeH maximum and `best_feh`, and the target.
+The report also retains sample log densities and counts. `recheck_missed_modes`
+returns a new report, keeping unspecified criteria unchanged. Changing FeH
+spacing, distance, model or samples requires a new `fit.check_missed_modes` call.
+For an explicit target, the lower-level `check_missed_modes(search, samples)`
+accepts a search from `find_initial(return_grid=True)` and matching draws.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `feh_step` | `0.1` | Initial FeH scan spacing; `None` holds FeH fixed |
+| `threshold` | `5.` | Δlogp cutoff for candidate selection and connectivity |
+| `min_samples` | `5` | Minimum draws in a region plus its border, summed over chains |
+| `neighbor_cells` | `1` | Border width in cells, including diagonals; `0` disables the allowance |
+| `max_unvisited_fraction` | `0.1` | Flag above this fraction of cells without a nearby draw; `None` disables this criterion |
+
+The map is the **maximum joint log density over FeH** at fixed distance, on
+mass–EEP (log-age–EEP for isochrones). Grid points and draws use the same
+constrained density, including priors, with their combined maximum as the
+reference. NUTS potential energy includes transform Jacobians and is not used.
+Face-connected cells within the cutoff form regions; sample bins use native-node
+midpoints. A region is flagged if its nearby draw count is too small **or** its
+unvisited-cell fraction is too large. Exactly 10% unvisited does not flag at the
+default cutoff. Cells have equal weight; this is neither a posterior probability
+nor an effective sample size. Neighbor allowances can overlap between regions.
+
+`mode_check["regions"]` contains raw/nearby counts by chain, `unvisited_fraction`,
+`flag` and `flag_reasons` (`low_sample_count` and/or `high_unvisited_fraction`).
+The top-level `flag` is true if any region is flagged; `labels` identifies regions
+and `unvisited_cells` marks their unvisited cells. White outlines show candidate
+boundaries. A red cross marks the highest-logp unvisited cell for a fraction flag,
+or the region peak for a count-only flag. Its coordinates are given by
+`flag_peak_index` and `flag_peak_feh`; `peak_index` retains the overall peak.
+The title counts flagged / total candidate regions, not identified modes.
+
+A flag suggests a **potentially missed mode**, not a confirmed one. Large
+thresholds include sparsely visited tails and bridges even when both main peaks
+have draws. Conversely, projection over FeH/distance, discrete grid spacing and
+the neighbor allowance can hide missed modes. Use this check alongside chain
+mixing diagnostics; visiting both peaks does not establish their relative weights.
+The [v2.5 track notebook](../examples/mistfit/fit_track_v25.ipynb) includes this
+check and saves `missed_modes.png` with its results.
 
 ## Save results and inspect diagnostics
 
