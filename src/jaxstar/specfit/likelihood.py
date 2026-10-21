@@ -146,9 +146,14 @@ def _region_gp(obs, region, indices, amplitude, scale, jitter, dtype, solver):
     # Gather usable values before any subtraction, squaring or GP operation.
     y = jnp.atleast_2d(jnp.asarray(obs.flux, dtype=dtype))[region, index]
     error = jnp.atleast_2d(jnp.asarray(obs.uncertainty, dtype=dtype))[region, index]
-    kernel = tinygp.kernels.quasisep.Matern32(sigma=amplitude, scale=scale)
-    kwargs = ({"solver": tinygp.solvers.QuasisepSolver, "assume_sorted": True}
-              if solver == "quasisep" else {"solver": tinygp.solvers.DirectSolver})
+    if solver == "quasisep":
+        kernel = tinygp.kernels.quasisep.Matern32(sigma=amplitude, scale=scale)
+        kwargs = {"solver": tinygp.solvers.QuasisepSolver, "assume_sorted": True}
+    else:
+        # Dense quasisep evaluation can overflow an unused jnp.where branch,
+        # giving NaN gradients even when the covariance is finite.
+        kernel = amplitude**2 * tinygp.kernels.Matern32(scale=scale)
+        kwargs = {"solver": tinygp.solvers.DirectSolver}
     gp = tinygp.GaussianProcess(kernel, x, diag=error**2 + jitter**2, mean=0., **kwargs)
     return gp, y, index, origin
 

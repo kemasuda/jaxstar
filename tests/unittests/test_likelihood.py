@@ -163,6 +163,33 @@ def test_solvers_jit_dynamic_data_dtype_and_all_gradients(dtype, regions, x64_co
         assert before == jax.config.x64_enabled
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_long_range_short_scale_likelihood_gradients(dtype, x64_context):
+    with x64_context(dtype == np.float64):
+        # Nearby pixels retain scale sensitivity; distant pairs overflow the
+        # unused reverse transition in dense quasisep kernel evaluation.
+        x = np.concatenate((np.linspace(0., 1., 21), np.linspace(99., 100., 21)))
+        wave = (5000. + x).astype(dtype)
+        y = (1. + .015 * np.sin(6 * (wave - wave[0]))).astype(dtype)
+        obs = prepare_gp_observation(Observation(wave, y, np.full_like(wave, .02)))
+        flux = jnp.ones_like(jnp.asarray(wave))
+        results = []
+        for solver in ("quasisep", "direct"):
+            def fn(data, f, amplitude, scale):
+                return gp_marginalized_continuum_log_likelihood(
+                    data, f, gp_amplitude=amplitude, gp_scale=scale,
+                    sigma_constant=.1, sigma_continuum=.03, jitter=.009,
+                    gp_solver=solver)
+            value, gradients = jax.jit(jax.value_and_grad(fn, argnums=(2, 3)))(
+                obs, flux, jnp.asarray(.025, dtype=dtype), jnp.asarray(.2, dtype=dtype))
+            assert np.isfinite(value)
+            assert all(np.isfinite(gradient) for gradient in gradients)
+            results.append((value, gradients))
+        tolerance = dict(rtol=5e-4, atol=2e-3) if dtype == np.float32 else dict(rtol=3e-10, atol=3e-10)
+        for q, d in zip(jax.tree.leaves(results[0]), jax.tree.leaves(results[1])):
+            np.testing.assert_allclose(q, d, **tolerance)
+
+
 @pytest.mark.parametrize("solver", ["quasisep", "direct"])
 def test_gradients_match_finite_differences(solver):
     obs, flux = problem()
