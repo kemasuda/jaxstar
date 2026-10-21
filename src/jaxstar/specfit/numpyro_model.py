@@ -14,6 +14,7 @@ import numpyro.distributions as dist
 from .broadening import default_broadening
 from .continuum import _degree
 from .likelihood import (
+    _validate_gp_options,
     gp_marginalized_continuum_log_likelihood,
     marginalized_continuum_log_likelihood, prepare_gp_observation,
 )
@@ -212,7 +213,7 @@ def model_single(observation, specmodel, *, resolving_power=None,
                  jitter_bounds=(np.exp(-10.), np.exp(-3.)),
                  gp_amplitude_bounds=(np.exp(-5.), np.exp(-.5)),
                  gp_scale_bounds=(np.exp(-5.), np.exp(2.)),
-                 use_gp=None, gp_solver="auto", use_physical_logg_max=False,
+                 use_gp=None, gp_solver="auto", gp_parallel=False, use_physical_logg_max=False,
                  use_empirical_vmic=None, use_empirical_vmacro=False,
                  vmacro_empirical_sigma=1., degree=4, basis=None,
                  prior_only=False, save_model_flux=False,
@@ -245,12 +246,15 @@ def model_single(observation, specmodel, *, resolving_power=None,
     regions. GP masks must be concrete when tracing. GP amplitude/jitter are in
     flux units, GP scale in wavelength units. All physical/noise sites retain
     their native names; fixed inputs become deterministic sites.
+    gp_parallel=False preserves the usual solver policy; True requests parallel
+    Quasisep, while "auto" opts into GPU parallelism when tinygp supports it.
 
     ``prior_only=True`` records parameter sites and returns physical params
     before computing spectra or likelihoods. It supports check_prior. Normal
     evaluation returns the same params after recording the spectrum factor.
     """
     _check_ip_choice(specmodel, resolving_power)
+    _validate_gp_options(gp_solver, gp_parallel)
     fixed = dict(fixed or {})
     empirical_vmic_active = (specmodel.spectra.library == "bosz"
                              if use_empirical_vmic is None else use_empirical_vmic)
@@ -409,7 +413,8 @@ def model_single(observation, specmodel, *, resolving_power=None,
         log_likelihood = gp_marginalized_continuum_log_likelihood(
             gp_data, flux, degree=degree, basis=basis,
             sigma_constant=sigma_constant, sigma_continuum=sigma_continuum, jitter=jitter,
-            gp_amplitude=gp_amplitude, gp_scale=gp_scale, gp_solver=gp_solver)
+            gp_amplitude=gp_amplitude, gp_scale=gp_scale, gp_solver=gp_solver,
+            gp_parallel=gp_parallel)
     numpyro.factor("spectrum", log_likelihood)
     return params
 
@@ -434,7 +439,7 @@ def _bound_pair(value, name, *, shape=(), positive=False, singleton=False):
 
 def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bounds=None,
                       vsini_max=None, vmacro_bounds=(1., 15.), fixed=None,
-                      degree=4, basis=None, use_gp=True, gp_solver="auto",
+                      degree=4, basis=None, use_gp=True, gp_solver="auto", gp_parallel=False,
                       use_physical_logg_max=False, use_empirical_vmic=None,
                       use_empirical_vmacro=False, vmacro_empirical_sigma=1.,
                       sigma_constant=.2 / np.sqrt(3), sigma_continuum=.1 / np.sqrt(3),
@@ -449,6 +454,7 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     vsini_max. ``fixed`` supplies numeric values by native site name, e.g.
     {"logg": 4.4, "vmacro": 0.}. Atmosphere coordinates must be scalar; broadening,
     RV and jitter may be shared or per region. GP hyperparameters are shared.
+    gp_parallel is the static parallel-solver option described in model_single.
     Resolving power is required, as a positive scalar/region value or a NumPyro
     distribution. Infinity disables the Gaussian instrumental profile. With a
     fixed_ip SpecModel, omit resolving_power; its fixed mixture is used instead.
@@ -477,8 +483,7 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     if not isinstance(use_gp, bool):
         raise TypeError("use_gp must be a bool")
     degree = _degree(degree)
-    if gp_solver not in ("auto", "quasisep", "direct"):
-        raise ValueError("gp_solver must be 'auto', 'quasisep' or 'direct'")
+    _validate_gp_options(gp_solver, gp_parallel)
     for name, value in (("use_physical_logg_max", use_physical_logg_max),
                         ("use_empirical_vmacro", use_empirical_vmacro)):
         if not isinstance(value, bool):
@@ -605,7 +610,7 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
         atmosphere_bounds=bounds, rv_bounds=rv_bounds, vsini_max=vsini_max,
         vmacro_bounds=vmacro_bounds, fixed=fixed,
         resolving_power=resolving_power, degree=degree, basis=basis,
-        use_gp=use_gp, gp_solver=gp_solver, sigma_constant=sigma_constant,
+        use_gp=use_gp, gp_solver=gp_solver, gp_parallel=gp_parallel, sigma_constant=sigma_constant,
         sigma_continuum=sigma_continuum,
         jitter_bounds=_bound_pair(
             jitter_bounds, "jitter_bounds", positive=True),

@@ -213,17 +213,21 @@ def gp_case(x64_context):
         yield obs, model, config, point, physical
 
 
-@pytest.mark.parametrize("solver", ["auto", "quasisep", "direct"])
-def test_gp_fixed_factor_and_compact_trace(gp_case, solver):
+@pytest.mark.parametrize("solver, parallel", [
+    ("auto", False), ("quasisep", False), ("direct", False), ("quasisep", True)])
+def test_gp_fixed_factor_and_compact_trace(gp_case, solver, parallel):
     import inspect
+    from jaxstar.specfit.likelihood import _supports_parallel_gp
+    if parallel and not _supports_parallel_gp():
+        pytest.skip("installed tinygp does not support parallel Quasisep")
     obs, model, config, point, physical = gp_case
     assert "gp_data" not in inspect.signature(model_single).parameters
-    config = dict(config, gp_solver=solver, jitter=np.array([.004, .008]))
+    config = dict(config, gp_solver=solver, gp_parallel=parallel, jitter=np.array([.004, .008]))
     trace = trace_at(obs, model, config, point)
     expected = gp_marginalized_continuum_log_likelihood(
         prepare_gp_observation(obs), physical, gp_amplitude=.015, gp_scale=.3,
         sigma_constant=.1, sigma_continuum=.03, jitter=config["jitter"],
-        basis=config["basis"], gp_solver=solver)
+        basis=config["basis"], gp_solver=solver, gp_parallel=parallel)
     np.testing.assert_allclose(trace["spectrum"]["fn"].log_factor, expected, atol=1e-11)
     assert trace["gp_amplitude"]["type"] == trace["gp_scale"]["type"] == "deterministic"
     assert {name for name, site in trace.items()
@@ -328,6 +332,8 @@ def test_gp_svi_and_nuts_masked_sampled_hyperparameters(gp_case, solver):
     ({"gp_amplitude": 0.}, ValueError, "gp_amplitude must be finite and positive"),
     ({"gp_scale": np.inf}, ValueError, "gp_scale must be finite and positive"),
     ({"gp_solver": "unknown"}, ValueError, "gp_solver must be"),
+    ({"gp_parallel": "invalid"}, ValueError, "gp_parallel must be"),
+    ({"gp_solver": "direct", "gp_parallel": True}, ValueError, "requires gp_solver"),
 ])
 def test_gp_configuration_errors(gp_case, change, error, message):
     obs, model, config, point, _ = gp_case

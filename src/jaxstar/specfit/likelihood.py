@@ -5,6 +5,7 @@ numerical arrays remain dynamic. tinygp is imported only by GP operations.
 """
 
 from dataclasses import dataclass
+import inspect
 from typing import NamedTuple
 
 import jax
@@ -90,9 +91,18 @@ def prepare_gp_observation(observation):
     return _GPObservation(observation, indices)
 
 
-def _resolve_gp_solver(gp_solver):
+def _validate_gp_options(gp_solver, gp_parallel):
     if gp_solver not in ("auto", "quasisep", "direct"):
         raise ValueError("gp_solver must be 'auto', 'quasisep' or 'direct'")
+    if not (isinstance(gp_parallel, bool)
+            or isinstance(gp_parallel, str) and gp_parallel == "auto"):
+        raise ValueError("gp_parallel must be False, True or 'auto' (a static option)")
+    if gp_solver == "direct" and gp_parallel is True:
+        raise ValueError("gp_parallel=True requires gp_solver='auto' or 'quasisep'")
+
+
+def _resolve_gp_solver(gp_solver):
+    _validate_gp_options(gp_solver, False)
     if gp_solver == "auto":
         platform = jax.default_backend()
         if platform == "cpu":
@@ -101,6 +111,36 @@ def _resolve_gp_solver(gp_solver):
             return "direct"
         raise ValueError("auto GP solver supports CPU/GPU; select an explicit gp_solver")
     return gp_solver
+
+
+def _import_tinygp():
+    try:
+        import tinygp
+    except ImportError as exc:
+        raise ImportError("GP functions require tinygp; install jaxstar with its dependencies") from exc
+    return tinygp
+
+
+def _supports_parallel_gp():
+    """Check the installed solver API in Python, never using traced arrays."""
+    parameter = inspect.signature(_import_tinygp().solvers.QuasisepSolver).parameters.get("parallel")
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+
+
+def _resolve_gp_options(gp_solver, gp_parallel):
+    _validate_gp_options(gp_solver, gp_parallel)
+    if gp_parallel is True:
+        if not _supports_parallel_gp():
+            raise ValueError("gp_parallel=True requires a tinygp QuasisepSolver with "
+                             "a parallel argument; use a supporting tinygp version "
+                             "or set gp_parallel=False/'auto'")
+        return "quasisep", True
+    if (gp_parallel == "auto" and gp_solver != "direct"
+            and jax.default_backend() in ("gpu", "cuda", "rocm")
+            and _supports_parallel_gp()):
+        return "quasisep", True
+    return _resolve_gp_solver(gp_solver), False
 
 
 def _positive_scalar(value, name):
@@ -112,7 +152,7 @@ def _positive_scalar(value, name):
 
 
 def _gp_setup(observation, model_flux, gp_amplitude, gp_scale, jitter, gp_solver,
-              *, dtype_values=()):
+              gp_parallel, *, dtype_values=()):
     prepared = prepare_gp_observation(observation)
     obs = prepared.observation
     flux = _real_array(model_flux, "model_flux")
@@ -130,15 +170,13 @@ def _gp_setup(observation, model_flux, gp_amplitude, gp_scale, jitter, gp_solver
         raise ValueError("tinygp 0.3 float32 calculations require x64 disabled; "
                          "use float64 inputs or disable x64 in the caller")
     return (prepared, jnp.atleast_2d(flux.astype(dtype)), amplitude.astype(dtype),
-            scale.astype(dtype), jitter.astype(dtype), dtype, _resolve_gp_solver(gp_solver))
+            scale.astype(dtype), jitter.astype(dtype), dtype,
+            *_resolve_gp_options(gp_solver, gp_parallel))
 
 
-def _region_gp(obs, region, indices, amplitude, scale, jitter, dtype, solver):
+def _region_gp(obs, region, indices, amplitude, scale, jitter, dtype, solver, parallel=False):
     # Import lazily so iid calculations do not load the GP implementation.
-    try:
-        import tinygp
-    except ImportError as exc:
-        raise ImportError("GP functions require tinygp; install jaxstar with its dependencies") from exc
+    tinygp = _import_tinygp()
     index = jnp.asarray(indices, dtype=jnp.int32)
     wave = jnp.atleast_2d(jnp.asarray(obs.wavelength, dtype=dtype))
     origin = wave[region, 0]
@@ -149,6 +187,9 @@ def _region_gp(obs, region, indices, amplitude, scale, jitter, dtype, solver):
     if solver == "quasisep":
         kernel = tinygp.kernels.quasisep.Matern32(sigma=amplitude, scale=scale)
         kwargs = {"solver": tinygp.solvers.QuasisepSolver, "assume_sorted": True}
+        # Omit the keyword entirely for older tinygp versions.
+        if parallel:
+            kwargs["parallel"] = True
     else:
         # Dense quasisep evaluation can overflow an unused jnp.where branch,
         # giving NaN gradients even when the covariance is finite.
@@ -167,7 +208,8 @@ class _GPContinuumSystem(NamedTuple):
 
 
 def _gp_continuum_systems(observation, model_flux, gp_amplitude, gp_scale,
-                          sigma_constant, sigma_continuum, degree, basis, jitter, gp_solver):
+                          sigma_constant, sigma_continuum, degree, basis, jitter, gp_solver,
+                          gp_parallel):
     prepared = prepare_gp_observation(observation)
     obs = prepared.observation
     degree = _degree(degree)
@@ -176,8 +218,8 @@ def _gp_continuum_systems(observation, model_flux, gp_amplitude, gp_scale,
         raise ValueError("basis shape must be Observation.shape + (degree + 1,)")
     constant = _real_array(sigma_constant, "sigma_constant")
     continuum = _real_array(sigma_continuum, "sigma_continuum")
-    prepared, flux, amplitude, scale, jitters, dtype, solver = _gp_setup(
-        prepared, model_flux, gp_amplitude, gp_scale, jitter, gp_solver,
+    prepared, flux, amplitude, scale, jitters, dtype, solver, parallel = _gp_setup(
+        prepared, model_flux, gp_amplitude, gp_scale, jitter, gp_solver, gp_parallel,
         dtype_values=(basis, constant, continuum))
     prior = continuum_prior(sigma_constant=constant.astype(dtype),
                             sigma_continuum=continuum.astype(dtype), degree=degree,
@@ -190,7 +232,7 @@ def _gp_continuum_systems(observation, model_flux, gp_amplitude, gp_scale,
             systems.append(None)
             continue
         gp, y, index, _ = _region_gp(obs, region, indices, amplitude, scale,
-                                    jitters[region], dtype, solver)
+                                    jitters[region], dtype, solver, parallel)
         f = flux[region, index]
         _require(jnp.all(jnp.isfinite(f)), "model_flux must be finite on usable pixels")
         design = f[:, None] * basis[region, index]
@@ -209,7 +251,8 @@ def _gp_continuum_systems(observation, model_flux, gp_amplitude, gp_scale,
 
 def gp_marginalized_continuum_log_likelihood(
         observation, model_flux, *, gp_amplitude, gp_scale, sigma_constant,
-        sigma_continuum, degree=4, basis=None, jitter=0.0, gp_solver="auto"):
+        sigma_continuum, degree=4, basis=None, jitter=0.0, gp_solver="auto",
+        gp_parallel=False):
     """Normalized Matérn-3/2 density with Gaussian continuum integrated out.
 
     k(d)=gp_amplitude**2*(1+sqrt(3)*d/gp_scale)*exp(-sqrt(3)*d/gp_scale).
@@ -226,13 +269,17 @@ def gp_marginalized_continuum_log_likelihood(
     Fully masked regions contribute exactly zero.
 
     gp_solver is static: auto selects Quasisep on JAX's default CPU backend,
-    Direct on GPU. This is a workload-based benchmark heuristic; an explicit
-    override is allowed. Solver choice does not change the statistical model.
-    Direct can require much more memory. See prepare_gp_observation for JIT.
+    Direct on GPU by default (gp_parallel=False). gp_parallel=True requires a
+    supporting tinygp and selects parallel Quasisep; explicit Direct conflicts.
+    Opt-in gp_parallel="auto" selects parallel Quasisep on the default GPU
+    backend if supported, otherwise retains the usual solver policy. Explicit
+    Direct/Quasisep choices are respected. These options are static under JIT
+    and do not change the statistical model. Direct can require much more
+    memory. See prepare_gp_observation for JIT.
     """
     _, prior, systems = _gp_continuum_systems(
         observation, model_flux, gp_amplitude, gp_scale, sigma_constant,
-        sigma_continuum, degree, basis, jitter, gp_solver)
+        sigma_continuum, degree, basis, jitter, gp_solver, gp_parallel)
     total = jnp.zeros((), dtype=prior.scale.dtype)
     for system in systems:
         if system is None:
@@ -247,7 +294,8 @@ def gp_marginalized_continuum_log_likelihood(
 
 def gp_continuum_posterior(
         observation, model_flux, *, gp_amplitude, gp_scale, sigma_constant,
-        sigma_continuum, degree=4, basis=None, jitter=0.0, gp_solver="auto"):
+        sigma_continuum, degree=4, basis=None, jitter=0.0, gp_solver="auto",
+        gp_parallel=False):
     """Conditional continuum coefficients under the same GP covariance.
 
     Returns ContinuumPosterior(mean, covariance) with the same shapes and prior
@@ -255,10 +303,11 @@ def gp_continuum_posterior(
     small Cholesky system. A fully masked region returns its continuum prior.
     At fixed parameters, use apply_continuum with this mean, then condition the
     GP on residuals relative to that modified spectrum with gp_conditional_mean.
+    gp_solver/gp_parallel follow gp_marginalized_continuum_log_likelihood.
     """
     obs, prior, systems = _gp_continuum_systems(
         observation, model_flux, gp_amplitude, gp_scale, sigma_constant,
-        sigma_continuum, degree, basis, jitter, gp_solver)
+        sigma_continuum, degree, basis, jitter, gp_solver, gp_parallel)
     means, covariances = [], []
     identity = jnp.eye(degree + 1, dtype=prior.scale.dtype)
     for region, system in enumerate(systems):
@@ -277,7 +326,7 @@ def gp_continuum_posterior(
 
 
 def gp_conditional_mean(observation, model_flux, *, gp_amplitude, gp_scale,
-                        jitter=0.0, wavelength=None, gp_solver="auto"):
+                        jitter=0.0, wavelength=None, gp_solver="auto", gp_parallel=False):
     """Latent residual GP mean at one explicit nonlinear/continuum point.
 
     model_flux is the deterministic data-space mean on the full observation
@@ -292,9 +341,12 @@ def gp_conditional_mean(observation, model_flux, *, gp_amplitude, gp_scale,
     decomposition of the linear-Gaussian continuum + GP at fixed parameters.
     It returns no predictive variance or continuum/GP uncertainty propagation,
     and performs no averaging over nonlinear posterior samples.
+    gp_solver/gp_parallel follow gp_marginalized_continuum_log_likelihood.
+    Parallel mode covers factorization and solves; the kernel cross-coordinate
+    product below uses tinygp's default implementation.
     """
-    prepared, flux, amplitude, scale, jitters, dtype, solver = _gp_setup(
-        observation, model_flux, gp_amplitude, gp_scale, jitter, gp_solver)
+    prepared, flux, amplitude, scale, jitters, dtype, solver, parallel = _gp_setup(
+        observation, model_flux, gp_amplitude, gp_scale, jitter, gp_solver, gp_parallel)
     obs = prepared.observation
     wave = _real_array(obs.wavelength if wavelength is None else wavelength, "wavelength")
     if wave.ndim != obs.ndim or wave.shape[:-1] != obs.shape[:-1] or wave.shape[-1] == 0:
@@ -309,7 +361,7 @@ def gp_conditional_mean(observation, model_flux, *, gp_amplitude, gp_scale,
             predictions.append(jnp.zeros_like(wave[region]))
             continue
         gp, y, index, origin = _region_gp(obs, region, indices, amplitude, scale,
-                                         jitters[region], dtype, solver)
+                                         jitters[region], dtype, solver, parallel)
         f = flux[region, index]
         _require(jnp.all(jnp.isfinite(f)), "model_flux must be finite on usable pixels")
         residual = y - f

@@ -1028,6 +1028,63 @@ The standard installation includes the GP and plotting dependencies;
 see [installation](../README.md#installation). For GP continuum reconstruction,
 use `gp_continuum_posterior` and `gp_conditional_mean` with the fitted GP settings.
 
+#### Experimental parallel GP solver
+
+`make_model_single`, `model_single`, and the three low-level GP helpers accept
+the static option `gp_parallel=False`, `True`, or `"auto"`. This changes the
+numerical solver, preserving the Matérn-3/2 covariance, observation noise,
+masking, and analytic continuum marginalization.
+
+The default `False` preserves existing behavior: `gp_solver="auto"` uses
+sequential Quasisep on CPU and Direct on GPU. Set `gp_parallel="auto"` to opt
+into parallel Quasisep on GPU when the installed tinygp supports it:
+
+```python
+model = make_model_single(
+    sf, resolving_power=70000., gp_solver="auto", gp_parallel="auto",
+)
+```
+
+| `gp_solver` | `gp_parallel` | Behavior |
+| --- | --- | --- |
+| `"auto"` | `False` (default) | Sequential Quasisep on CPU; Direct on GPU |
+| `"auto"` | `"auto"` | Parallel Quasisep on a supported GPU; otherwise the default policy |
+| `"quasisep"` | `"auto"` | Parallel on a supported GPU; sequential otherwise |
+| `"direct"` | `False` or `"auto"` | Always Direct |
+| `"auto"` or `"quasisep"` | `True` | Require parallel Quasisep, including on CPU |
+
+Support is detected from the installed `QuasisepSolver` signature, not its
+version number. Explicit `True` raises a setup error if tinygp is unsupported
+or `gp_solver="direct"`; numerical errors are never silently retried using a
+different solver. Detection and selection use Python at setup/tracing time
+and JAX's default backend. If running on a different device/backend, choose
+the solver and parallel setting explicitly. Keep these options static in JIT.
+
+Configured-model reconstruction retains `gp_parallel`. Low-level callers
+should pass the same settings to `gp_continuum_posterior` and
+`gp_conditional_mean`. Parallel mode covers the GP factorization and triangular
+solves; the final cross-coordinate kernel product in GP-mean reconstruction
+still uses tinygp's default implementation.
+
+Parallel mode is experimental and is not enabled by default. Compare
+likelihood **and gradients**, including continuum marginalization, at the
+pixel counts and precision used for inference. The standalone
+[GP benchmark](../benchmarks/benchmark_gp_likelihood.py) compares Direct,
+sequential Quasisep, and parallel Quasisep without running sampling:
+
+```bash
+JAX_PLATFORMS=cuda PYTHONPATH=src python benchmarks/benchmark_gp_likelihood.py \
+    --pixels 2048 --regions 2 --dtype float64 --require-parallel \
+    --json-out benchmark-results/gp-parallel/gpu-f64.json
+```
+
+Use a tinygp build exposing `parallel` and record its exact source revision
+with `--tinygp-revision <commit>` when testing a development build. The
+benchmark separates compilation from synchronized warm calls and reports
+compiler buffer estimates, not measured peak GPU memory. It uses synthetic
+spectra with a simple differentiable line model, not the full stellar forward
+model or an end-to-end NUTS run.
+
 ## Notebooks
 
 - [Coelho workflow](../examples/specfit/coelho.ipynb) demonstrates the basic

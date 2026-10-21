@@ -105,6 +105,31 @@ def test_gp_defaults_reconstruct_and_finite_density_gradient(single):
     assert all(np.isfinite(g).all() for g in jax.tree_util.tree_leaves(gradient))
 
 
+def test_parallel_setting_reaches_inference_and_reconstruction(monkeypatch):
+    from jaxstar.specfit import numpyro_model, reconstruction
+    calls = []
+    def capture(module, name):
+        original = getattr(module, name)
+        def wrapper(*args, **kwargs):
+            calls.append((name, kwargs["gp_parallel"]))
+            return original(*args, **kwargs)
+        monkeypatch.setattr(module, name, wrapper)
+    capture(numpyro_model, "gp_marginalized_continuum_log_likelihood")
+    capture(reconstruction, "gp_continuum_posterior")
+    capture(reconstruction, "gp_conditional_mean")
+    fit = make_fit(single=True)
+    model = make_model_single(fit, resolving_power=70000., gp_parallel="auto")
+    assert model.settings["gp_parallel"] == "auto"
+    result = trace(fit, model)
+    point = {name: site["value"] for name, site in result.items()
+             if site["type"] == "sample" and not site["is_observed"]}
+    prediction = fit.predict(point=point, model=model)
+    assert np.isfinite(prediction["mean_flux"]).all()
+    assert {name for name, _ in calls} == {
+        "gp_marginalized_continuum_log_likelihood", "gp_continuum_posterior", "gp_conditional_mean"}
+    assert all(option == "auto" for _, option in calls)
+
+
 @pytest.mark.parametrize("width,half_width", [(12., 5.), (20., 10.), (80., 40.)])
 def test_ccf_rv_without_clipping_and_prior_inspection_skips_spectrum(width, half_width):
     fit = make_fit()
