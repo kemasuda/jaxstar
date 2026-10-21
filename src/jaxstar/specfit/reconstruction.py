@@ -58,8 +58,7 @@ def reconstruct_single(obs, specmodel, params, trace, settings):
     This callback is specific to Gaussian, analytically marginalized continuum
     coefficients. A custom likelihood or sampled-continuum model supplies its
     own callback to ConfiguredModel. Settings must already include the model's
-    resolved degree and basis, plus gp_solver when a GP is used. Older settings
-    without gp_parallel retain the sequential/default solver policy.
+    resolved degree and basis, plus gp_solver when a GP is used.
     """
     names = ("sigma_constant", "sigma_continuum", "jitter")
     if not isinstance(params, Mapping) or "components" not in params or not all(name in trace for name in names):
@@ -75,8 +74,7 @@ def reconstruct_single(obs, specmodel, params, trace, settings):
     gp = {name: trace[name]["value"] for name in gp_names if name in trace}
     if gp and len(gp) != 2:
         raise ValueError("reconstruction requires paired gp_amplitude/gp_scale sites")
-    gp_options = dict(gp, gp_solver=settings["gp_solver"],
-                      gp_parallel=settings.get("gp_parallel", False)) if gp else {}
+    gp_options = dict(gp, gp_solver=settings["gp_solver"]) if gp else {}
     post = (gp_continuum_posterior(obs, physical, degree=degree, basis=basis, **noise, **gp_options)
             if gp else continuum_posterior(obs, physical, degree=degree, basis=basis, **noise))
     continuum = evaluate_continuum(basis, post.mean)

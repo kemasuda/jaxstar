@@ -99,25 +99,24 @@ def dense_reference(obs, flux, *, gp_amplitude, gp_scale, jitter,
     return total, mean, cov, gp_mean
 
 
-@pytest.mark.parametrize("solver, parallel", [("quasisep", False), ("direct", False), ("quasisep", True)])
+@pytest.mark.parametrize("solver", ["quasisep", "direct", "quasisep_parallel"])
 @pytest.mark.parametrize("regions", [None, 2])
 @pytest.mark.parametrize("degree", [0, 4])
-def test_dense_joint_likelihood_posterior_and_reconstruction(solver, parallel, regions, degree):
-    if parallel and not likelihood._supports_parallel_gp():
+def test_dense_joint_likelihood_posterior_and_reconstruction(solver, regions, degree):
+    if solver == "quasisep_parallel" and not likelihood._supports_parallel_gp():
         pytest.skip("installed tinygp does not support parallel Quasisep")
     obs, flux = problem(regions)
-    opts = dict(OPTIONS, degree=degree, gp_solver=solver, gp_parallel=parallel)
+    opts = dict(OPTIONS, degree=degree, gp_solver=solver)
     if regions is not None:
         opts.update(jitter=[.005, .02], sigma_constant=[.1, .2], sigma_continuum=[.02, .04])
     expected = dense_reference(obs, flux, **{k: v for k, v in opts.items()
-                                           if k not in ("gp_solver", "gp_parallel")})
+                                           if k != "gp_solver"})
     actual = gp_marginalized_continuum_log_likelihood(obs, flux, **opts)
     posterior = gp_continuum_posterior(obs, flux, **opts)
     basis = chebyshev_basis(obs.wavelength, degree)
     mean_flux = apply_continuum(flux, basis, posterior.mean)
     gp_mean = gp_conditional_mean(obs, mean_flux, gp_amplitude=opts["gp_amplitude"],
-                                 gp_scale=opts["gp_scale"], jitter=opts["jitter"], gp_solver=solver,
-                                 gp_parallel=parallel)
+                                 gp_scale=opts["gp_scale"], jitter=opts["jitter"], gp_solver=solver)
     for value, reference in zip((actual, posterior.mean, posterior.covariance, gp_mean), expected):
         np.testing.assert_allclose(value, reference, rtol=2e-11, atol=2e-11)
     assert np.all(np.isfinite(gp_mean))  # Includes predictions at masked pixels.
@@ -142,13 +141,13 @@ def test_solvers_jit_dynamic_data_dtype_and_all_gradients(dtype, regions, x64_co
         prepared = prepare_gp_observation(obs)
         results = []
         before = jax.config.x64_enabled
-        modes = [("quasisep", False), ("direct", False)]
+        modes = ["quasisep", "direct"]
         if likelihood._supports_parallel_gp():
-            modes.append(("quasisep", True))
-        for solver, parallel in modes:
+            modes.append("quasisep_parallel")
+        for solver in modes:
             fn = lambda data, f, a, l, s0, sc, j: gp_marginalized_continuum_log_likelihood(
                 data, f, gp_amplitude=a, gp_scale=l, sigma_constant=s0,
-                sigma_continuum=sc, jitter=j, gp_solver=solver, gp_parallel=parallel)
+                sigma_continuum=sc, jitter=j, gp_solver=solver)
             args = (prepared, flux, .025, .55, .1, .03, .009)
             result = jax.jit(jax.value_and_grad(fn, argnums=(1, 2, 3, 4, 5, 6)))(*args)
             value, gradients = result
@@ -158,11 +157,11 @@ def test_solvers_jit_dynamic_data_dtype_and_all_gradients(dtype, regions, x64_co
             tolerance = dict(rtol=2e-4, atol=2e-4) if dtype == np.float32 else dict(rtol=2e-11, atol=2e-11)
             np.testing.assert_allclose(value, fn(*args), **tolerance)
             post = jax.jit(lambda data, f: gp_continuum_posterior(
-                data, f, gp_solver=solver, gp_parallel=parallel, **OPTIONS))(prepared, flux)
+                data, f, gp_solver=solver, **OPTIONS))(prepared, flux)
             assert post.mean.dtype == dtype and post.covariance.dtype == dtype
             prediction = jax.jit(lambda data, f: gp_conditional_mean(
                 data, f, gp_amplitude=.025, gp_scale=.55, jitter=.009,
-                gp_solver=solver, gp_parallel=parallel))(prepared, flux)
+                gp_solver=solver))(prepared, flux)
             assert prediction.dtype == dtype and np.all(np.isfinite(prediction))
             results.append((result, post, prediction))
         tolerance = dict(rtol=5e-4, atol=2e-3) if dtype == np.float32 else dict(rtol=3e-10, atol=3e-10)
@@ -183,15 +182,15 @@ def test_long_range_short_scale_likelihood_gradients(dtype, x64_context):
         obs = prepare_gp_observation(Observation(wave, y, np.full_like(wave, .02)))
         flux = jnp.ones_like(jnp.asarray(wave))
         results = []
-        modes = [("quasisep", False), ("direct", False)]
+        modes = ["quasisep", "direct"]
         if likelihood._supports_parallel_gp():
-            modes.append(("quasisep", True))
-        for solver, parallel in modes:
+            modes.append("quasisep_parallel")
+        for solver in modes:
             def fn(data, f, amplitude, scale):
                 return gp_marginalized_continuum_log_likelihood(
                     data, f, gp_amplitude=amplitude, gp_scale=scale,
                     sigma_constant=.1, sigma_continuum=.03, jitter=.009,
-                    gp_solver=solver, gp_parallel=parallel)
+                    gp_solver=solver)
             value, gradients = jax.jit(jax.value_and_grad(fn, argnums=(2, 3)))(
                 obs, flux, jnp.asarray(.025, dtype=dtype), jnp.asarray(.2, dtype=dtype))
             assert np.isfinite(value)
@@ -349,36 +348,37 @@ def test_fixed_mask_setup_is_required_for_dynamic_observation_and_rebuild():
     np.testing.assert_allclose(fn(rebuilt, flux), dense_reference(changed, flux, **OPTIONS)[0], atol=1e-11)
 
 
-@pytest.mark.parametrize("platform, expected", [("cpu", "quasisep"), ("gpu", "direct"), ("rocm", "direct")])
-def test_auto_solver_policy_and_actual_classes(monkeypatch, platform, expected):
+@pytest.mark.parametrize("platform", ["cpu", "gpu", "cuda", "rocm"])
+def test_auto_solver_policy_and_actual_classes(monkeypatch, platform):
     import tinygp
+    supported = likelihood._supports_parallel_gp()
+    expected = "quasisep" if platform == "cpu" else (
+        "quasisep_parallel" if supported else "direct")
     monkeypatch.setattr(jax, "default_backend", lambda: platform)
     assert likelihood._resolve_gp_solver("auto") == expected
     obs, _ = problem()
     gp, *_ = likelihood._region_gp(obs, 0, tuple(np.flatnonzero(obs.valid)), .025, .55, .009, jnp.float64, expected)
-    cls = tinygp.solvers.QuasisepSolver if expected == "quasisep" else tinygp.solvers.DirectSolver
+    cls = tinygp.solvers.DirectSolver if expected == "direct" else tinygp.solvers.QuasisepSolver
     assert isinstance(gp.solver, cls)
+    if supported and expected != "direct":
+        assert gp.solver.parallel is (expected == "quasisep_parallel")
 
 
-@pytest.mark.parametrize("platform, supported, solver, parallel, expected", [
-    ("cpu", True, "auto", "auto", ("quasisep", False)),
-    ("cpu", False, "auto", "auto", ("quasisep", False)),
-    ("gpu", True, "auto", "auto", ("quasisep", True)),
-    ("cuda", True, "auto", "auto", ("quasisep", True)),
-    ("rocm", True, "auto", "auto", ("quasisep", True)),
-    ("gpu", False, "auto", "auto", ("direct", False)),
-    ("gpu", True, "auto", False, ("direct", False)),
-    ("cpu", True, "auto", True, ("quasisep", True)),
-    ("gpu", True, "auto", True, ("quasisep", True)),
-    ("gpu", True, "direct", "auto", ("direct", False)),
-    ("gpu", False, "quasisep", "auto", ("quasisep", False)),
-    ("gpu", True, "quasisep", "auto", ("quasisep", True)),
-    ("gpu", True, "quasisep", False, ("quasisep", False)),
-])
-def test_parallel_solver_policy(monkeypatch, platform, supported, solver, parallel, expected):
+@pytest.mark.parametrize("platform", ["cpu", "gpu", "cuda", "rocm"])
+@pytest.mark.parametrize("supported", [False, True])
+@pytest.mark.parametrize("solver", ["auto", "direct", "quasisep", "quasisep_parallel"])
+def test_parallel_solver_policy(monkeypatch, platform, supported, solver):
     monkeypatch.setattr(jax, "default_backend", lambda: platform)
     monkeypatch.setattr(likelihood, "_supports_parallel_gp", lambda: supported)
-    assert likelihood._resolve_gp_options(solver, parallel) == expected
+    if solver == "quasisep_parallel" and not supported:
+        with pytest.raises(ValueError, match="requires a tinygp QuasisepSolver"):
+            likelihood._resolve_gp_solver(solver)
+    else:
+        expected = solver
+        if solver == "auto":
+            expected = "quasisep" if platform == "cpu" else (
+                "quasisep_parallel" if supported else "direct")
+        assert likelihood._resolve_gp_solver(solver) == expected
 
 
 def test_parallel_capability_uses_signature_not_version(monkeypatch):
@@ -395,25 +395,25 @@ def test_parallel_capability_uses_signature_not_version(monkeypatch):
         assert likelihood._supports_parallel_gp() is supported
 
 
-@pytest.mark.parametrize("parallel", [None, "yes", 1, [], np.array(True)])
-def test_parallel_static_option_validation(parallel):
+@pytest.mark.parametrize("solver", [None, "yes", 1, [], np.array(["auto", "direct"])])
+def test_solver_static_option_validation(solver):
     obs, flux = problem()
-    with pytest.raises(ValueError, match="gp_parallel must be"):
-        gp_marginalized_continuum_log_likelihood(obs, flux, gp_parallel=parallel, **OPTIONS)
+    with pytest.raises(ValueError, match="gp_solver must be"):
+        gp_marginalized_continuum_log_likelihood(obs, flux, gp_solver=solver, **OPTIONS)
 
 
-def test_parallel_unavailable_and_conflicting_requests(monkeypatch):
+def test_parallel_unavailable_explicit_request(monkeypatch):
     monkeypatch.setattr(likelihood, "_supports_parallel_gp", lambda: False)
     obs, flux = problem()
     with pytest.raises(ValueError, match="requires a tinygp QuasisepSolver"):
-        gp_marginalized_continuum_log_likelihood(obs, flux, gp_parallel=True, **OPTIONS)
-    with pytest.raises(ValueError, match="requires gp_solver"):
         gp_marginalized_continuum_log_likelihood(
-            obs, flux, gp_solver="direct", gp_parallel=True, **OPTIONS)
+            obs, flux, gp_solver="quasisep_parallel", **OPTIONS)
 
 
-def test_parallel_failure_is_not_silently_retried(monkeypatch):
+@pytest.mark.parametrize("solver", ["auto", "quasisep_parallel"])
+def test_parallel_failure_is_not_silently_retried(monkeypatch, solver):
     import tinygp
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
     monkeypatch.setattr(likelihood, "_supports_parallel_gp", lambda: True)
     calls = []
     def failed(*args, **kwargs):
@@ -422,7 +422,7 @@ def test_parallel_failure_is_not_silently_retried(monkeypatch):
     monkeypatch.setattr(tinygp, "GaussianProcess", failed)
     obs, flux = problem()
     with pytest.raises(RuntimeError, match="parallel factorization failed"):
-        gp_marginalized_continuum_log_likelihood(obs, flux, gp_parallel=True, **OPTIONS)
+        gp_marginalized_continuum_log_likelihood(obs, flux, gp_solver=solver, **OPTIONS)
     assert len(calls) == 1 and calls[0]["parallel"] is True
 
 
@@ -438,12 +438,12 @@ def test_parallel_short_and_empty_regions(usable):
     obs = Observation(original.wavelength, np.nan_to_num(original.flux, nan=1.),
                       np.full(original.shape, .02), mask)
     expected = dense_reference(obs, flux, **OPTIONS)
-    options = dict(OPTIONS, gp_solver="quasisep", gp_parallel=True)
+    options = dict(OPTIONS, gp_solver="quasisep_parallel")
     value = gp_marginalized_continuum_log_likelihood(obs, flux, **options)
     post = gp_continuum_posterior(obs, flux, **options)
     baseline = apply_continuum(flux, chebyshev_basis(obs.wavelength, 4), post.mean)
     prediction = gp_conditional_mean(obs, baseline, gp_amplitude=.025, gp_scale=.55,
-                                     jitter=.009, gp_solver="quasisep", gp_parallel=True)
+                                     jitter=.009, gp_solver="quasisep_parallel")
     for actual, reference in zip((value, post.mean, post.covariance, prediction), expected):
         np.testing.assert_allclose(actual, reference, atol=2e-11, rtol=2e-11)
 

@@ -71,9 +71,9 @@ def run(args):
     }
     reference = None
     tolerance = 2e-3 if args.dtype == "float32" else 1e-8
-    for name, solver, parallel in (("sequential", "quasisep", False),
-                                   ("direct", "direct", False),
-                                   ("parallel", "quasisep", True)):
+    for name, solver in (("sequential", "quasisep"),
+                         ("direct", "direct"),
+                         ("parallel", "quasisep_parallel")):
         if name == "parallel" and not supported:
             report["results"][name] = {"skipped": "tinygp does not support parallel Quasisep"}
             continue
@@ -84,7 +84,7 @@ def run(args):
                 data, line_model(theta, coordinate), basis=basis, degree=args.degree,
                 gp_amplitude=amplitude, gp_scale=scale, jitter=jitter,
                 sigma_constant=constant, sigma_continuum=continuum,
-                gp_solver=solver, gp_parallel=parallel)
+                gp_solver=solver)
 
         timing, memory, result = measure(jax.value_and_grad(objective), inputs,
                                           rounds=args.rounds, warmup=3)
