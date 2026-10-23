@@ -105,6 +105,25 @@ def test_gp_defaults_reconstruct_and_finite_density_gradient(single):
     assert all(np.isfinite(g).all() for g in jax.tree_util.tree_leaves(gradient))
 
 
+def test_vecchia_configured_model_likelihood_and_reconstruction_boundary():
+    from jaxstar.specfit import gp_marginalized_continuum_log_likelihood
+    fit = make_fit(single=True)
+    model = make_model_single(fit, resolving_power=70000., degree=2, gp_solver="vecchia1")
+    result = trace(fit, model)
+    params = handlers.seed(model, 0)(fit.fit_observation(), fit.specmodel)
+    flux = fit.specmodel(params, fit.observation.wavelength)
+    options = {name: result[name]["value"] for name in
+               ("gp_amplitude", "gp_scale", "jitter", "sigma_constant", "sigma_continuum")}
+    expected = gp_marginalized_continuum_log_likelihood(
+        fit.fit_observation(), flux, degree=2, gp_solver="vecchia1", **options)
+    np.testing.assert_allclose(result["spectrum"]["fn"].log_factor, expected, atol=1e-10)
+    assert model.settings["gp_solver"] == "vecchia1"
+    point = {name: site["value"] for name, site in result.items()
+             if site["type"] == "sample" and not site["is_observed"]}
+    with pytest.raises(ValueError, match="does not define a latent GP conditional mean"):
+        fit.predict(point=point, model=model)
+
+
 @pytest.mark.parametrize("width,half_width", [(12., 5.), (20., 10.), (80., 40.)])
 def test_ccf_rv_without_clipping_and_prior_inspection_skips_spectrum(width, half_width):
     fit = make_fit()

@@ -1,7 +1,7 @@
 """Normalized spectral densities and conditional means at fixed parameters.
 
 GP regions are independent. Exact masking is prepared once outside JIT; large
-numerical arrays remain dynamic. tinygp is imported only by GP operations.
+numerical arrays remain dynamic. Only exact GP operations import tinygp.
 """
 
 from dataclasses import dataclass
@@ -90,9 +90,14 @@ def prepare_gp_observation(observation):
     return _GPObservation(observation, indices)
 
 
+def _validate_gp_solver(gp_solver):
+    if not isinstance(gp_solver, str) or gp_solver not in (
+            "auto", "quasisep", "direct", "vecchia1"):
+        raise ValueError("gp_solver must be 'auto', 'quasisep', 'direct' or 'vecchia1'")
+
+
 def _resolve_gp_solver(gp_solver):
-    if gp_solver not in ("auto", "quasisep", "direct"):
-        raise ValueError("gp_solver must be 'auto', 'quasisep' or 'direct'")
+    _validate_gp_solver(gp_solver)
     if gp_solver == "auto":
         platform = jax.default_backend()
         if platform == "cpu":
@@ -121,24 +126,20 @@ def _gp_setup(observation, model_flux, gp_amplitude, gp_scale, jitter, gp_solver
     amplitude = _positive_scalar(gp_amplitude, "gp_amplitude")
     scale = _positive_scalar(gp_scale, "gp_scale")
     jitter = _region_jitter(jitter, obs.n_regions)
+    solver = _resolve_gp_solver(gp_solver)
     dtype = jnp.result_type(flux, obs.wavelength, obs.flux, obs.uncertainty,
                             amplitude, scale, jitter, *dtype_values)
     # tinygp 0.3's NumPy sqrt(3) promotes some state-space arrays to float64
     # in x64 mode, giving an invalid mixed-dtype lax.scan for float32 inputs.
     # Keep precision under caller control rather than changing global config.
-    if dtype == jnp.float32 and jax.config.x64_enabled:
+    if solver != "vecchia1" and dtype == jnp.float32 and jax.config.x64_enabled:
         raise ValueError("tinygp 0.3 float32 calculations require x64 disabled; "
                          "use float64 inputs or disable x64 in the caller")
     return (prepared, jnp.atleast_2d(flux.astype(dtype)), amplitude.astype(dtype),
-            scale.astype(dtype), jitter.astype(dtype), dtype, _resolve_gp_solver(gp_solver))
+            scale.astype(dtype), jitter.astype(dtype), dtype, solver)
 
 
-def _region_gp(obs, region, indices, amplitude, scale, jitter, dtype, solver):
-    # Import lazily so iid calculations do not load the GP implementation.
-    try:
-        import tinygp
-    except ImportError as exc:
-        raise ImportError("GP functions require tinygp; install jaxstar with its dependencies") from exc
+def _region_data(obs, region, indices, dtype):
     index = jnp.asarray(indices, dtype=jnp.int32)
     wave = jnp.atleast_2d(jnp.asarray(obs.wavelength, dtype=dtype))
     origin = wave[region, 0]
@@ -146,6 +147,16 @@ def _region_gp(obs, region, indices, amplitude, scale, jitter, dtype, solver):
     # Gather usable values before any subtraction, squaring or GP operation.
     y = jnp.atleast_2d(jnp.asarray(obs.flux, dtype=dtype))[region, index]
     error = jnp.atleast_2d(jnp.asarray(obs.uncertainty, dtype=dtype))[region, index]
+    return x, y, error, index, origin
+
+
+def _region_gp(obs, region, indices, amplitude, scale, jitter, dtype, solver):
+    # Import lazily so iid/Vecchia calculations do not load tinygp.
+    try:
+        import tinygp
+    except ImportError as exc:
+        raise ImportError("GP functions require tinygp; install jaxstar with its dependencies") from exc
+    x, y, error, index, origin = _region_data(obs, region, indices, dtype)
     if solver == "quasisep":
         kernel = tinygp.kernels.quasisep.Matern32(sigma=amplitude, scale=scale)
         kwargs = {"solver": tinygp.solvers.QuasisepSolver, "assume_sorted": True}
@@ -158,8 +169,43 @@ def _region_gp(obs, region, indices, amplitude, scale, jitter, dtype, solver):
     return gp, y, index, origin
 
 
+def _matern32_log_correlation(t):
+    """Preserve 1-rho**2 at tiny gaps using log(rho)'s small-t series."""
+    # log1p(t)-t = -t**2/2+t**3/3-...; omitted O(t**7) is at
+    # float64 roundoff relative to the leading term for t < 1e-3.
+    small = jnp.minimum(t, 1e-3)
+    series = small**2 * (-.5 + small * (1/3 + small * (-.25 + small * (.2 - small/6))))
+    return jnp.where(t < 1e-3, series, jnp.log1p(t) - t)
+
+
+def _vecchia1_factors(x, error, amplitude, scale, jitter):
+    """Conditional slopes and innovation variances for retained, sorted pixels.
+
+    With A=amplitude**2, D=error**2+jitter**2, V=A+D and
+    rho=(1+t)*exp(-t), b=A*rho/V[:-1]. Evaluate
+    v=D[1:]+A*(D[:-1]+A*(1-rho**2))/V[:-1] as a sum of nonnegative
+    terms, avoiding cancellation in V[1:]-(A*rho)**2/V[:-1]. No floor.
+    log(rho) uses its series near zero to preserve 1-rho**2 at tiny gaps.
+    """
+    a2 = amplitude**2
+    noise = error**2 + jitter**2
+    variance = a2 + noise
+    t = jnp.sqrt(jnp.asarray(3., dtype=x.dtype)) * jnp.diff(x) / scale
+    log_rho = _matern32_log_correlation(t)
+    b = (a2 / variance[:-1]) * jnp.exp(log_rho)
+    conditional = noise[1:] + (a2 / variance[:-1]) * (
+        noise[:-1] + a2 * -jnp.expm1(2 * log_rho))
+    return b, jnp.concatenate((variance[:1], conditional))
+
+
+def _vecchia1_whiten(rhs, b, variance):
+    """Whiten all columns together without a scan or a pixel covariance."""
+    innovations = jnp.concatenate((rhs[:1], rhs[1:] - b[:, None] * rhs[:-1]))
+    return innovations / jnp.sqrt(variance[:, None])
+
+
 class _GPContinuumSystem(NamedTuple):
-    gp: object
+    normalization: object
     scaled: object
     residual: object
     cholesky: object
@@ -189,8 +235,12 @@ def _gp_continuum_systems(observation, model_flux, gp_amplitude, gp_scale,
         if not indices:
             systems.append(None)
             continue
-        gp, y, index, _ = _region_gp(obs, region, indices, amplitude, scale,
-                                    jitters[region], dtype, solver)
+        if solver == "vecchia1":
+            x, y, error, index, _ = _region_data(obs, region, indices, dtype)
+            b, variance = _vecchia1_factors(x, error, amplitude, scale, jitters[region])
+        else:
+            gp, y, index, _ = _region_gp(obs, region, indices, amplitude, scale,
+                                        jitters[region], dtype, solver)
         f = flux[region, index]
         _require(jnp.all(jnp.isfinite(f)), "model_flux must be finite on usable pixels")
         design = f[:, None] * basis[region, index]
@@ -199,18 +249,23 @@ def _gp_continuum_systems(observation, model_flux, gp_amplitude, gp_scale,
         # One solver whitening operation for residual and all prior-scaled
         # design columns. Only H has a dense continuum-space Cholesky here.
         rhs = jnp.concatenate((residual[:, None], columns), axis=1)
-        transformed = gp.solver.solve_triangular(rhs)
+        if solver == "vecchia1":
+            transformed = _vecchia1_whiten(rhs, b, variance)
+            normalization = .5 * (jnp.log(variance).sum() + len(indices) * jnp.log(2 * jnp.pi))
+        else:
+            transformed = gp.solver.solve_triangular(rhs)
+            normalization = gp.solver.normalization()
         r, z = transformed[:, 0], transformed[:, 1:]
         chol = jnp.linalg.cholesky(identity + z.T @ z)
         delta = cho_solve((chol, True), z.T @ r)
-        systems.append(_GPContinuumSystem(gp, z, r, chol, delta))
+        systems.append(_GPContinuumSystem(normalization, z, r, chol, delta))
     return obs, prior, systems
 
 
 def gp_marginalized_continuum_log_likelihood(
         observation, model_flux, *, gp_amplitude, gp_scale, sigma_constant,
         sigma_continuum, degree=4, basis=None, jitter=0.0, gp_solver="auto"):
-    """Normalized Matérn-3/2 density with Gaussian continuum integrated out.
+    """Marginalized Matérn-3/2 density, with an optional k=1 approximation.
 
     k(d)=gp_amplitude**2*(1+sqrt(3)*d/gp_scale)*exp(-sqrt(3)*d/gp_scale).
     Amplitude is a scalar standard deviation in observation flux units; scale
@@ -227,8 +282,21 @@ def gp_marginalized_continuum_log_likelihood(
 
     gp_solver is static: auto selects Quasisep on JAX's default CPU backend,
     Direct on GPU. This is a workload-based benchmark heuristic; an explicit
-    override is allowed. Solver choice does not change the statistical model.
+    override is allowed. These tinygp solvers do not change the statistical model.
     Direct can require much more memory. See prepare_gp_observation for JIT.
+
+    Experimental "vecchia1" approximates the density as p(r[0]) times the
+    product of p(r[i]|r[i-1]), using the diagonal and adjacent entries of the
+    same C, at the actual retained wavelength gaps. It changes the likelihood,
+    not the kernel or error convention. The same bidiagonal whitening acts on
+    residuals and design columns; the continuum integral remains analytic.
+    The normalization is (log(V[0])+sum(log(v[i]))+N*log(2*pi))/2,
+    counted once, plus log|H|/2. Pixel work/storage is linear for fixed degree;
+    only the independent regions are looped over, allowing unequal mask sizes.
+
+    This approximation generally differs from the exact Matérn-3/2 density.
+    It supports gp_continuum_posterior, but defines no latent GP prediction;
+    gp_conditional_mean rejects "vecchia1" explicitly.
     """
     _, prior, systems = _gp_continuum_systems(
         observation, model_flux, gp_amplitude, gp_scale, sigma_constant,
@@ -239,8 +307,8 @@ def gp_marginalized_continuum_log_likelihood(
             continue
         fitted = system.residual - system.scaled @ system.delta
         quadratic = jnp.sum(fitted**2) + jnp.sum(system.delta**2)
-        # tinygp normalization is (log|C| + N*log(2*pi))/2.
-        total -= (.5 * quadratic + system.gp.solver.normalization()
+        # Every whitener includes (log|C| + N*log(2*pi))/2 exactly once.
+        total -= (.5 * quadratic + system.normalization
                   + jnp.log(jnp.diag(system.cholesky)).sum())
     return total
 
@@ -248,13 +316,15 @@ def gp_marginalized_continuum_log_likelihood(
 def gp_continuum_posterior(
         observation, model_flux, *, gp_amplitude, gp_scale, sigma_constant,
         sigma_continuum, degree=4, basis=None, jitter=0.0, gp_solver="auto"):
-    """Conditional continuum coefficients under the same GP covariance.
+    """Conditional continuum coefficients under the selected noise likelihood.
 
     Returns ContinuumPosterior(mean, covariance) with the same shapes and prior
     convention as continuum_posterior. Uses the likelihood's whitening and
     small Cholesky system. A fully masked region returns its continuum prior.
-    At fixed parameters, use apply_continuum with this mean, then condition the
+    For exact solvers, use apply_continuum with this mean, then condition the
     GP on residuals relative to that modified spectrum with gp_conditional_mean.
+    With "vecchia1", this is the continuum posterior under the approximate
+    likelihood; latent GP prediction is not supported.
     """
     obs, prior, systems = _gp_continuum_systems(
         observation, model_flux, gp_amplitude, gp_scale, sigma_constant,
@@ -292,7 +362,14 @@ def gp_conditional_mean(observation, model_flux, *, gp_amplitude, gp_scale,
     decomposition of the linear-Gaussian continuum + GP at fixed parameters.
     It returns no predictive variance or continuum/GP uncertainty propagation,
     and performs no averaging over nonlinear posterior samples.
+
+    "vecchia1" approximates the observed-residual density only and does not
+    define a latent GP conditional mean. It is rejected explicitly; use
+    gp_continuum_posterior for its approximate continuum posterior.
     """
+    if isinstance(gp_solver, str) and gp_solver == "vecchia1":
+        raise ValueError(f"gp_solver={gp_solver!r} does not define a latent GP conditional mean; "
+                         "use gp_continuum_posterior for the approximate continuum posterior")
     prepared, flux, amplitude, scale, jitters, dtype, solver = _gp_setup(
         observation, model_flux, gp_amplitude, gp_scale, jitter, gp_solver)
     obs = prepared.observation

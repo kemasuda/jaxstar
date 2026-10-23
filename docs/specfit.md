@@ -1084,12 +1084,70 @@ The standard installation includes the GP and plotting dependencies;
 see [installation](../README.md#installation). For GP continuum reconstruction,
 use `gp_continuum_posterior` and `gp_conditional_mean` with the fitted GP settings.
 
+### Experimental nearest-neighbor likelihood
+
+Set `gp_solver="vecchia1"` on `make_model_single`, `model_single`, or
+`gp_marginalized_continuum_log_likelihood` to opt into the experimental k=1
+Vecchia approximation. Defaults are unchanged: `auto`, `quasisep`, and `direct`
+still evaluate the exact Matérn-3/2 likelihood with tinygp. For example:
+
+```python
+model = make_model_single(sf, resolving_power=70000., use_gp=True,
+                          gp_solver="vecchia1")
+```
+
+For retained pixels in increasing wavelength order, start from the same
+covariance `C = K_M32 + diag(uncertainty**2 + jitter**2)`. Set
+`V = diag(C)`, `b[i] = C[i,i-1]/V[i-1]`, and
+`v[i] = V[i] - C[i,i-1]**2/V[i-1]`. The approximate density is
+`N(r[0]; 0,V[0]) * product(N(r[i]; b[i]*r[i-1],v[i]))`.
+This uses observed-residual conditionals from the target covariance; it does
+not divide residuals by observational errors or substitute an exponential
+kernel. The induced joint covariance agrees on diagonal/adjacent entries,
+but generally differs at longer separations. Masked pixels are removed first;
+adjacent covariance uses the actual wavelength gap across a mask. The kernel
+parameter `gp_scale` keeps its meaning and units, but its fitted value can
+change with the approximate density.
+
+For the existing multiplicative continuum, `X = model_flux[:,None] * basis`,
+`r = y-X*prior.mean`, and `Z = W*X*diag(prior.scale)`. Apply the same bidiagonal
+whitening `W` to `r` and every design column. The existing small system
+`H = I+Z.T@Z` then integrates the continuum exactly under the approximate
+density. The noise determinant `log(V[0])+sum(log(v[1:]))` and the continuum
+determinant `log|H|` each enter the Gaussian normalization once. A stable
+nonnegative-sum expression for `v` avoids cancellation without a variance floor.
+
+Pixel operations are vectorized and require linear work/storage at fixed
+continuum degree; there is no pixel scan or dense pixel covariance. Independent
+regions retain the existing loop so different retained-pixel counts are allowed.
+Use `prepare_gp_observation` before passing data dynamically through JIT, as
+with the exact GP functions. Amplitude, scale, jitter and model parameters
+remain differentiable.
+
+`gp_continuum_posterior(..., gp_solver="vecchia1")` gives the continuum
+posterior under this approximate likelihood. Latent GP prediction is not
+implemented: `gp_conditional_mean` and the standard `SpecFit.predict`
+reconstruction callback raise explicitly for `vecchia1`. This observed-residual
+approximation does not define a latent GP joint distribution; no prediction
+extension or exact-GP fallback is applied. Continuum-only diagnostics can use
+`gp_continuum_posterior`, as in the notebook below.
+
+The [comparison benchmark](../benchmarks/benchmark_vecchia1.py) measures
+likelihoods and gradients separately, including the analytic continuum
+integral, and can fit both densities to a spectrum drawn from the exact model.
+Validate parameter shifts against an exact solver before using this
+approximation for inference.
+
 ## Notebooks
 
 - [Coelho workflow](../examples/specfit/coelho.ipynb) demonstrates the basic
   workflow with local Coelho grids and an example IRD dataset under
   `examples/specfit/coelho/`. It covers CCF, SVI, outlier masking and refitting,
   NUTS, plots and result saving.
+- [Coelho with Vecchia k=1](../examples/specfit/coelho_vecchia1.ipynb) copies
+  that workflow with the experimental likelihood. It uses GPU float64,
+  sequential NUTS chains, a separate result directory, and a notebook-local
+  continuum-only reconstruction callback for plotting and diagnostics.
 - [SpecModel](tutorials/specfit/specmodel.ipynb) demonstrates the physical
   stages and multiple stellar components. It requires reference data from a
   sibling `jaxspec` checkout; see the notebook's setup instructions.

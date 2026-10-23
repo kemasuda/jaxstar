@@ -14,6 +14,7 @@ import numpyro.distributions as dist
 from .broadening import default_broadening
 from .continuum import _degree
 from .likelihood import (
+    _validate_gp_solver,
     gp_marginalized_continuum_log_likelihood,
     marginalized_continuum_log_likelihood, prepare_gp_observation,
 )
@@ -246,11 +247,17 @@ def model_single(observation, specmodel, *, resolving_power=None,
     flux units, GP scale in wavelength units. All physical/noise sites retain
     their native names; fixed inputs become deterministic sites.
 
+    gp_solver="vecchia1" opts into an experimental likelihood conditioning
+    each observed residual on its preceding retained pixel. It retains local
+    Matérn-3/2 covariances and the analytic continuum integral. Latent GP
+    prediction is not supported with this approximation.
+
     ``prior_only=True`` records parameter sites and returns physical params
     before computing spectra or likelihoods. It supports check_prior. Normal
     evaluation returns the same params after recording the spectrum factor.
     """
     _check_ip_choice(specmodel, resolving_power)
+    _validate_gp_solver(gp_solver)
     fixed = dict(fixed or {})
     empirical_vmic_active = (specmodel.spectra.library == "bosz"
                              if use_empirical_vmic is None else use_empirical_vmic)
@@ -449,6 +456,9 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     vsini_max. ``fixed`` supplies numeric values by native site name, e.g.
     {"logg": 4.4, "vmacro": 0.}. Atmosphere coordinates must be scalar; broadening,
     RV and jitter may be shared or per region. GP hyperparameters are shared.
+    gp_solver="vecchia1" selects the experimental likelihood described in
+    model_single. Continuum posteriors are available, but the standard
+    SpecFit.predict GP reconstruction callback is not supported.
     Resolving power is required, as a positive scalar/region value or a NumPyro
     distribution. Infinity disables the Gaussian instrumental profile. With a
     fixed_ip SpecModel, omit resolving_power; its fixed mixture is used instead.
@@ -477,8 +487,7 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     if not isinstance(use_gp, bool):
         raise TypeError("use_gp must be a bool")
     degree = _degree(degree)
-    if gp_solver not in ("auto", "quasisep", "direct"):
-        raise ValueError("gp_solver must be 'auto', 'quasisep' or 'direct'")
+    _validate_gp_solver(gp_solver)
     for name, value in (("use_physical_logg_max", use_physical_logg_max),
                         ("use_empirical_vmacro", use_empirical_vmacro)):
         if not isinstance(value, bool):
