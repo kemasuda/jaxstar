@@ -932,6 +932,30 @@ def test_plot_uses_model_prediction_and_baseline_residuals(show_gp, posterior):
         fit.plot_models(prediction=prediction, model=model)
 
 
+@pytest.mark.parametrize("posterior", [False, True])
+def test_vecchia_plot_omits_uncomputed_gp_even_when_requested(posterior):
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    fit, config, point = case(single=True)
+    config.update(gp_amplitude=.02, gp_scale=.15, gp_solver="vecchia1")
+    model = configured(fit, config)
+    options = dict(samples={"teff": np.array([5500., 6000.])}) if posterior else dict(point=point)
+    prediction = fit.predict(model=model, **options)
+    assert "gp_mean" not in prediction
+    np.testing.assert_array_equal(prediction["mean_flux"], prediction["model_flux"])
+    [(fig, (upper, lower))] = fit.plot_models(
+        model=model, show_gp=True, show_interval=True, **options)
+    try:
+        labels = [text.get_text() for text in fig.legends[0].get_texts()]
+        assert not any(label.startswith("GP") for label in labels)
+        assert not lower.collections
+        assert len(upper.collections) == int(posterior)
+    finally:
+        plt.close(fig)
+
+
 @pytest.mark.parametrize("show_gp", [False, True])
 @pytest.mark.parametrize("single", [False, True])
 @pytest.mark.parametrize("max_draws,mean,bounds", [

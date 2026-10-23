@@ -130,10 +130,10 @@ def _plot_mixture_outliers(observation, baseline, fit_mask, regions, diagnostics
         upper.set(title=f"Region {region}: Gaussian-mixture outlier check", ylabel="Flux")
         upper.legend(fontsize=8)
         middle.axhline(0., color="C0", lw=.5)
-        middle.fill_between(wave, -scale, scale, color="C0", alpha=.15,
-                             label=r"normal residual scale $\sqrt{V}$")
+        normal_band = middle.fill_between(wave, -scale, scale, color="C0", alpha=.15,
+                                          label=r"normal residual scale $\sqrt{V}$")
         middle.set_ylabel("Physical residual")
-        middle.legend(fontsize=8)
+        middle.legend(handles=[normal_band], fontsize=8)
         threshold_line = lower.axhline(
             diagnostics["p_outlier"], color="C3", ls="--", lw=.8,
             label=f"p_outlier = {diagnostics['p_outlier']:g}")

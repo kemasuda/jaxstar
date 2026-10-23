@@ -107,7 +107,7 @@ is a guide for the rotation prior, not a direct `vsini` measurement.
 ```python
 model = make_model_single(
     sf, resolving_power=np.full(obs.n_regions, 70000.), degree=4,
-    use_gp=True, gp_solver="quasisep", use_physical_logg_max=True,
+    use_gp=True, gp_solver="auto", use_physical_logg_max=True,
     use_empirical_vmic=False, use_empirical_vmacro=False,
 )
 display(model.check_prior())
@@ -600,9 +600,10 @@ refitting after mask changes and for NUTS/prediction.
 | `vsini` | Shared Uniform(0, CCF width), capped at 90% of default kernel support |
 | `vmacro` | Shared Uniform(1, 15) km/s unless an empirical prior is requested |
 | `q1`, `q2` | Shared Uniform(0, 1) each |
-| Continuum | `degree=4`, fixed coefficient scales `0.2/sqrt(3)` and `0.1/sqrt(3)` |
-| Jitter | Shared LogUniform(exp(-10), exp(-3)), in flux units |
-| GP, enabled by default | Shared amplitude LogUniform(exp(-5), exp(-0.5)), in flux units; scale LogUniform(exp(-5), exp(2)), in Angstrom; `gp_solver="auto"` |
+| Continuum | `degree=4`, fixed coefficient scales `0.1` and `0.05` |
+| Jitter | Shared LogUniform(1e-3, 0.05), in normalized flux units |
+| GP amplitude | Shared LogUniform(1e-3, 0.05), in normalized flux units |
+| GP scale | Shared LogUniform from 5 km/s equivalent to region wavelength span / 5; GP enabled by default, `gp_solver="auto"` |
 
 The factory accepts `atmosphere_bounds`, `rv_bounds`, `vsini_max`,
 `vmacro_bounds`, `jitter_bounds`, `gp_amplitude_bounds` and `gp_scale_bounds`.
@@ -615,6 +616,18 @@ region vector or NumPyro distribution; infinity disables Gaussian IP. For a
 `SpecModel` with `fixed_ip`, omit resolving power instead. CCF is
 unnecessary when RV and vsini are both supplied explicitly through bounds or
 fixed values. The continuum/noise defaults assume normalized flux.
+
+With noise bounds omitted (`None`), the factory uses fixed bounds `(1e-3, 0.05)`
+for jitter and GP amplitude, independent of observational errors and masks.
+For each region, the GP scale lower bound is
+`5 * wavelength_midpoint / 299792.458` and the upper bound is its full wavelength
+span divided by five, both in wavelength units (Angstrom). The shared scale
+prior uses the largest lower bound and smallest upper bound across regions.
+These bounds are fixed when the model is created and do not change during
+outlier masking. Explicit bounds override them. If the derived interval is
+empty, supply explicit bounds; fixed parameters and disabled GP do not require
+derived bounds. The data-dependent scale setup belongs to `make_model_single`;
+direct `model_single` calls retain their existing numeric GP scale bounds.
 
 RV priors are not clipped to `sf.rv_bounds`; spectrum evaluation still checks
 coverage. `use_empirical_vmic=None` enables BOSZ's deterministic relation;
@@ -782,11 +795,12 @@ mean when present:
 ```python
 prediction = sf.predict(point=p_fit, model=model)
 model_flux = prediction["model_flux"]  # physical spectrum multiplied by continuum
-gp_mean = prediction["gp_mean"]  # when the model includes a GP
+gp_mean = prediction["gp_mean"]  # when a latent GP mean is reconstructed
 ```
 
 At a parameter point, `model_flux = physical_flux * continuum` and
-`mean_flux = model_flux + gp_mean` (or just `model_flux` without a GP).
+`mean_flux = model_flux + gp_mean` (or just `model_flux` without a GP or with
+`gp_solver="vecchia1"`, which reconstructs the continuum only).
 `continuum` is the multiplicative correction itself.
 
 For posterior draws, pass the dictionary returned by `mcmc.get_samples()` with
@@ -842,6 +856,8 @@ zero line uses C0 to match the continuum model in the upper panel.
 with its own 16th-84th percentile band when using `samples` and
 `show_interval=True`. `show_gp` defaults to
 False and controls display, not the model's GP calculations.
+Vecchia models omit the GP overlay even with `show_gp=True`, because their
+latent GP mean is not reconstructed.
 Masked points are distinguished by default. Set `show_masked=False` to hide
 both observation- and fit-masked data points in the upper and residual panels.
 Model and GP curves/bands still cover all wavelengths.
@@ -1084,12 +1100,81 @@ The standard installation includes the GP and plotting dependencies;
 see [installation](../README.md#installation). For GP continuum reconstruction,
 use `gp_continuum_posterior` and `gp_conditional_mean` with the fitted GP settings.
 
+### Experimental nearest-neighbor likelihood
+
+Set `gp_solver="vecchia1"` on `make_model_single`, `model_single`, or
+`gp_marginalized_continuum_log_likelihood` to opt into the experimental k=1
+Vecchia approximation. Defaults are unchanged: `auto`, `quasisep`, and `direct`
+still evaluate the exact Matérn-3/2 likelihood with tinygp. `auto` selects
+`quasisep` on CPU and `direct` on GPU.
+
+Vecchia provides a fast approximation to the GP likelihood. It can
+provide substantial speedups, especially on GPU; the gain depends on hardware
+and data. To assess its effect on inference, compare posterior estimates and
+uncertainties with `gp_solver="auto"`, keeping the priors and masks identical.
+For example:
+
+```python
+model = make_model_single(sf, resolving_power=70000., use_gp=True,
+                          gp_solver="vecchia1")
+```
+
+For retained pixels in increasing wavelength order, start from the same
+covariance `C = K_M32 + diag(uncertainty**2 + jitter**2)`. Set
+`V = diag(C)`, `b[i] = C[i,i-1]/V[i-1]`, and
+`v[i] = V[i] - C[i,i-1]**2/V[i-1]`. The approximate density is
+`N(r[0]; 0,V[0]) * product(N(r[i]; b[i]*r[i-1],v[i]))`.
+This uses observed-residual conditionals from the target covariance; it does
+not divide residuals by observational errors or substitute an exponential
+kernel. The induced joint covariance agrees on diagonal/adjacent entries,
+but generally differs at longer separations. Masked pixels are removed first;
+adjacent covariance uses the actual wavelength gap across a mask. The kernel
+parameter `gp_scale` keeps its meaning and units, but its fitted value can
+change with the approximate density.
+
+For the existing multiplicative continuum, `X = model_flux[:,None] * basis`,
+`r = y-X*prior.mean`, and `Z = W*X*diag(prior.scale)`. Apply the same bidiagonal
+whitening `W` to `r` and every design column. The existing small system
+`H = I+Z.T@Z` then integrates the continuum exactly under the approximate
+density. The noise determinant `log(V[0])+sum(log(v[1:]))` and the continuum
+determinant `log|H|` each enter the Gaussian normalization once. A stable
+nonnegative-sum expression for `v` avoids cancellation without a variance floor.
+
+Pixel operations are vectorized and require linear work/storage at fixed
+continuum degree; there is no pixel scan or dense pixel covariance. Independent
+regions retain the existing loop so different retained-pixel counts are allowed.
+Use `prepare_gp_observation` before passing data dynamically through JIT, as
+with the exact GP functions. Amplitude, scale, jitter and model parameters
+remain differentiable.
+
+`gp_continuum_posterior(..., gp_solver="vecchia1")` gives the continuum
+posterior under this approximate likelihood. Standard `SpecFit.predict` uses
+that posterior to return `model_flux = physical_flux * continuum` and
+`mean_flux = model_flux`, without a `gp_mean` entry. This means the latent GP
+mean is not reconstructed, rather than estimated to be zero. `plot_models`
+omits its GP overlay, including when `show_gp=True`. Direct calls to
+`gp_conditional_mean` still raise for `vecchia1`; no latent prediction
+extension or exact-GP fallback is applied.
+
+Point predictions also return `normal_residual_variance`, equal to
+`gp_amplitude**2 + uncertainty**2 + jitter**2`. This is the marginal variance `V`, not the
+conditional innovation variance `v`. Standard `mask_outliers` uses it for
+Gaussian-mixture selection without constructing a dense covariance or GP mean.
+The model and variance cover previously fit-masked pixels as well, so those
+pixels can be reconsidered. Continuum coefficients remain analytically
+marginalized in the inference likelihood; the mixture is used only for masking.
+
+The [comparison benchmark](../benchmarks/benchmark_vecchia1.py) measures
+likelihoods and gradients separately, including the analytic continuum
+integral, and can fit both densities to a spectrum drawn from the exact model.
+
 ## Notebooks
 
 - [Coelho workflow](../examples/specfit/coelho.ipynb) demonstrates the basic
   workflow with local Coelho grids and an example IRD dataset under
   `examples/specfit/coelho/`. It covers CCF, SVI, outlier masking and refitting,
-  NUTS, plots and result saving.
+  NUTS, plots and result saving. Set `GP_SOLVER="auto"` (default) for exact GP
+  inference, or `GP_SOLVER="vecchia1"` to try the experimental approximation.
 - [SpecModel](tutorials/specfit/specmodel.ipynb) demonstrates the physical
   stages and multiple stellar components. It requires reference data from a
   sibling `jaxspec` checkout; see the notebook's setup instructions.

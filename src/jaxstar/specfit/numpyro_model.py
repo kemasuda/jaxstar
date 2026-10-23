@@ -14,11 +14,13 @@ import numpyro.distributions as dist
 from .broadening import default_broadening
 from .continuum import _degree
 from .likelihood import (
+    _validate_gp_solver,
     gp_marginalized_continuum_log_likelihood,
     marginalized_continuum_log_likelihood, prepare_gp_observation,
 )
 from .model import SpecModel, _require
 from .observation import Observation
+from .sampling import _C_KMS
 
 
 def physical_logg_max(teff):
@@ -208,9 +210,9 @@ def _check_ip_choice(specmodel, resolving_power):
 def model_single(observation, specmodel, *, resolving_power=None,
                  atmosphere_bounds=None, rv_bounds=None, vsini_max=None,
                  vmacro_bounds=(0., 10.), fixed=None,
-                 sigma_constant=.2 / np.sqrt(3), sigma_continuum=.1 / np.sqrt(3),
-                 jitter_bounds=(np.exp(-10.), np.exp(-3.)),
-                 gp_amplitude_bounds=(np.exp(-5.), np.exp(-.5)),
+                 sigma_constant=0.1, sigma_continuum=0.05,
+                 jitter_bounds=(1e-3, 0.05),
+                 gp_amplitude_bounds=(1e-3, 0.05),
                  gp_scale_bounds=(np.exp(-5.), np.exp(2.)),
                  use_gp=None, gp_solver="auto", use_physical_logg_max=False,
                  use_empirical_vmic=None, use_empirical_vmacro=False,
@@ -246,11 +248,17 @@ def model_single(observation, specmodel, *, resolving_power=None,
     flux units, GP scale in wavelength units. All physical/noise sites retain
     their native names; fixed inputs become deterministic sites.
 
+    gp_solver="vecchia1" opts into an experimental likelihood conditioning
+    each observed residual on its preceding retained pixel. It retains local
+    Matérn-3/2 covariances and the analytic continuum integral. Latent GP
+    prediction is not supported with this approximation.
+
     ``prior_only=True`` records parameter sites and returns physical params
     before computing spectra or likelihoods. It supports check_prior. Normal
     evaluation returns the same params after recording the spectrum factor.
     """
     _check_ip_choice(specmodel, resolving_power)
+    _validate_gp_solver(gp_solver)
     fixed = dict(fixed or {})
     empirical_vmic_active = (specmodel.spectra.library == "bosz"
                              if use_empirical_vmic is None else use_empirical_vmic)
@@ -437,10 +445,9 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
                       degree=4, basis=None, use_gp=True, gp_solver="auto",
                       use_physical_logg_max=False, use_empirical_vmic=None,
                       use_empirical_vmacro=False, vmacro_empirical_sigma=1.,
-                      sigma_constant=.2 / np.sqrt(3), sigma_continuum=.1 / np.sqrt(3),
-                      jitter_bounds=(np.exp(-10.), np.exp(-3.)),
-                      gp_amplitude_bounds=(np.exp(-5.), np.exp(-.5)),
-                      gp_scale_bounds=(np.exp(-5.), np.exp(2.))):
+                      sigma_constant=0.1, sigma_continuum=0.05,
+                      jitter_bounds=None, gp_amplitude_bounds=None,
+                      gp_scale_bounds=None):
     """Prepare a configured single-star model from a SpecFit's grid and CCF.
 
     The factory resolves numeric bounds/settings; model_single defines every
@@ -449,6 +456,10 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     vsini_max. ``fixed`` supplies numeric values by native site name, e.g.
     {"logg": 4.4, "vmacro": 0.}. Atmosphere coordinates must be scalar; broadening,
     RV and jitter may be shared or per region. GP hyperparameters are shared.
+    gp_solver="vecchia1" selects the experimental likelihood described in
+    model_single. SpecFit.predict reconstructs its conditional continuum and
+    returns mean_flux = model_flux, omitting the latent GP mean. Its marginal
+    residual variance is available for the standard mixture outlier masking.
     Resolving power is required, as a positive scalar/region value or a NumPyro
     distribution. Infinity disables the Gaussian instrumental profile. With a
     fixed_ip SpecModel, omit resolving_power; its fixed mixture is used instead.
@@ -459,6 +470,13 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     vsini defaults to the CCF width capped at 90% of default kernel support.
     Explicit vsini_max must fit that support. Bounds and settings are snapshots;
     fit masks are always read anew by SpecFit when inference/reconstruction runs.
+
+    Omitted jitter/amplitude bounds are (1e-3, 0.05) in normalized flux units,
+    independent of observational errors and masks. Omitted GP
+    scale bounds run from 5 km/s at each region's wavelength midpoint to one
+    fifth of its full wavelength span. The shared interval uses the largest
+    lower and smallest upper bound across regions. Explicit bounds override
+    these defaults; fixed parameters and disabled GP need no derived bounds.
 
     With physical logg enabled, the selected Teff bounds are intersected with
     4500--7000 K; fixed Teff must already be in that interval. The resulting
@@ -477,8 +495,7 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     if not isinstance(use_gp, bool):
         raise TypeError("use_gp must be a bool")
     degree = _degree(degree)
-    if gp_solver not in ("auto", "quasisep", "direct"):
-        raise ValueError("gp_solver must be 'auto', 'quasisep' or 'direct'")
+    _validate_gp_solver(gp_solver)
     for name, value in (("use_physical_logg_max", use_physical_logg_max),
                         ("use_empirical_vmacro", use_empirical_vmacro)):
         if not isinstance(value, bool):
@@ -601,18 +618,27 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     vmacro_bounds = _bound_pair(vmacro_bounds, "vmacro_bounds")
     if vmacro_bounds[0] < 0:
         raise ValueError("vmacro_bounds must be nonnegative")
+    noise_bounds = {}
+    for name, value, active in (("jitter", jitter_bounds, True),
+                                ("gp_amplitude", gp_amplitude_bounds, use_gp),
+                                ("gp_scale", gp_scale_bounds, use_gp)):
+        if value is None and active and name not in fixed:
+            if name == "gp_scale":
+                wave = np.atleast_2d(np.asarray(sf.observation.wavelength))
+                center = (wave[:, 0] + wave[:, -1]) / 2
+                value = (np.max(center) * 5. / _C_KMS,
+                         np.min(wave[:, -1] - wave[:, 0]) / 5.)
+            else:
+                value = (1e-3, 0.05)
+        noise_bounds[f"{name}_bounds"] = (None if value is None else
+            _bound_pair(value, f"{name}_bounds", positive=True))
     settings = dict(
         atmosphere_bounds=bounds, rv_bounds=rv_bounds, vsini_max=vsini_max,
         vmacro_bounds=vmacro_bounds, fixed=fixed,
         resolving_power=resolving_power, degree=degree, basis=basis,
         use_gp=use_gp, gp_solver=gp_solver, sigma_constant=sigma_constant,
         sigma_continuum=sigma_continuum,
-        jitter_bounds=_bound_pair(
-            jitter_bounds, "jitter_bounds", positive=True),
-        gp_amplitude_bounds=_bound_pair(
-            gp_amplitude_bounds, "gp_amplitude_bounds", positive=True),
-        gp_scale_bounds=_bound_pair(
-            gp_scale_bounds, "gp_scale_bounds", positive=True),
+        **noise_bounds,
         use_physical_logg_max=use_physical_logg_max, use_empirical_vmic=use_empirical_vmic,
         use_empirical_vmacro=use_empirical_vmacro, vmacro_empirical_sigma=vmacro_empirical_sigma)
     annotations = {
