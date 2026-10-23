@@ -137,7 +137,7 @@ point_figures = sf.plot_models(point=p_fit, model=model, show_gp=True)
 display(pd.DataFrame(sf.residual_diagnostics(point=p_fit, model=model)))
 plt.show()
 
-sf.mask_outliers(point=p_fit, model=model, sigma_threshold=3., plot=True)
+sf.mask_outliers(point=p_fit, model=model, plot=True)
 display(pd.DataFrame(sf.mask_summary()))
 plt.show()
 
@@ -648,13 +648,19 @@ provides the underlying sites and prior draws for more detailed inspection.
 
 ### Outlier plots
 
-For an outlier-specific quicklook, enable plotting when updating the fit mask:
+`mask_outliers` defaults to `method="gaussian_mixture"`, with `p_outlier=0.5`
+and `mask_velocity=10.` km/s. Calls that omit `method` now use mixture masking
+and can produce different masks than earlier versions. To retain the legacy
+median-filter/MAD method, select `method="sigma_clip"` explicitly.
+
+For a legacy sigma-clipping quicklook, enable plotting when updating the fit mask:
 
 ```python
-sf.mask_outliers(point=p_fit, model=model, sigma_threshold=3., plot=True)
+sf.mask_outliers(point=p_fit, model=model, method="sigma_clip",
+                 sigma_threshold=3., plot=True)
 ```
 
-`mask_outliers` calls `predict` once using the current mask, before updating it.
+With `method="sigma_clip"`, `mask_outliers` calls `predict` once using the current mask, before updating it.
 It uses `continuum_flux` as the baseline and the largest component `vsini` for
 the median-filter width; `mask_v` can override that velocity in km/s. Previously
 flagged pixels are reconsidered, so they can return to the sf. Custom model
@@ -686,7 +692,7 @@ figures are left open for notebook display or `plt.show()`.
 To save one file per region, add `save_path`:
 
 ```python
-sf.mask_outliers(point=p_fit, model=model, sigma_threshold=3.,
+sf.mask_outliers(point=p_fit, model=model, method="sigma_clip", sigma_threshold=3.,
                   plot=True, save_path="outliers.pdf")
 ```
 
@@ -695,6 +701,44 @@ filename conventions as `plot_models`. Without an extension, Matplotlib's
 default save format is used. With `plot=False` (the default), `save_path` still
 creates and saves the figures, then closes them; use `plot=True` to keep them
 open as well. Saving uses the diagnostics from the same masking pass.
+
+For the default mixture-based masking after a normal Gaussian/GP fit:
+
+```python
+sf.mask_outliers(point=p_fit, model=model,
+                 p_outlier=0.5, plot=True)  # Configurable; default 0.5
+q = sf.outlier_diagnostics["mismatch_probability"]
+# Refit with the same model and the new fixed fit mask.
+```
+
+The mixture uses `data - continuum_flux`, including the fitted conditional continuum but
+excluding the GP mean. It fits one global fraction `f` and absolute flux scale
+`s` by maximum likelihood with component variances `V` and `V + s**2`.
+`V` is the fitted GP's combined covariance diagonal (kernel, observational
+noise and jitter counted once); without a GP it is observational variance plus
+jitter variance. It is not the conditional GP predictive variance or continuum
+uncertainty. The continuum marginalization and inference likelihood are unchanged.
+
+Pixels with `q > p_outlier` are flagged. For mixture masking, the default
+`mask_velocity=10.` extends each original flagged pixel by ±10 km/s within its
+region, using log-wavelength distances. Overlapping windows are combined
+without recursive extension.
+`mask_velocity=None` uses the legacy `extension_factor`; zero adds no neighbors,
+and `extend_outlier_mask=False` disables extension. `mask_velocity` applies only
+to the mixture method and is separate from the sigma-clipping filter's `mask_v`.
+As with sigma clipping, fixed masked pixels are excluded and previous fit-mask
+pixels are reconsidered. Probabilities are NaN on fixed
+masks. `outlier_diagnostics` also records `mismatch_fraction`, `mismatch_scale`,
+and `normal_residual_variance` from that call. These are conditional
+classification probabilities treating pixels independently, not a replacement
+for the correlated GP fit. `sigma_threshold` and `mask_v` apply only to sigma
+clipping. Mixture plots retain the sigma-clipping layout: data and physical
+model at the top, physical residuals in the middle, and outlier probabilities
+with their threshold at the bottom. The right-hand histogram shows residuals
+divided by `sqrt(V)`, with an `N(0, 1)` reference. Extended flags are highlighted
+throughout; no GP mean or median-filter trend is subtracted.
+Custom model callbacks must supply `normal_residual_variance` alongside
+`continuum_flux`; the built-in model obtains it internally during masking.
 
 ### Mask summary and residual diagnostics
 
@@ -791,7 +835,10 @@ zero line uses C0 to match the continuum model in the upper panel.
 with its own 16th-84th percentile band when using `samples` and
 `show_interval=True`. `show_gp` defaults to
 False and controls display, not the model's GP calculations.
-Masked points are distinguished. Upper y limits include unmasked data and all
+Masked points are distinguished by default. Set `show_masked=False` to hide
+both observation- and fit-masked data points in the upper and residual panels.
+Model and GP curves/bands still cover all wavelengths.
+Upper y limits include unmasked data and all
 finite displayed model and band values, including those at masked pixels. Residual limits
 use unmasked residuals and all finite displayed GP curve/band values.
 Both `point` and `samples` paths require `model`; precomputed prediction

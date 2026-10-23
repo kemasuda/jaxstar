@@ -524,13 +524,13 @@ def test_outliers_model_baseline_replacement_and_fixed_nan():
     model = clipping_model(fit)
     point = {"baseline": baseline}
     # The model's mean_flux absorbs the spike; clipping still uses continuum_flux.
-    flags = fit.mask_outliers(point=point, model=model, extend_outlier_mask=False).copy()
+    flags = fit.mask_outliers(point=point, model=model, method="sigma_clip", extend_outlier_mask=False).copy()
     assert flags[10] and not flags[70]
     # Improved baseline fits the first spike but introduces a second discrepancy.
     improved = np.array(fit.observation.flux, copy=True)
     improved[20] -= .2
     fit.set_fit_mask(flags)
-    fit.mask_outliers(point={"baseline": improved}, model=model, extend_outlier_mask=False)
+    fit.mask_outliers(point={"baseline": improved}, model=model, method="sigma_clip", extend_outlier_mask=False)
     assert fit.fit_mask[20] and not fit.fit_mask[10]
     assert not fit.fit_mask[70]
     fixed = fit.observation.mask.copy()
@@ -562,7 +562,7 @@ def test_outliers_predict_once_before_mask_update_and_plot_same_baseline():
 
     model = ConfiguredModel(model_single, settings=config, reconstruct_fn=reconstruct,
                             observation=fit.observation, specmodel=fit.specmodel)
-    flags = fit.mask_outliers(point=point, model=model, plot=True)
+    flags = fit.mask_outliers(point=point, model=model, method="sigma_clip", plot=True)
     assert len(predicted) == 1
     assert flags[20] and not flags[3]
     fig = plt.gcf()
@@ -584,28 +584,28 @@ def test_extension_exact_runs_and_edges():
     fit, baseline = clipping_case()
     model = clipping_model(fit, include_params=False)
     point = {"baseline": baseline}
-    flags = fit.mask_outliers(point=point, model=model, mask_v=2.)
+    flags = fit.mask_outliers(point=point, model=model, method="sigma_clip", mask_v=2.)
     assert flags[9:12].all()
     with pytest.raises(ValueError, match="mask_v"):
-        fit.mask_outliers(point=point, model=model)
+        fit.mask_outliers(point=point, model=model, method="sigma_clip")
     with pytest.raises(ValueError, match="positive"):
-        fit.mask_outliers(point=point, model=model, mask_v=2., sigma_threshold=0.)
+        fit.mask_outliers(point=point, model=model, method="sigma_clip", mask_v=2., sigma_threshold=0.)
 
 
 def test_masked_filter_poison_and_oversized_kernel():
     fit, baseline = clipping_case()
     point = {"baseline": baseline}
     model = clipping_model(fit)
-    flags = fit.mask_outliers(point=point, model=model, extend_outlier_mask=False).copy()
+    flags = fit.mask_outliers(point=point, model=model, method="sigma_clip", extend_outlier_mask=False).copy()
     finite_flux = np.where(fit.observation.mask, 1e10, fit.observation.flux)
     other = SpecFit(replace(fit.observation, flux=finite_flux), fit.specmodel)
     np.testing.assert_array_equal(other.mask_outliers(point=point, model=clipping_model(other),
-                                                     extend_outlier_mask=False), flags)
-    fit.mask_outliers(point=point, model=model, mask_v=1e6)
+                                                     method="sigma_clip", extend_outlier_mask=False), flags)
+    fit.mask_outliers(point=point, model=model, method="sigma_clip", mask_v=1e6)
     fit.set_fit_mask(np.zeros_like(flags))
     entirely_masked = SpecFit(replace(fit.observation, mask=np.ones_like(flags)), fit.specmodel)
     entirely_masked.mask_outliers(point={"baseline": np.full(flags.shape, np.nan)},
-                                  model=clipping_model(entirely_masked))
+                                  model=clipping_model(entirely_masked), method="sigma_clip")
     assert not entirely_masked.fit_mask.any()
 
 
@@ -632,7 +632,7 @@ def test_outlier_quicklook_matches_clipping_quantities(single, extend, tmp_path)
             np.stack([obs.mask, obs.mask]), region=(8, 9)), multi.specmodel)
         baseline = np.stack([baseline, baseline])
     options = dict(point={"baseline": baseline}, model=clipping_model(fit), sigma_threshold=3.,
-                   extend_outlier_mask=extend)
+                   method="sigma_clip", extend_outlier_mask=extend)
     before = set(plt.get_fignums())
     expected = fit.mask_outliers(**options).copy()
     assert set(plt.get_fignums()) == before  # plotting is opt-in
@@ -691,7 +691,7 @@ def test_outlier_quicklook_matches_clipping_quantities(single, extend, tmp_path)
                                    norm.pdf(normal.get_xdata()) * (~fixed).sum() * (edges[1] - edges[0]))
         median_error = np.median(np.atleast_2d(fit.observation.uncertainty)[i, ~fixed])
         annotation = histogram.texts[0].get_text()
-        assert f"1.4826 × MAD = {scatter:.4g}" in annotation
+        assert f"1.4826 x MAD = {scatter:.4g}" in annotation
         assert f"median(error_obs) = {median_error:.4g}" in annotation
         assert f"ratio = {scatter / median_error:.3f}" in annotation
         plt.close(fig)
@@ -709,7 +709,7 @@ def test_outlier_quicklook_zero_scale_and_empty_region(all_masked, tmp_path):
     mask = np.ones_like(flux, dtype=bool) if all_masked else fit.observation.mask
     fit = SpecFit(replace(fit.observation, flux=flux, mask=mask), fit.specmodel)
     flags = fit.mask_outliers(point={"baseline": baseline}, model=clipping_model(fit),
-                             plot=True, save_path=tmp_path / "outliers.pdf")
+                             method="sigma_clip", plot=True, save_path=tmp_path / "outliers.pdf")
     assert (tmp_path / "outliers_region8.pdf").read_bytes().startswith(b"%PDF")
     fig = plt.gcf()
     lower = fig.axes[2]
@@ -740,7 +740,7 @@ def test_outlier_save_without_display_and_escaped_region(filename, tmp_path):
     region = ("blue/UV",)
     spectra = replace(fit.specmodel.spectra, regions=region)
     fit = SpecFit(replace(fit.observation, region=region), SpecModel(spectra, vmax=30.))
-    options = dict(point={"baseline": baseline}, model=clipping_model(fit))
+    options = dict(point={"baseline": baseline}, model=clipping_model(fit), method="sigma_clip")
     expected = fit.mask_outliers(**options).copy()
     existing = plt.figure()
     before = set(plt.get_fignums())

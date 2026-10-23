@@ -163,7 +163,7 @@ def _plot_outlier_diagnostics(observation, baseline, fit_mask, regions,
                 normal_counts = count_scale * \
                     np.exp(-.5 * normal_x**2) / np.sqrt(2 * np.pi)
                 histogram.plot(normal_x, normal_counts,
-                               color="C0", lw=1.2, label="N(0, 1)")
+                               color="C0", lw=0.8, label="N(0, 1)")
             histogram.set_yscale("log")
             histogram.set_ylim(bottom=.5)
             histogram.axvline(limit, color="C3", ls="--", lw=0.5)
@@ -173,7 +173,7 @@ def _plot_outlier_diagnostics(observation, baseline, fit_mask, regions,
                              borderaxespad=0, frameon=False)
             median_error = np.median(error[usable])
             histogram.text(0, 1.15,
-                           f"1.4826 × MAD = {scatter:.4g}\n"
+                           f"1.4826 x MAD = {scatter:.4g}\n"
                            f"median(error_obs) = {median_error:.4g}\n"
                            f"ratio = {scatter / median_error:.3f}\n"
                            "(scales in flux units)",
@@ -479,9 +479,31 @@ class SpecFit:
 
     def mask_outliers(self, *, point, model, sigma_threshold=5.,
                       extend_outlier_mask=True, extension_factor=1., mask_v=None,
-                      plot=False, save_path=None):
-        """Replace the fit mask using the legacy median-filter/MAD rule.
+                      plot=False, save_path=None, method="gaussian_mixture", p_outlier=.5,
+                      mask_velocity=10.):
+        """Replace the fit mask; default to Gaussian-mixture classification.
 
+        ``method="gaussian_mixture"`` fits one global contamination fraction
+        and extra absolute flux scale to data minus continuum_flux, without
+        subtracting the GP mean or median filtering. The narrow variance is
+        diag(K + observation variance + jitter variance) from the fitted normal
+        model. Pixels with mismatch probability > p_outlier (default .5) are
+        flagged, then extended. sigma_threshold and mask_v
+        apply only to sigma_clip. The inference likelihood is never changed.
+        For mixture masking, mask_velocity (default 10.) sets a fixed half-width
+        in km/s around each original flagged pixel instead of extension_factor,
+        using c * abs(log(wavelength / flagged_wavelength)) <= mask_velocity
+        within each region. Zero adds no neighbors; None keeps the usual rule.
+        extend_outlier_mask=False disables either kind of extension.
+        After a mixture call, ``outlier_diagnostics`` contains
+        mismatch_probability (NaN on fixed masks), mismatch_fraction,
+        mismatch_scale, and normal_residual_variance from that masking pass.
+        These diagnostics are a snapshot, not recomputed when the mask changes.
+        Mixture plots use the same layout, with physical residuals in the middle,
+        probabilities and their threshold at the bottom, and a histogram of
+        residual/sqrt(V) on the right. Final extended flags are highlighted.
+
+        ``method="sigma_clip"`` selects the legacy median-filter/MAD rule below.
         Predict once at ``point`` using ``model`` and the current fit mask,
         before updating the mask. The baseline is prediction['continuum_flux'],
         excluding GP mean. ``mask_v`` is in km/s; absent an override it is the
@@ -506,6 +528,69 @@ class SpecFit:
         leaves figures open for notebook display or ``plt.show()``. Plotting
         defaults to False; the return value is always the updated fit mask.
         """
+        if method not in ("sigma_clip", "gaussian_mixture"):
+            raise ValueError(
+                "method must be 'sigma_clip' or 'gaussian_mixture'")
+        if method == "gaussian_mixture":
+            from numpyro import handlers
+            from ._outliers import (
+                _normal_residual_variance, _fit_gaussian_mixture, _plot_mixture_outliers,
+            )
+
+            threshold = np.asarray(p_outlier)
+            if threshold.ndim != 0 or not np.isfinite(threshold) or not 0 <= threshold <= 1:
+                raise ValueError("p_outlier must be finite in [0, 1]")
+            factor = _positive(
+                extension_factor, "extension_factor", allow_zero=True)
+            if mask_velocity is not None:
+                mask_velocity = _positive(
+                    mask_velocity, "mask_velocity", allow_zero=True)
+            # Capture the already-replayed fitted noise sites; no new samples.
+            with handlers.trace() as trace:
+                prediction = self.predict(point=point, model=model)
+            if not isinstance(prediction, Mapping) or "continuum_flux" not in prediction:
+                raise ValueError(
+                    "model prediction must contain continuum_flux")
+            fixed = np.asarray(self.observation.mask)
+            baseline = self._prediction(prediction["continuum_flux"], fixed)
+            variance = self._prediction(
+                _normal_residual_variance(self.observation, prediction, model, trace), fixed)
+            if np.any(variance[~fixed] <= 0):
+                raise ValueError(
+                    "normal_residual_variance must be positive on usable pixels")
+            probability = np.full(self.observation.shape, np.nan)
+            fitted = dict(mismatch_fraction=None,
+                          mismatch_scale=None, log_likelihood=0.)
+            if np.any(~fixed):
+                fitted, probability[~fixed] = _fit_gaussian_mixture(
+                    self.observation.flux[~fixed] - baseline[~fixed], variance[~fixed])
+            flags = probability > float(threshold)
+            if extend_outlier_mask:
+                if mask_velocity is None:
+                    flags = np.stack([_extend_mask(row, factor)
+                                     for row in _rows(flags)]).reshape(fixed.shape)
+                else:
+                    for wave, row in zip(_rows(self.observation.wavelength), _rows(flags)):
+                        log_wave = np.log(np.asarray(wave, dtype=float))
+                        # Original flags only; no recursive extension.
+                        centers = log_wave[row]
+                        left = np.searchsorted(
+                            log_wave, centers - mask_velocity / _C_KMS)
+                        right = np.searchsorted(
+                            log_wave, centers + mask_velocity / _C_KMS, side="right")
+                        for start, end in zip(left, right):
+                            row[start:end] = True
+                flags &= ~fixed
+            diagnostics = dict(fitted, method=method, p_outlier=float(threshold),
+                               mismatch_probability=probability,
+                               normal_residual_variance=variance)
+            self.set_fit_mask(flags)
+            self.outlier_diagnostics = diagnostics
+            if plot or save_path is not None:
+                _plot_mixture_outliers(self.observation, baseline, self.fit_mask,
+                                       self.regions, diagnostics, save_path=save_path, keep_open=plot)
+            return self.fit_mask
+
         from scipy.stats import median_abs_deviation
 
         threshold = _positive(sigma_threshold, "sigma_threshold")
@@ -625,7 +710,8 @@ class SpecFit:
         return stats
 
     def plot_models(self, *, point=None, samples=None, model, show_gp=False,
-                    show_interval=False, max_draws=50, res_factor=1.5, save_path=None):
+                    show_interval=False, max_draws=50, res_factor=1.5,
+                    show_masked=True, save_path=None):
         """Predict and plot continuum-corrected spectra and baseline residuals.
 
         The upper panel shows data and continuum_flux (physical model including
@@ -639,6 +725,8 @@ class SpecFit:
         show the spread of conditional means across draws, excluding within-draw
         continuum/GP uncertainty and fresh noise. The lower panel subtracts the
         mean continuum_flux; its zero line shares the upper model's C0 color.
+        show_masked=False hides fixed- and fit-masked data points in both panels;
+        model/GP curves and bands still cover all wavelengths. The default is True.
         Upper limits include unmasked data and all finite displayed model/band values.
         Residual limits are +/- res_factor times the largest absolute usable
         residual or finite displayed GP curve/band value. Each region
@@ -680,7 +768,7 @@ class SpecFit:
                                                 (fixed, "x", "lightgray",
                                                  "fixed mask"),
                                                 (fitted & ~fixed, "o", "salmon", "fit mask")):
-                if not np.any(select):
+                if not np.any(select) or (not show_masked and label != "data"):
                     continue
                 marker_options = dict(
                     mfc="none", mew=.5) if label == "data" else {}
