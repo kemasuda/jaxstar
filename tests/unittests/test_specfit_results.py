@@ -83,7 +83,7 @@ def test_mcmc_roundtrip_and_reconstruction(sampled_fit, tmp_path, monkeypatch):
     restored_fit.set_fit_mask(result.fit_mask)
     restored_model = configured(restored_fit, config)
     prediction = restored_fit.predict(point=result.point, model=restored_model)
-    for name in ("physical_flux", "continuum_flux", "mean_flux"):
+    for name in ("physical_flux", "model_flux", "mean_flux"):
         np.testing.assert_allclose(prediction[name], expected[name], equal_nan=True)
     original_mean = fit.predict(samples=mcmc.get_samples(), model=model, max_draws=2)
     restored_mean = restored_fit.predict(samples=result.samples, model=restored_model, max_draws=2)

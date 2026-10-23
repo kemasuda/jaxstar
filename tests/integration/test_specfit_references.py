@@ -105,6 +105,7 @@ def test_frozen_check_ccf_and_outlier_mask(x64_context):
         old_outliers(legacy, {"fluxmodel": physical, "vsini": 6.})
         fit = SpecFit(Observation(wave, flux, np.full_like(flux, .01)), model)
         prediction_model = SimpleNamespace(predict=lambda point, observation, specmodel: {
-            "continuum_flux": specmodel(point, observation.wavelength), "params": point})
-        np.testing.assert_array_equal(fit.mask_outliers(point=params, model=prediction_model), sm.mask_fit)
+            "model_flux": specmodel(point, observation.wavelength), "params": point})
+        np.testing.assert_array_equal(
+            fit.mask_outliers(point=params, model=prediction_model, method="sigma_clip"), sm.mask_fit)
         plt.close("all")

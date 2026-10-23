@@ -271,7 +271,7 @@ def test_reconstruction_matches_helpers(single, gp, degree, provide_basis, x64_c
         assert result["continuum_posterior"].mean.shape == obs.shape[:-1] + (degree + 1,)
         np.testing.assert_allclose(result["physical_flux"], physical, atol=1e-12)
         np.testing.assert_allclose(result["continuum"], continuum, atol=1e-12)
-        np.testing.assert_allclose(result["continuum_flux"], physical * continuum, atol=1e-12)
+        np.testing.assert_allclose(result["model_flux"], physical * continuum, atol=1e-12)
         np.testing.assert_allclose(result["continuum_posterior"].covariance, post.covariance, atol=1e-12)
         if gp:
             expected = gp_conditional_mean(obs, physical * continuum, jitter=.004,
@@ -280,7 +280,7 @@ def test_reconstruction_matches_helpers(single, gp, degree, provide_basis, x64_c
             np.testing.assert_allclose(result["mean_flux"], physical * continuum + expected, atol=1e-12)
         else:
             assert "gp_mean" not in result
-            np.testing.assert_array_equal(result["mean_flux"], result["continuum_flux"])
+            np.testing.assert_array_equal(result["mean_flux"], result["model_flux"])
         with pytest.raises(ValueError, match="latent site 'teff'"):
             fit.predict(point={}, model=configured(fit, config))
 
@@ -356,10 +356,10 @@ def test_posterior_prediction_averages_model_curves(single, max_draws, x64_conte
         np.testing.assert_array_equal(result["draw_indices"], indices)
         predictions = [fit.predict(point={name: value[i] for name, value in samples.items()}, model=model)
                        for i in indices]
-        for name in ("physical_flux", "continuum", "continuum_flux", "mean_flux", "gp_mean"):
+        for name in ("physical_flux", "continuum", "model_flux", "mean_flux", "gp_mean"):
             assert result[name].shape == fit.observation.shape
             np.testing.assert_allclose(result[name], np.mean([p[name] for p in predictions], axis=0), atol=1e-12)
-        np.testing.assert_allclose(result["mean_flux"] - result["continuum_flux"], result["gp_mean"], atol=1e-12)
+        np.testing.assert_allclose(result["mean_flux"] - result["model_flux"], result["gp_mean"], atol=1e-12)
         np.testing.assert_allclose(result["gp_mean_quantiles"],
                                    np.quantile([p["gp_mean"] for p in predictions], [.16, .84], axis=0),
                                    atol=1e-12)
@@ -453,7 +453,7 @@ def test_single_model_svi_and_nuts_use_effective_observation(gp):
     assert isinstance(mcmc, MCMC)
     assert mcmc.get_samples()["teff"].shape == (12,)
     assert np.all(np.isfinite(mcmc.get_samples()["teff"]))
-    assert not {"model_flux", "gp_mean", "continuum_flux"}.intersection(mcmc.get_samples())
+    assert not {"physical_flux", "model_flux", "gp_mean"}.intersection(mcmc.get_samples())
     with pytest.raises(ValueError, match="jit_model_args"):
         fit.run_nuts(rng_key=jax.random.PRNGKey(0), model=configured(fit, config),
                      mcmc_kwargs={"jit_model_args": True})
@@ -510,7 +510,7 @@ def clipping_model(fit, *, include_params=True):
                               .to_event(len(observation.shape)))
 
     def reconstruct(observation, specmodel, returned, trace, settings):
-        prediction = {"continuum_flux": returned, "mean_flux": observation.flux}
+        prediction = {"model_flux": returned, "mean_flux": observation.flux}
         if include_params:
             prediction["params"] = {"components": ({"broadening": {"vsini": 2.}},)}
         return prediction
@@ -523,14 +523,14 @@ def test_outliers_model_baseline_replacement_and_fixed_nan():
     fit, baseline = clipping_case()
     model = clipping_model(fit)
     point = {"baseline": baseline}
-    # The model's mean_flux absorbs the spike; clipping still uses continuum_flux.
-    flags = fit.mask_outliers(point=point, model=model, extend_outlier_mask=False).copy()
+    # The model's mean_flux absorbs the spike; clipping still uses model_flux.
+    flags = fit.mask_outliers(point=point, model=model, method="sigma_clip", extend_outlier_mask=False).copy()
     assert flags[10] and not flags[70]
     # Improved baseline fits the first spike but introduces a second discrepancy.
     improved = np.array(fit.observation.flux, copy=True)
     improved[20] -= .2
     fit.set_fit_mask(flags)
-    fit.mask_outliers(point={"baseline": improved}, model=model, extend_outlier_mask=False)
+    fit.mask_outliers(point={"baseline": improved}, model=model, method="sigma_clip", extend_outlier_mask=False)
     assert fit.fit_mask[20] and not fit.fit_mask[10]
     assert not fit.fit_mask[70]
     fixed = fit.observation.mask.copy()
@@ -562,13 +562,13 @@ def test_outliers_predict_once_before_mask_update_and_plot_same_baseline():
 
     model = ConfiguredModel(model_single, settings=config, reconstruct_fn=reconstruct,
                             observation=fit.observation, specmodel=fit.specmodel)
-    flags = fit.mask_outliers(point=point, model=model, plot=True)
+    flags = fit.mask_outliers(point=point, model=model, method="sigma_clip", plot=True)
     assert len(predicted) == 1
     assert flags[20] and not flags[3]
     fig = plt.gcf()
     baseline = next(curve for curve in fig.axes[0].lines if curve.get_label() == "baseline")
     np.testing.assert_allclose(baseline.get_ydata(),
-                               np.asarray(predicted[0]["continuum_flux"])[~fit.observation.mask])
+                               np.asarray(predicted[0]["model_flux"])[~fit.observation.mask])
     plt.close(fig)
     with pytest.raises(TypeError, match="prediction"):
         fit.mask_outliers(point=point, model=model, prediction=predicted[0])
@@ -584,28 +584,28 @@ def test_extension_exact_runs_and_edges():
     fit, baseline = clipping_case()
     model = clipping_model(fit, include_params=False)
     point = {"baseline": baseline}
-    flags = fit.mask_outliers(point=point, model=model, mask_v=2.)
+    flags = fit.mask_outliers(point=point, model=model, method="sigma_clip", mask_v=2.)
     assert flags[9:12].all()
     with pytest.raises(ValueError, match="mask_v"):
-        fit.mask_outliers(point=point, model=model)
+        fit.mask_outliers(point=point, model=model, method="sigma_clip")
     with pytest.raises(ValueError, match="positive"):
-        fit.mask_outliers(point=point, model=model, mask_v=2., sigma_threshold=0.)
+        fit.mask_outliers(point=point, model=model, method="sigma_clip", mask_v=2., sigma_threshold=0.)
 
 
 def test_masked_filter_poison_and_oversized_kernel():
     fit, baseline = clipping_case()
     point = {"baseline": baseline}
     model = clipping_model(fit)
-    flags = fit.mask_outliers(point=point, model=model, extend_outlier_mask=False).copy()
+    flags = fit.mask_outliers(point=point, model=model, method="sigma_clip", extend_outlier_mask=False).copy()
     finite_flux = np.where(fit.observation.mask, 1e10, fit.observation.flux)
     other = SpecFit(replace(fit.observation, flux=finite_flux), fit.specmodel)
     np.testing.assert_array_equal(other.mask_outliers(point=point, model=clipping_model(other),
-                                                     extend_outlier_mask=False), flags)
-    fit.mask_outliers(point=point, model=model, mask_v=1e6)
+                                                     method="sigma_clip", extend_outlier_mask=False), flags)
+    fit.mask_outliers(point=point, model=model, method="sigma_clip", mask_v=1e6)
     fit.set_fit_mask(np.zeros_like(flags))
     entirely_masked = SpecFit(replace(fit.observation, mask=np.ones_like(flags)), fit.specmodel)
     entirely_masked.mask_outliers(point={"baseline": np.full(flags.shape, np.nan)},
-                                  model=clipping_model(entirely_masked))
+                                  model=clipping_model(entirely_masked), method="sigma_clip")
     assert not entirely_masked.fit_mask.any()
 
 
@@ -632,7 +632,7 @@ def test_outlier_quicklook_matches_clipping_quantities(single, extend, tmp_path)
             np.stack([obs.mask, obs.mask]), region=(8, 9)), multi.specmodel)
         baseline = np.stack([baseline, baseline])
     options = dict(point={"baseline": baseline}, model=clipping_model(fit), sigma_threshold=3.,
-                   extend_outlier_mask=extend)
+                   method="sigma_clip", extend_outlier_mask=extend)
     before = set(plt.get_fignums())
     expected = fit.mask_outliers(**options).copy()
     assert set(plt.get_fignums()) == before  # plotting is opt-in
@@ -691,7 +691,7 @@ def test_outlier_quicklook_matches_clipping_quantities(single, extend, tmp_path)
                                    norm.pdf(normal.get_xdata()) * (~fixed).sum() * (edges[1] - edges[0]))
         median_error = np.median(np.atleast_2d(fit.observation.uncertainty)[i, ~fixed])
         annotation = histogram.texts[0].get_text()
-        assert f"1.4826 × MAD = {scatter:.4g}" in annotation
+        assert f"1.4826 x MAD = {scatter:.4g}" in annotation
         assert f"median(error_obs) = {median_error:.4g}" in annotation
         assert f"ratio = {scatter / median_error:.3f}" in annotation
         plt.close(fig)
@@ -709,7 +709,7 @@ def test_outlier_quicklook_zero_scale_and_empty_region(all_masked, tmp_path):
     mask = np.ones_like(flux, dtype=bool) if all_masked else fit.observation.mask
     fit = SpecFit(replace(fit.observation, flux=flux, mask=mask), fit.specmodel)
     flags = fit.mask_outliers(point={"baseline": baseline}, model=clipping_model(fit),
-                             plot=True, save_path=tmp_path / "outliers.pdf")
+                             method="sigma_clip", plot=True, save_path=tmp_path / "outliers.pdf")
     assert (tmp_path / "outliers_region8.pdf").read_bytes().startswith(b"%PDF")
     fig = plt.gcf()
     lower = fig.axes[2]
@@ -740,7 +740,7 @@ def test_outlier_save_without_display_and_escaped_region(filename, tmp_path):
     region = ("blue/UV",)
     spectra = replace(fit.specmodel.spectra, regions=region)
     fit = SpecFit(replace(fit.observation, region=region), SpecModel(spectra, vmax=30.))
-    options = dict(point={"baseline": baseline}, model=clipping_model(fit))
+    options = dict(point={"baseline": baseline}, model=clipping_model(fit), method="sigma_clip")
     expected = fit.mask_outliers(**options).copy()
     existing = plt.figure()
     before = set(plt.get_fignums())
@@ -776,7 +776,7 @@ def test_residual_diagnostics_manual_and_no_bridging():
         return point
 
     model = SimpleNamespace(predict=predict)
-    point = {"mean_flux": np.ones(8), "continuum_flux": np.zeros(8), "jitter": 1.}
+    point = {"mean_flux": np.ones(8), "model_flux": np.zeros(8), "jitter": 1.}
     stats = fit.residual_diagnostics(point=point, model=model)[0]
     assert len(seen) == 1 and seen[0] is point
     valid_res = np.array([0., 1., 2., 4., 6., 12.])
@@ -788,15 +788,15 @@ def test_residual_diagnostics_manual_and_no_bridging():
     assert stats["n_gt_3sigma"] == 2 and stats["n_gt_5sigma"] == 1
     assert stats["n_adjacent_pairs"] == 3
     np.testing.assert_allclose(stats["lag1_correlation"], np.corrcoef([0., 1., 4.], [1., 2., 6.])[0, 1])
-    continuum = fit.residual_diagnostics(point=point, model=model, baseline="continuum_flux")[0]
+    continuum = fit.residual_diagnostics(point=point, model=model, baseline="model_flux")[0]
     np.testing.assert_allclose(continuum["rms"], np.sqrt(np.mean((valid_res + 1)**2)))
     no_jitter = fit.residual_diagnostics(point={"mean_flux": np.ones(8)}, model=model)[0]
     np.testing.assert_allclose(no_jitter["standardized_rms"], stats["rms"])
     with pytest.raises(ValueError, match="baseline"):
         fit.residual_diagnostics(point=point, model=model, baseline="physical_flux")
-    with pytest.raises(ValueError, match="containing continuum_flux"):
+    with pytest.raises(ValueError, match="containing model_flux"):
         fit.residual_diagnostics(point={"mean_flux": np.ones(8)}, model=model,
-                                 baseline="continuum_flux")
+                                 baseline="model_flux")
     with pytest.raises(ValueError, match="prediction must have shape"):
         fit.residual_diagnostics(point={"mean_flux": np.ones(7)}, model=model)
     fit.set_fit_mask(np.ones(8, bool))
@@ -884,7 +884,7 @@ def test_plot_limits_include_model_on_masked_pixels(masked_pixel):
     baseline[masked_pixel] = .1  # A line core inside either kind of mask.
     baseline[48 if masked_pixel == 3 else 3] = np.nan
     model = SimpleNamespace(predict=lambda point, observation, specmodel: point)
-    [(fig, axes)] = fit.plot_models(point={"continuum_flux": baseline}, model=model)
+    [(fig, axes)] = fit.plot_models(point={"model_flux": baseline}, model=model)
     try:
         low, high = axes[0].get_ylim()
         assert 0 < low < .1
@@ -918,15 +918,15 @@ def test_plot_uses_model_prediction_and_baseline_residuals(show_gp, posterior):
     baseline = next(line for line in upper.lines if line.get_label() == "model\n(incl. continuum)")
     assert lower.lines[-1].get_color() == baseline.get_color() == "C0"
     np.testing.assert_array_equal(lower.lines[-1].get_ydata(), [0, 0])
-    np.testing.assert_allclose(baseline.get_ydata(), prediction["continuum_flux"])
+    np.testing.assert_allclose(baseline.get_ydata(), prediction["model_flux"])
     valid = ~fit.effective_mask
     np.testing.assert_allclose(lower.lines[0].get_ydata(),
-                               (np.asarray(fit.observation.flux) - np.asarray(prediction["continuum_flux"]))[valid])
+                               (np.asarray(fit.observation.flux) - np.asarray(prediction["model_flux"]))[valid])
     gp_lines = [line for line in lower.lines if line.get_label() == "GP mean"]
     assert len(gp_lines) == int(show_gp)
     if show_gp:
         np.testing.assert_allclose(gp_lines[0].get_ydata(),
-                                   prediction["mean_flux"] - prediction["continuum_flux"])
+                                   prediction["mean_flux"] - prediction["model_flux"])
     plt.close(fig)
     with pytest.raises(TypeError, match="prediction"):
         fit.plot_models(prediction=prediction, model=model)
@@ -955,7 +955,7 @@ def test_posterior_band_uses_selected_draws(single, max_draws, mean, bounds, sho
         gp = .5 - 2 * point["level"] * scale
         # GP and continuum vary together; subtract within each draw. A custom
         # callback need not return a separate gp_mean for plotting its band.
-        return {"continuum_flux": curve, "mean_flux": curve + gp}
+        return {"model_flux": curve, "mean_flux": curve + gp}
 
     model = SimpleNamespace(predict=predict)
     # With max_draws=2, the large middle draw is excluded from both summaries.
@@ -964,10 +964,10 @@ def test_posterior_band_uses_selected_draws(single, max_draws, mean, bounds, sho
     prediction = fit.predict(**options)
     expected = np.stack([1 + value * scale for value in bounds])
     expected_gp = np.stack([.5 - 2 * value * scale for value in bounds[::-1]])
-    assert prediction["continuum_flux_quantiles"].shape == (2, *fit.observation.shape)
-    np.testing.assert_allclose(prediction["continuum_flux_quantiles"], expected)
+    assert prediction["model_flux_quantiles"].shape == (2, *fit.observation.shape)
+    np.testing.assert_allclose(prediction["model_flux_quantiles"], expected)
     np.testing.assert_allclose(prediction["gp_mean_quantiles"], expected_gp)
-    np.testing.assert_allclose(prediction["continuum_flux"], 1 + mean * scale)
+    np.testing.assert_allclose(prediction["model_flux"], 1 + mean * scale)
     plots = fit.plot_models(show_gp=show_gp, show_interval=True, **options)
     try:
         for i, (fig, (upper, lower)) in enumerate(plots):
