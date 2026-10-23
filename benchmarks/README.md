@@ -1,5 +1,133 @@
 # Spectral CPU/GPU benchmark comparison
 
+## Experimental k=1 Vecchia likelihood
+
+`benchmark_vecchia1.py` compares the exact Matérn-3/2 tinygp parallel solver,
+`gp_solver="vecchia1"`, and white noise, with the same analytically marginalized
+degree-4 Chebyshev continuum and synthetic differentiable line model. Defaults
+are **eight orders, 2048 pixels/order, float64**. The spectrum is drawn from the
+exact M32 model with heteroscedastic errors, jitter, random continuum coefficients,
+isolated masks and a contiguous gap. Each retained wavelength separation is used.
+With `--fit`, the exact and k=1 likelihoods are fitted and each fitted point
+is scored under both densities. This option supports likelihood evaluation
+and analytic continuum posteriors; latent GP prediction is not implemented.
+
+```bash
+env -u LD_LIBRARY_PATH JAX_PLATFORMS=cuda PYTHONPATH=src \
+  XLA_FLAGS=--xla_gpu_enable_triton_gemm=false python benchmarks/benchmark_vecchia1.py \
+  --pixels 2048 --fit --json-out benchmark-results/vecchia1-gpu-2048.json
+env -u LD_LIBRARY_PATH JAX_PLATFORMS=cuda PYTHONPATH=src \
+  XLA_FLAGS=--xla_gpu_enable_triton_gemm=false python benchmarks/benchmark_vecchia1.py \
+  --pixels 4096 --fit --json-out benchmark-results/vecchia1-gpu-4096.json
+```
+
+Use a tinygp build supporting `QuasisepSolver(parallel=True)` and record its
+commit with `--tinygp-revision`. The benchmark temporarily adapts that constructor
+while compiling the exact reference, reusing the production marginalization
+and validation code; it does not edit tinygp or change the package's default
+solver policy. It also checks parallel/sequential value and gradient agreement.
+The application itself does not require this development tinygp for Vecchia.
+
+The JSON separates compilation from synchronized steady-state likelihood and
+`value_and_grad` timing (five warmups, 30 rounds). Speedup is baseline time divided
+by method time, with tinygp-parallel as baseline. It includes all eight physical
+and nuisance derivatives, signed log-likelihood/gradient differences at the
+generating parameter point, environment and XLA flags. `--fit` adds bounded
+maximum-likelihood fits of line depth, RV, width, GP amplitude/scale, jitter and
+continuum prior scales for each selected correlated likelihood; convergence and
+active bounds are reported. Each fitted point is also scored with all selected
+likelihoods, outside the timed section. This is a line-spectrum accuracy experiment, not
+an atmosphere-grid fit or a posterior coverage test.
+
+On the local JAX 0.11.2/CUDA stack, Triton GEMM compilation of the parallel
+reference aborts in `triton_tiling_propagation.cc`. The recorded comparison uses
+`XLA_FLAGS=--xla_gpu_enable_triton_gemm=false` for **all** methods. If existing
+`LD_LIBRARY_PATH` settings interfere with pip CUDA libraries, run with
+`env -u LD_LIBRARY_PATH`; neither workaround modifies the Python environment.
+
+Measured on 2026-10-21 with an NVIDIA A100 80GB PCIe, Python 3.12.15,
+JAX/jaxlib 0.11.2 and tinygp `0.3.2.dev16+gbea3c43e4`
+(`bea3c43e47c339cb20bc14b91cbd0e55a592f7e6`), with the above Triton flag:
+
+| Pixels/order (8 orders) | Method | Likelihood, ms | Value + gradient, ms | Speedup, likelihood / gradient |
+| --- | --- | ---: | ---: | ---: |
+| 2048 | tinygp parallel | 20.081 | 37.918 | 1 / 1 |
+| 2048 | Vecchia k=1 | 1.516 | 2.967 | 13.25 / 12.78 |
+| 2048 | White noise | 1.003 | 1.198 | 20.01 / 31.66 |
+| 4096 | tinygp parallel | 23.167 | 44.715 | 1 / 1 |
+| 4096 | Vecchia k=1 | 1.676 | 2.875 | 13.82 / 15.55 |
+| 4096 | White noise | 1.267 | 1.365 | 18.29 / 32.76 |
+
+These are medians of 30 synchronized calls after five warmups, including the
+line model and input validation. There are 15,446 / 31,023 usable pixels across
+the eight orders. Vecchia costs about 1.3–1.5 times white noise for values and
+2.1–2.5 times white noise for values plus gradients. Compilation is reported
+separately in the ignored local JSON artifacts
+`benchmark-results/vecchia1-gpu-2048.json` and `vecchia1-gpu-4096.json`.
+Parallel and sequential exact reference log likelihoods agree to the reported
+precision; maximum absolute gradient differences are below `7e-13`.
+
+At the same generating parameters, Vecchia minus exact log likelihood is
+−2077.199 / −4575.163 (−0.1345 / −0.1475 per usable pixel). Absolute density
+offsets alone do not establish fit accuracy. The gradient difference has
+maximum absolute component 521.98 / 405.10 and relative Euclidean norm
+`||g_vecchia-g_exact|| / ||g_exact||` of 5.033 / 1.014 in the reported parameter
+coordinates. In particular, the log-length gradient changes from −49.556 to
+−0.111 in the 2048 case and from −51.939 to −0.464 in the 4096 case: k=1
+retains little length information when the typical 0.02 Angstrom separation
+is much shorter than the 0.55 Angstrom correlation length and observations
+include independent noise. All eight gradient components are saved in JSON.
+
+Both bounded optimizations report convergence without active bounds. They
+start from the generating point; this is not a global optimum guarantee.
+The fitted values below are exact / Vecchia, respectively:
+
+| Parameter | Generating value | 2048 pixels/order | 4096 pixels/order |
+| --- | ---: | ---: | ---: |
+| Line depth | 0.35 | 0.34943 / 0.35059 | 0.34804 / 0.34594 |
+| RV, km/s | 2.0 | 2.00980 / 1.96421 | 2.00148 / 2.00536 |
+| Line width, Angstrom | 0.12 | 0.11963 / 0.12036 | 0.12058 / 0.11941 |
+| GP amplitude | 0.025 | 0.024315 / 0.022874 | 0.025189 / 0.024278 |
+| GP scale, Angstrom | 0.55 | 0.50298 / 0.69002 | 0.53746 / 0.67998 |
+| Jitter | 0.009 | 0.008501 / 0.008467 | 0.008789 / 0.008990 |
+| Constant-continuum prior scale | 0.03 | 0.04549 / 0.04630 | 0.04247 / 0.04282 |
+| Other-continuum prior scale | 0.01 | 0.01371 / 0.01549 | 0.01143 / 0.01221 |
+
+Evaluating both fitted points under the **exact** likelihood, the Vecchia fit
+loses 71.88 / 75.91 log units relative to the exact fit. Under the Vecchia
+likelihood, its fit gains 12.29 / 10.03 log units over the exact fit. Thus the
+optimization targets differ materially, beyond an additive normalization offset.
+The full cross-evaluation is recorded as `fit_comparison` in the JSON.
+
+The speed gain warrants keeping k=1 as an explicit experimental option, but
+these gradient and nuisance-parameter shifts do **not** establish it as an
+adequate replacement for the exact likelihood. The fitted RV difference is
+−45.6 / +3.9 m/s in these two realizations; no posterior uncertainty/coverage
+comparison was made.
+
+Historical validation of the initial k=1 implementation: the full CPU suite completed with **1313 passed,
+44 skipped, 2 xfailed**, with no failures. On the A100, all **21** new
+conditional-density, masking, continuum, stability, gradient and model-API
+checks passed. The CPU run used `JAX_PLATFORMS=cpu PYTHONPATH=src python -m pytest
+-q --disable-warnings`; the GPU run selected `tests/unittests/test_vecchia1.py`
+and the k=1 configured-model likelihood/reconstruction-boundary test
+with the same CUDA environment as the benchmark. Final logs are saved locally
+as `benchmark-results/vecchia1-tests-cpu.txt` and `vecchia1-tests-gpu.txt`.
+
+The implementation is now restricted to k=1 likelihoods and continuum
+posteriors. Tests also require latent GP prediction to raise explicitly,
+including for fully masked observations. This cleanup has only been checked
+statically; numerical tests and benchmarks have not been rerun. To run the
+focused checks:
+
+```bash
+JAX_PLATFORMS=cpu PYTHONPATH=src python -m pytest -q \
+  tests/unittests/test_vecchia1.py \
+  tests/unittests/test_specfit_priors.py::test_vecchia_configured_model_likelihood_and_reconstruction_boundary
+```
+
+## Forward-model benchmarks
+
 Run from the repository root using a Python environment with JAX/jaxlib for the
 target hardware and the repository's runtime dependencies. No spectral data,
 frozen sibling repository, notebook execution or fitting/inference is required.
