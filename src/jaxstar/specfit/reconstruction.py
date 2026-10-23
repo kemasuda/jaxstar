@@ -25,9 +25,9 @@ def _mean_prediction(predict, samples, *, max_draws):
             raise ValueError("max_draws must be a positive integer or None")
         count = min(count, max_draws)
     indices = np.linspace(0, len(next(iter(samples.values()))) - 1, count, dtype=int)
-    curve_names = ("physical_flux", "continuum", "continuum_flux", "mean_flux", "gp_mean")
+    curve_names = ("physical_flux", "continuum", "model_flux", "mean_flux", "gp_mean")
     means = {}
-    continuum_draws = []
+    model_draws = []
     gp_draws = []
     for index in indices:
         prediction = predict({name: value[index] for name, value in samples.items()})
@@ -41,13 +41,13 @@ def _mean_prediction(predict, samples, *, max_draws):
             raise ValueError("model prediction curve names and shapes must be the same across draws")
         for name, value in curves.items():
             means[name] += value / len(indices)
-        if "continuum_flux" in curves:
-            continuum_draws.append(curves["continuum_flux"].copy())
+        if "model_flux" in curves:
+            model_draws.append(curves["model_flux"].copy())
             # Match the plotted GP curve, including callbacks without gp_mean.
-            gp_draws.append(curves["mean_flux"] - curves["continuum_flux"])
+            gp_draws.append(curves["mean_flux"] - curves["model_flux"])
     result = {**means, "draw_indices": indices}
-    if continuum_draws:
-        result["continuum_flux_quantiles"] = np.quantile(continuum_draws, [.16, .84], axis=0)
+    if model_draws:
+        result["model_flux_quantiles"] = np.quantile(model_draws, [.16, .84], axis=0)
         result["gp_mean_quantiles"] = np.quantile(gp_draws, [.16, .84], axis=0)
     return result
 
@@ -80,7 +80,7 @@ def reconstruct_single(obs, specmodel, params, trace, settings):
     continuum = evaluate_continuum(basis, post.mean)
     baseline = physical * continuum
     result = {"params": params, "physical_flux": physical, "continuum": continuum,
-              "continuum_posterior": post, "continuum_flux": baseline,
+              "continuum_posterior": post, "model_flux": baseline,
               "mean_flux": baseline, "jitter": noise["jitter"]}
     if gp:
         result["gp_mean"] = gp_conditional_mean(obs, baseline, jitter=noise["jitter"], **gp_options)

@@ -38,7 +38,7 @@ def test_fitted_covariance_and_physical_residual(single, solver, x64_context):
         variance = fit.observation.uncertainty**2 + (
             jitter if single else jitter[:, None])**2 + (0.02**2 if solver else 0.)
         np.testing.assert_allclose(d["normal_residual_variance"][~fixed], variance[~fixed], rtol=1e-12)
-        residual = flux[~fixed] - original_prediction["continuum_flux"][~fixed]
+        residual = flux[~fixed] - original_prediction["model_flux"][~fixed]
         fraction, scale = d["mismatch_fraction"], d["mismatch_scale"]
         terms = np.stack((np.log1p(-fraction) + norm.logpdf(residual, scale=np.sqrt(variance[~fixed])),
                           np.log(fraction) + norm.logpdf(residual, scale=np.sqrt(variance[~fixed] + scale**2))))
@@ -61,7 +61,7 @@ def custom_case():
 
     def predict(point, observation, specmodel):
         calls.append(observation.mask.copy())
-        return {"continuum_flux": point["baseline"], "mean_flux": observation.flux,
+        return {"model_flux": point["baseline"], "mean_flux": observation.flux,
                 "normal_residual_variance": np.full(observation.shape, .01**2)}
 
     return fit, {"baseline": baseline}, SimpleNamespace(predict=predict), calls
@@ -104,7 +104,7 @@ def test_invalid_variance_or_custom_model_preserves_mask():
     fit.set_fit_mask(previous)
     for variance in (-np.ones(fit.observation.shape), np.full(fit.observation.shape, np.nan)):
         bad = SimpleNamespace(predict=lambda *args: {
-            "continuum_flux": point["baseline"], "normal_residual_variance": variance})
+            "model_flux": point["baseline"], "normal_residual_variance": variance})
         with pytest.raises(ValueError):
             fit.mask_outliers(point=point, model=bad, method="gaussian_mixture")
         np.testing.assert_array_equal(fit.fit_mask, previous)
@@ -132,7 +132,7 @@ def test_velocity_extension_on_nonuniform_wavelengths(single, velocity, extend, 
     monkeypatch.setattr("jaxstar.specfit._outliers._fit_gaussian_mixture",
                         lambda *args: ({}, q[~fixed]))
     model = SimpleNamespace(predict=lambda *args: {
-        "continuum_flux": np.ones(q.shape), "normal_residual_variance": np.ones(q.shape)})
+        "model_flux": np.ones(q.shape), "normal_residual_variance": np.ones(q.shape)})
     options = {} if velocity == 10. else {"mask_velocity": velocity}
     flags = fit.mask_outliers(point={}, model=model, method="gaussian_mixture",
                               extension_factor=100., extend_outlier_mask=extend, **options)

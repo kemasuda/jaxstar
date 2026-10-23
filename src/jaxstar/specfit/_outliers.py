@@ -22,7 +22,7 @@ def _normal_residual_variance(observation, prediction, model, trace):
         error = np.where(observation.valid, observation.uncertainty, 1.)
         return np.where(observation.valid, np.hypot(error, jitters)**2, np.nan)
     prepared, _, amplitude, scale, jitters, dtype, solver = _gp_setup(
-        observation, prediction["continuum_flux"], gp["gp_amplitude"], gp["gp_scale"],
+        observation, prediction["model_flux"], gp["gp_amplitude"], gp["gp_scale"],
         jitter, model.settings["gp_solver"])
     for region, indices in enumerate(prepared.indices):
         if indices:

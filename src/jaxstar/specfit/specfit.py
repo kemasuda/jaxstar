@@ -437,14 +437,16 @@ class SpecFit:
 
         Supply exactly one of point or samples. All physical/continuum/GP
         calculations delegate to model.predict using the current fit mask.
-        A point returns the model's full prediction dict. Samples must have a
+        A point returns the model's full prediction dict. The built-in model
+        returns model_flux = physical_flux * continuum and mean_flux equal to
+        model_flux plus the GP conditional mean, when enabled. Samples must have a
         leading, flattened draw axis, as in MCMC.get_samples(). At most max_draws
         evenly spaced draws are used; None uses all draws. Sample predictions
-        return the mean curves (physical_flux, continuum, continuum_flux,
+        return the mean curves (physical_flux, continuum, model_flux,
         mean_flux and gp_mean when supplied by the model) and draw_indices.
-        When continuum_flux is supplied, continuum_flux_quantiles and
+        When model_flux is supplied, model_flux_quantiles and
         gp_mean_quantiles contain pointwise 16th/84th percentiles of
-        continuum_flux and mean_flux - continuum_flux, respectively, with shape
+        model_flux and mean_flux - model_flux, respectively, with shape
         (2, *observation.shape), using the same draws. The difference is taken
         within each draw. These describe the spread of conditional means across
         draws, excluding within-draw continuum/GP uncertainty and fresh noise.
@@ -484,7 +486,7 @@ class SpecFit:
         """Replace the fit mask; default to Gaussian-mixture classification.
 
         ``method="gaussian_mixture"`` fits one global contamination fraction
-        and extra absolute flux scale to data minus continuum_flux, without
+        and extra absolute flux scale to data minus model_flux, without
         subtracting the GP mean or median filtering. The narrow variance is
         diag(K + observation variance + jitter variance) from the fitted normal
         model. Pixels with mismatch probability > p_outlier (default .5) are
@@ -505,7 +507,7 @@ class SpecFit:
 
         ``method="sigma_clip"`` selects the legacy median-filter/MAD rule below.
         Predict once at ``point`` using ``model`` and the current fit mask,
-        before updating the mask. The baseline is prediction['continuum_flux'],
+        before updating the mask. The baseline is prediction['model_flux'],
         excluding GP mean. ``mask_v`` is in km/s; absent an override it is the
         largest predicted component vsini, matching the old shared filter-width
         choice. All pixels outside the fixed mask are then reconsidered for
@@ -548,11 +550,11 @@ class SpecFit:
             # Capture the already-replayed fitted noise sites; no new samples.
             with handlers.trace() as trace:
                 prediction = self.predict(point=point, model=model)
-            if not isinstance(prediction, Mapping) or "continuum_flux" not in prediction:
+            if not isinstance(prediction, Mapping) or "model_flux" not in prediction:
                 raise ValueError(
-                    "model prediction must contain continuum_flux")
+                    "model prediction must contain model_flux")
             fixed = np.asarray(self.observation.mask)
-            baseline = self._prediction(prediction["continuum_flux"], fixed)
+            baseline = self._prediction(prediction["model_flux"], fixed)
             variance = self._prediction(
                 _normal_residual_variance(self.observation, prediction, model, trace), fixed)
             if np.any(variance[~fixed] <= 0):
@@ -598,11 +600,11 @@ class SpecFit:
             extension_factor, "extension_factor", allow_zero=True)
         make_plots = plot or save_path is not None
         prediction = self.predict(point=point, model=model)
-        if not isinstance(prediction, Mapping) or "continuum_flux" not in prediction:
+        if not isinstance(prediction, Mapping) or "model_flux" not in prediction:
             raise ValueError(
-                "model prediction must return a mapping containing continuum_flux")
+                "model prediction must return a mapping containing model_flux")
         fixed = np.asarray(self.observation.mask)
-        baseline = self._prediction(prediction["continuum_flux"], fixed)
+        baseline = self._prediction(prediction["model_flux"], fixed)
         if mask_v is None:
             if "params" not in prediction:
                 raise ValueError(
@@ -660,7 +662,7 @@ class SpecFit:
 
         Predict once at ``point`` using ``model`` and the current effective mask.
         Residuals are observation.flux minus the selected prediction field:
-        ``mean_flux`` includes the GP mean; ``continuum_flux`` excludes it.
+        ``mean_flux`` includes the GP mean; ``model_flux`` excludes it.
         Jitter comes from the prediction (zero if omitted by a custom model),
         in additive flux units, scalar or one value per region. Standardization
         uses sqrt(uncertainty**2 + jitter**2), without GP whitening.
@@ -672,9 +674,9 @@ class SpecFit:
         """
         from scipy.stats import median_abs_deviation
 
-        if baseline not in ("mean_flux", "continuum_flux"):
+        if baseline not in ("mean_flux", "model_flux"):
             raise ValueError(
-                "baseline must be 'mean_flux' or 'continuum_flux'")
+                "baseline must be 'mean_flux' or 'model_flux'")
         prediction = self.predict(point=point, model=model)
         if not isinstance(prediction, Mapping) or baseline not in prediction:
             raise ValueError(
@@ -714,17 +716,17 @@ class SpecFit:
                     show_masked=True, save_path=None):
         """Predict and plot continuum-corrected spectra and baseline residuals.
 
-        The upper panel shows data and continuum_flux (physical model including
-        the continuum prediction). The lower shows data - continuum_flux;
-        show_gp adds mean_flux - continuum_flux there. It controls display only,
+        The upper panel shows data and model_flux (physical model including
+        the continuum prediction). The lower shows data - model_flux;
+        show_gp adds mean_flux - model_flux there. It controls display only,
         leaving the model's continuum/GP calculations to predict. Supply exactly
         one of point or samples; samples uses predict's max_draws convention.
         With samples, show_interval=True adds pointwise 16th-84th percentile
-        bands for continuum_flux in the upper panel and, with show_gp, the GP
+        bands for model_flux in the upper panel and, with show_gp, the GP
         mean in the lower panel. Bands are hidden by default. They
         show the spread of conditional means across draws, excluding within-draw
         continuum/GP uncertainty and fresh noise. The lower panel subtracts the
-        mean continuum_flux; its zero line shares the upper model's C0 color.
+        mean model_flux; its zero line shares the upper model's C0 color.
         show_masked=False hides fixed- and fit-masked data points in both panels;
         model/GP curves and bands still cover all wavelengths. The default is True.
         Upper limits include unmasked data and all finite displayed model/band values.
@@ -746,9 +748,9 @@ class SpecFit:
         prediction = self.predict(
             point=point, samples=samples, model=model, max_draws=max_draws)
         baseline = self._prediction(
-            prediction["continuum_flux"], self.effective_mask)
+            prediction["model_flux"], self.effective_mask)
         interval = (np.stack([_rows(self._prediction(bound, self.effective_mask))
-                              for bound in prediction["continuum_flux_quantiles"]])
+                              for bound in prediction["model_flux_quantiles"]])
                     if samples is not None and show_interval else None)
         gp_mean = (self._prediction(prediction["mean_flux"], self.effective_mask) - baseline
                    if show_gp else None)
@@ -757,7 +759,7 @@ class SpecFit:
                        if samples is not None and show_gp and show_interval else None)
         plots = []
         output = Path(save_path) if save_path is not None else None
-        for i, (wave, flux, fixed, fitted, continuum_flux) in enumerate(zip(
+        for i, (wave, flux, fixed, fitted, model_flux) in enumerate(zip(
                 _rows(self.observation.wavelength), _rows(
                     self.observation.flux),
                 _rows(self.observation.mask), _rows(self.fit_mask), _rows(baseline))):
@@ -774,9 +776,9 @@ class SpecFit:
                     mfc="none", mew=.5) if label == "data" else {}
                 upper.plot(wave[select], flux[select], style, color=color, ms=3,
                            label=label, **marker_options)
-                lower.plot(wave[select], (flux - continuum_flux)[select], style,
+                lower.plot(wave[select], (flux - model_flux)[select], style,
                            color=color, ms=3, **marker_options)
-            upper.plot(wave, continuum_flux, color="C0", ls="-", lw=1,
+            upper.plot(wave, model_flux, color="C0", ls="-", lw=1,
                        label="model\n(incl. continuum)")
             if interval is not None:
                 upper.fill_between(wave, interval[0, i], interval[1, i],
@@ -791,7 +793,7 @@ class SpecFit:
                                        label="GP 16–84%\n(across draws)")
             valid = ~(fixed | fitted)
             shown = np.concatenate(
-                (flux[valid], continuum_flux[np.isfinite(continuum_flux)]))
+                (flux[valid], model_flux[np.isfinite(model_flux)]))
             if interval is not None:
                 bounds = interval[:, i]
                 shown = np.concatenate((shown, bounds[np.isfinite(bounds)]))
@@ -801,7 +803,7 @@ class SpecFit:
                                 low else max(abs(high), 1.))
                 upper.set_ylim(low - margin, high + margin)
             if np.any(valid):
-                maximum = np.max(np.abs(flux[valid] - continuum_flux[valid]))
+                maximum = np.max(np.abs(flux[valid] - model_flux[valid]))
                 if maximum == 0:
                     maximum = np.median(
                         _rows(self.observation.uncertainty)[i, valid])

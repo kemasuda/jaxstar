@@ -152,7 +152,7 @@ sample-site values that can be reused directly. The learning rate `0.1` is the
 notebook's explicit choice; `run_svi` defaults to `0.01`.
 
 Outlier detection uses the physical spectrum times its conditional continuum
-(`continuum_flux`), excluding the GP mean. It preserves the fixed observation
+(`model_flux`), excluding the GP mean. It preserves the fixed observation
 mask and updates a separate fit mask. The second SVI run starts from the first
 point with the updated mask. Reuse the same configured model: each inference
 call binds the current masked observation.
@@ -661,15 +661,15 @@ sf.mask_outliers(point=p_fit, model=model, method="sigma_clip",
 ```
 
 With `method="sigma_clip"`, `mask_outliers` calls `predict` once using the current mask, before updating it.
-It uses `continuum_flux` as the baseline and the largest component `vsini` for
+It uses `model_flux` as the baseline and the largest component `vsini` for
 the median-filter width; `mask_v` can override that velocity in km/s. Previously
 flagged pixels are reconsidered, so they can return to the sf. Custom model
-predictions must include `continuum_flux`, plus physical `params` unless
+predictions must include `model_flux`, plus physical `params` unless
 `mask_v` is supplied. Pass a parameter point and the model, not a precomputed
 prediction dictionary.
 
 `plot=True` creates three panels on the left for each region: data and
-`continuum_flux` (excluding the GP mean); residuals and their median-filter trend;
+`model_flux` (excluding the GP mean); residuals and their median-filter trend;
 and detrended residuals divided by `1.4826 * MAD`, with the positive and negative
 clipping thresholds. A histogram on the right shows the same detrended quantity,
 with retained and excluded pixels in separate colors, logarithmic counts and
@@ -711,7 +711,7 @@ q = sf.outlier_diagnostics["mismatch_probability"]
 # Refit with the same model and the new fixed fit mask.
 ```
 
-The mixture uses `data - continuum_flux`, including the fitted conditional continuum but
+The mixture uses `data - model_flux`, including the fitted conditional continuum but
 excluding the GP mean. It fits one global fraction `f` and absolute flux scale
 `s` by maximum likelihood with component variances `V` and `V + s**2`.
 `V` is the fitted GP's combined covariance diagonal (kernel, observational
@@ -738,7 +738,7 @@ with their threshold at the bottom. The right-hand histogram shows residuals
 divided by `sqrt(V)`, with an `N(0, 1)` reference. Extended flags are highlighted
 throughout; no GP mean or median-filter trend is subtracted.
 Custom model callbacks must supply `normal_residual_variance` alongside
-`continuum_flux`; the built-in model obtains it internally during masking.
+`model_flux`; the built-in model obtains it internally during masking.
 
 ### Mask summary and residual diagnostics
 
@@ -751,7 +751,7 @@ import pandas as pd
 display(pd.DataFrame(sf.mask_summary()))
 display(pd.DataFrame(sf.residual_diagnostics(point=p_fit, model=model)))
 display(pd.DataFrame(sf.residual_diagnostics(
-    point=p_fit, model=model, baseline="continuum_flux",
+    point=p_fit, model=model, baseline="model_flux",
 )))
 ```
 
@@ -761,7 +761,7 @@ their union, `effective_mask`.
 
 `residual_diagnostics` calls `predict` at the supplied point using the current
 effective mask. The default `baseline="mean_flux"` includes the GP conditional
-mean; `baseline="continuum_flux"` uses the physical spectrum multiplied by its
+mean; `baseline="model_flux"` uses the physical spectrum multiplied by its
 continuum, before adding the GP. Jitter comes from the same prediction and
 defaults to zero when omitted by a custom reconstruction callback.
 
@@ -781,8 +781,13 @@ mean when present:
 
 ```python
 prediction = sf.predict(point=p_fit, model=model)
+model_flux = prediction["model_flux"]  # physical spectrum multiplied by continuum
 gp_mean = prediction["gp_mean"]  # when the model includes a GP
 ```
+
+At a parameter point, `model_flux = physical_flux * continuum` and
+`mean_flux = model_flux + gp_mean` (or just `model_flux` without a GP).
+`continuum` is the multiplicative correction itself.
 
 For posterior draws, pass the dictionary returned by `mcmc.get_samples()` with
 its flattened leading draw axis:
@@ -792,13 +797,15 @@ prediction = sf.predict(samples=mcmc.get_samples(), model=model, max_draws=50)
 ```
 
 This predicts at up to 50 evenly spaced draws, then averages the returned curves
-(`physical_flux`, `continuum`, `continuum_flux`, `mean_flux`, `gp_mean`, where
+(`physical_flux`, `continuum`, `model_flux`, `mean_flux`, `gp_mean`, where
 provided). `max_draws=None` uses all draws. The result also includes
 `draw_indices`; physical parameter dictionaries, conditional covariance objects
 and jitter are not averaged. In particular, GP means are computed at each draw
-before averaging. When `continuum_flux` is available, the result also includes
-`continuum_flux_quantiles` and `gp_mean_quantiles`: pointwise 16th and 84th
-percentiles of `continuum_flux` and `mean_flux - continuum_flux`, respectively,
+before averaging. `model_flux` averages the product evaluated at each draw,
+not the product of the separately averaged `physical_flux` and `continuum`.
+When `model_flux` is available, the result also includes
+`model_flux_quantiles` and `gp_mean_quantiles`: pointwise 16th and 84th
+percentiles of `model_flux` and `mean_flux - model_flux`, respectively,
 across the same draws, with shape `(2, *observation.shape)`. The GP difference
 is computed within each draw before taking percentiles. These describe the
 spread of conditional means across posterior draws. They exclude the conditional
@@ -826,12 +833,12 @@ region; special characters in region labels are URL-escaped for filenames.
 Without a filename extension, Matplotlib's default save format is used.
 
 The upper panel shows data and the physical model including its continuum
-prediction (`continuum_flux`). Bands are hidden by default (`show_interval=False`).
+prediction (`model_flux`). Bands are hidden by default (`show_interval=False`).
 With `samples` and `show_interval=True`, it shades the pointwise 16th-84th
 percentile range of the conditional means described above. The lower
-shows `data - continuum_flux`, subtracting the mean curve for `samples`. Its
+shows `data - model_flux`, subtracting the mean curve for `samples`. Its
 zero line uses C0 to match the continuum model in the upper panel.
-`show_gp=True` overlays `mean_flux - continuum_flux` in C1 in the lower panel,
+`show_gp=True` overlays `mean_flux - model_flux` in C1 in the lower panel,
 with its own 16th-84th percentile band when using `samples` and
 `show_interval=True`. `show_gp` defaults to
 False and controls display, not the model's GP calculations.
@@ -1049,7 +1056,9 @@ Choose prior support inside the atmosphere grid and the model's wavelength,
 RV and broadening coverage. Atmosphere keys must match the loaded library.
 
 Retrieve posterior draws with `mcmc.get_samples()`. Set `save_model_flux=True`
-to save physical spectra at every draw, or reconstruct physical and
+to save physical spectra in the NumPyro trace's `model_flux` site at every draw.
+This trace option stores the spectrum before the continuum correction;
+`predict()["model_flux"]` includes that correction. Reconstruct physical and
 continuum-corrected spectra afterward with the helpers above.
 
 #### Empirical relations and residual GP
