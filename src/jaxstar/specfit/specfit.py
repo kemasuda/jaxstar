@@ -439,8 +439,10 @@ class SpecFit:
         calculations delegate to model.predict using the current fit mask.
         A point returns the model's full prediction dict. The built-in model
         returns model_flux = physical_flux * continuum and mean_flux equal to
-        model_flux plus the GP conditional mean, when enabled. Samples must have a
-        leading, flattened draw axis, as in MCMC.get_samples(). At most max_draws
+        model_flux plus the GP conditional mean, when available. With vecchia1,
+        mean_flux equals model_flux, gp_mean is omitted, and a point also returns
+        normal_residual_variance = diag(C) for mixture masking. Samples must have
+        a leading, flattened draw axis, as in MCMC.get_samples(). At most max_draws
         evenly spaced draws are used; None uses all draws. Sample predictions
         return the mean curves (physical_flux, continuum, model_flux,
         mean_flux and gp_mean when supplied by the model) and draw_indices.
@@ -719,7 +721,8 @@ class SpecFit:
         The upper panel shows data and model_flux (physical model including
         the continuum prediction). The lower shows data - model_flux;
         show_gp adds mean_flux - model_flux there. It controls display only,
-        leaving the model's continuum/GP calculations to predict. Supply exactly
+        leaving the model's continuum/GP calculations to predict. Vecchia models
+        omit the GP overlay, since they reconstruct no latent GP mean. Supply exactly
         one of point or samples; samples uses predict's max_draws convention.
         With samples, show_interval=True adds pointwise 16th-84th percentile
         bands for model_flux in the upper panel and, with show_gp, the GP
@@ -747,6 +750,8 @@ class SpecFit:
         res_factor = _positive(res_factor, "res_factor")
         prediction = self.predict(
             point=point, samples=samples, model=model, max_draws=max_draws)
+        if getattr(model, "settings", {}).get("gp_solver") == "vecchia1":
+            show_gp = False
         baseline = self._prediction(
             prediction["model_flux"], self.effective_mask)
         interval = (np.stack([_rows(self._prediction(bound, self.effective_mask))

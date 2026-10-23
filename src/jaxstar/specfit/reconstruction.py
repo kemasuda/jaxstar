@@ -5,7 +5,7 @@ from numbers import Integral
 
 import numpy as np
 
-from .continuum import chebyshev_basis, continuum_posterior, evaluate_continuum
+from .continuum import _region_jitter, chebyshev_basis, continuum_posterior, evaluate_continuum
 from .likelihood import gp_continuum_posterior, gp_conditional_mean
 
 
@@ -59,6 +59,8 @@ def reconstruct_single(obs, specmodel, params, trace, settings):
     coefficients. A custom likelihood or sampled-continuum model supplies its
     own callback to ConfiguredModel. Settings must already include the model's
     resolved degree and basis, plus gp_solver when a GP is used.
+    Vecchia reconstructs the continuum only: mean_flux equals model_flux,
+    gp_mean is omitted, and normal_residual_variance supplies diag(C) for masking.
     """
     names = ("sigma_constant", "sigma_continuum", "jitter")
     if not isinstance(params, Mapping) or "components" not in params or not all(name in trace for name in names):
@@ -82,7 +84,14 @@ def reconstruct_single(obs, specmodel, params, trace, settings):
     result = {"params": params, "physical_flux": physical, "continuum": continuum,
               "continuum_posterior": post, "model_flux": baseline,
               "mean_flux": baseline, "jitter": noise["jitter"]}
-    if gp:
+    if gp and settings["gp_solver"] == "vecchia1":
+        jitters = _region_jitter(noise["jitter"], obs.n_regions)
+        jitters = jitters[0] if obs.ndim == 1 else jitters[:, None]
+        # Marginal residual variance, not the Vecchia innovation variance.
+        # Include fit-masked pixels: masking may reconsider them on the next pass.
+        result["normal_residual_variance"] = (
+            gp["gp_amplitude"]**2 + obs.uncertainty**2 + jitters**2)
+    elif gp:
         result["gp_mean"] = gp_conditional_mean(obs, baseline, jitter=noise["jitter"], **gp_options)
         result["mean_flux"] = baseline + result["gp_mean"]
     return result

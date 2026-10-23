@@ -16,8 +16,8 @@ from test_specfit import case, configured, clipping_case, clipping_model
 
 
 @pytest.mark.parametrize("single", [False, True])
-@pytest.mark.parametrize("solver", [None, "direct", "quasisep"])
-def test_fitted_covariance_and_physical_residual(single, solver, x64_context):
+@pytest.mark.parametrize("solver", [None, "direct", "quasisep", "vecchia1"])
+def test_fitted_covariance_and_physical_residual(single, solver, x64_context, monkeypatch):
     with x64_context():
         fit, settings, point = case(single=single)
         jitter = .004 if single else np.array([.004, .008])
@@ -27,9 +27,23 @@ def test_fitted_covariance_and_physical_residual(single, solver, x64_context):
         flux = fit.observation.flux.copy()
         flux[..., 50] -= .4
         fit = SpecFit(replace(fit.observation, flux=flux), fit.specmodel)
+        previous = fit.fit_mask.copy()
+        if solver == "vecchia1":
+            # Both normal and contaminated fit-masked pixels must be reconsidered.
+            previous[..., [20, 50]] = True
+            fit.set_fit_mask(previous)
+
+            def unavailable(*args, **kwargs):
+                raise AssertionError("Vecchia masking must not construct a tinygp GP or predict its mean")
+
+            monkeypatch.setattr("jaxstar.specfit.likelihood._region_gp", unavailable)
+            monkeypatch.setattr("jaxstar.specfit.reconstruction.gp_conditional_mean", unavailable)
         model = configured(fit, settings)
         original_prediction = fit.predict(point=point, model=model)
-        if solver:
+        if solver == "vecchia1":
+            assert "gp_mean" not in original_prediction
+            assert np.isfinite(original_prediction["model_flux"]).all()
+        elif solver:
             assert np.all(np.abs(original_prediction["gp_mean"][..., 50]) > .1)
         fixed = fit.observation.mask.copy()
         flags = fit.mask_outliers(point=point, model=model,
@@ -45,12 +59,14 @@ def test_fitted_covariance_and_physical_residual(single, solver, x64_context):
         expected = np.exp(terms[1] - logsumexp(terms, axis=0))
         np.testing.assert_allclose(d["mismatch_probability"][~fixed], expected, rtol=1e-10)
         assert flags[..., 50].all() and not flags[fixed].any()
+        if solver == "vecchia1":
+            assert not flags[..., 20].any()
         assert np.isnan(d["mismatch_probability"][fixed]).all()
         np.testing.assert_array_equal(flags, d["mismatch_probability"] > .5)
         np.testing.assert_array_equal(fit.observation.mask, fixed)
         # The model and its prediction contract still contain no mixture sites.
         assert not {"mismatch_fraction", "mismatch_scale"}.intersection(model.prior_trace())
-        fit.reset_fit_mask()
+        fit.set_fit_mask(previous)
         np.testing.assert_array_equal(fit.predict(point=point, model=model)["mean_flux"],
                                       original_prediction["mean_flux"])
 

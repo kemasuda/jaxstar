@@ -1,5 +1,7 @@
 """Grid-aware default priors used by the real single-star model."""
 
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -89,10 +91,13 @@ def test_gp_defaults_reconstruct_and_finite_density_gradient(single):
     fit = make_fit(single=single)
     model = make_model_single(fit, resolving_power=70000., degree=2, gp_solver="quasisep")
     result = trace(fit, model)
-    for name, limits in (("jitter", (-10., -3.)), ("gp_amplitude", (-5., -.5)),
-                         ("gp_scale", (-5., 2.))):
+    wave = np.atleast_2d(np.asarray(fit.observation.wavelength))
+    scale_low = (wave[-1, 0] + wave[-1, -1]) / 2 * 5 / 299792.458
+    scale_high = (wave[0, -1] - wave[0, 0]) / 5
+    for name, limits in (("jitter", (.001, .05)), ("gp_amplitude", (.001, .05)),
+                         ("gp_scale", (scale_low, scale_high))):
         prior = result[name]["fn"]
-        np.testing.assert_allclose(np.log([prior.low, prior.high]), limits)
+        np.testing.assert_allclose([prior.low, prior.high], limits)
     point = {name: site["value"] for name, site in result.items()
              if site["type"] == "sample" and not site["is_observed"]}
     prediction = fit.predict(point=point, model=model)
@@ -105,9 +110,61 @@ def test_gp_defaults_reconstruct_and_finite_density_gradient(single):
     assert all(np.isfinite(g).all() for g in jax.tree_util.tree_leaves(gradient))
 
 
-def test_vecchia_configured_model_likelihood_and_reconstruction_boundary():
-    from jaxstar.specfit import gp_marginalized_continuum_log_likelihood
-    fit = make_fit(single=True)
+def test_noise_default_bounds_are_independent_of_errors_and_masks():
+    original = make_fit()
+    options = dict(resolving_power=70000., rv_bounds=(5., 15.), vsini_max=10.)
+    reference = make_model_single(original, **options)
+    error = np.full(original.observation.shape, .03)
+    error[:, :40] = np.nan
+    error[:, 40:52] = .01
+    fit = SpecFit(replace(original.observation, uncertainty=error,
+                          mask=~np.isfinite(error)), original.specmodel)
+    fit.set_fit_mask(error == .03)
+    model = make_model_single(fit, **options)
+    for name in ("jitter_bounds", "gp_amplitude_bounds"):
+        np.testing.assert_allclose(model.settings[name], (.001, .05))
+    # Masked endpoints do not shorten the region used to set the scale prior.
+    assert model.settings["gp_scale_bounds"] == reference.settings["gp_scale_bounds"]
+    before = model.prior_trace()
+    fit.reset_fit_mask()
+    after = trace(fit, model)
+    for name in ("jitter", "gp_amplitude", "gp_scale"):
+        np.testing.assert_array_equal(
+            [before[name]["fn"].low, before[name]["fn"].high],
+            [after[name]["fn"].low, after[name]["fn"].high])
+
+
+def test_noise_bounds_overrides_and_fixed_parameters_bypass_invalid_defaults():
+    original = make_fit(single=True)
+    obs = original.observation
+    # A narrow region needs explicit scale bounds; large errors do not change priors.
+    fit = SpecFit(Observation(obs.wavelength[30:34], obs.flux[30:34],
+                              np.ones(4)), original.specmodel)
+    options = dict(resolving_power=70000., rv_bounds=(5., 15.), vsini_max=10.)
+    with pytest.raises(ValueError, match="gp_scale_bounds.*ordered bounds"):
+        make_model_single(fit, **options)
+    defaults = make_model_single(fit, **options, gp_scale_bounds=(.03, 1.)).prior_trace()
+    for name in ("jitter", "gp_amplitude"):
+        np.testing.assert_allclose([defaults[name]["fn"].low, defaults[name]["fn"].high],
+                                   (.001, .05))
+    overrides = dict(jitter_bounds=(.001, .02), gp_amplitude_bounds=(.002, .04),
+                     gp_scale_bounds=(.03, 1.))
+    result = make_model_single(fit, **options, **overrides).prior_trace()
+    for name, limits in overrides.items():
+        prior = result[name.removesuffix("_bounds")]["fn"]
+        np.testing.assert_allclose([prior.low, prior.high], limits)
+    fixed = dict(jitter=0., gp_amplitude=.01, gp_scale=.1)
+    result = make_model_single(fit, **options, fixed=fixed).prior_trace()
+    assert all(result[name]["type"] == "deterministic" for name in fixed)
+    result = make_model_single(fit, **options, use_gp=False,
+                               fixed={"jitter": 0.}).prior_trace()
+    assert "gp_scale" not in result
+
+
+@pytest.mark.parametrize("single", [False, True])
+def test_vecchia_configured_model_likelihood_and_reconstruction(single):
+    from jaxstar.specfit import gp_continuum_posterior, gp_marginalized_continuum_log_likelihood
+    fit = make_fit(single=single)
     model = make_model_single(fit, resolving_power=70000., degree=2, gp_solver="vecchia1")
     result = trace(fit, model)
     params = handlers.seed(model, 0)(fit.fit_observation(), fit.specmodel)
@@ -120,8 +177,17 @@ def test_vecchia_configured_model_likelihood_and_reconstruction_boundary():
     assert model.settings["gp_solver"] == "vecchia1"
     point = {name: site["value"] for name, site in result.items()
              if site["type"] == "sample" and not site["is_observed"]}
-    with pytest.raises(ValueError, match="does not define a latent GP conditional mean"):
-        fit.predict(point=point, model=model)
+    prediction = fit.predict(point=point, model=model)
+    post = gp_continuum_posterior(
+        fit.fit_observation(), flux, degree=2, gp_solver="vecchia1", **options)
+    np.testing.assert_allclose(prediction["continuum_posterior"].mean, post.mean)
+    np.testing.assert_allclose(prediction["continuum_posterior"].covariance, post.covariance)
+    np.testing.assert_allclose(prediction["model_flux"], flux * prediction["continuum"])
+    np.testing.assert_array_equal(prediction["mean_flux"], prediction["model_flux"])
+    assert "gp_mean" not in prediction
+    np.testing.assert_allclose(prediction["normal_residual_variance"],
+                               options["gp_amplitude"]**2 + fit.observation.uncertainty**2
+                               + options["jitter"]**2)
 
 
 @pytest.mark.parametrize("width,half_width", [(12., 5.), (20., 10.), (80., 40.)])
