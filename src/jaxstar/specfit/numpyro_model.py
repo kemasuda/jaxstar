@@ -1,6 +1,6 @@
-"""Optional single-star priors on deterministic and marginalized likelihood APIs.
+"""Single-star priors with Gaussian or Gaussian-mixture spectral likelihoods.
 
-No optimizer, sampled continuum coefficients or fitting state lives here.
+No optimizer or fitting state lives here.
 Users can instead write their own NumPyro model using exactly the same helpers.
 """
 
@@ -12,9 +12,9 @@ import numpyro
 import numpyro.distributions as dist
 
 from .broadening import default_broadening
-from .continuum import _degree
+from .continuum import _basis, _degree, chebyshev_basis, continuum_prior, apply_continuum
 from .likelihood import (
-    _validate_gp_solver,
+    _validate_gp_solver, _mixture_parameters, gaussian_mixture_log_likelihood,
     gp_marginalized_continuum_log_likelihood,
     marginalized_continuum_log_likelihood, prepare_gp_observation,
 )
@@ -165,7 +165,8 @@ def _validate_single_config(observation, specmodel, atmosphere, broadening, *,
 
     names = ("vsini", "vmacro", "q1", "q2")
     reserved = (*names, "rv", "resolving_power", "sigma_constant", "sigma_continuum",
-                "jitter", "u1", "u2", "spectrum", "model_flux")
+                "jitter", "u1", "u2", "spectrum", "model_flux",
+                "mismatch_fraction", "mismatch_scale", "continuum_coefficients")
     if set(axes).intersection(reserved):
         raise ValueError(
             "atmosphere axis names conflict with single-star sample sites")
@@ -207,6 +208,18 @@ def _check_ip_choice(specmodel, resolving_power):
         raise ValueError("resolving_power is required unless SpecModel has fixed_ip")
 
 
+def _validate_likelihood(likelihood, gp_enabled, mismatch_fraction, mismatch_scale):
+    if not isinstance(likelihood, str) or likelihood not in ("gaussian", "gaussian_mixture"):
+        raise ValueError("likelihood must be 'gaussian' or 'gaussian_mixture'")
+    if likelihood == "gaussian_mixture":
+        if gp_enabled:
+            raise ValueError("likelihood='gaussian_mixture' requires use_gp=False and no GP parameters")
+        if mismatch_fraction is None or mismatch_scale is None:
+            raise ValueError("supply mismatch_fraction and mismatch_scale as numbers or distributions")
+    elif mismatch_fraction is not None or mismatch_scale is not None:
+        raise ValueError("mismatch parameters require likelihood='gaussian_mixture'")
+
+
 def model_single(observation, specmodel, *, resolving_power=None,
                  atmosphere_bounds=None, rv_bounds=None, vsini_max=None,
                  vmacro_bounds=(0., 10.), fixed=None,
@@ -215,6 +228,7 @@ def model_single(observation, specmodel, *, resolving_power=None,
                  gp_amplitude_bounds=(1e-3, 0.05),
                  gp_scale_bounds=(np.exp(-5.), np.exp(2.)),
                  use_gp=None, gp_solver="auto", use_physical_logg_max=False,
+                 likelihood="gaussian", mismatch_fraction=None, mismatch_scale=None,
                  use_empirical_vmic=None, use_empirical_vmacro=False,
                  vmacro_empirical_sigma=1., degree=4, basis=None,
                  prior_only=False, save_model_flux=False,
@@ -242,8 +256,17 @@ def model_single(observation, specmodel, *, resolving_power=None,
     without clipping. make_model_single checks the gravity support and prepares
     a compatible Teff interval; direct callers choose compatible bounds.
 
-    The continuum coefficients are analytically marginalized with Gaussian
-    priors. The optional residual GP is Matérn-3/2, shared across independent
+    With likelihood="gaussian" (default), continuum coefficients are analytically
+    marginalized under Gaussian priors. With likelihood="gaussian_mixture", the
+    same priors define explicit ``continuum_coefficients`` sites, optimized by
+    run_svi or sampled by run_nuts. Per-pixel mixture
+    indicators are summed out with logsumexp; there are no discrete sample sites.
+    Supply global ``mismatch_fraction`` and absolute-flux ``mismatch_scale`` as
+    numbers or scalar NumPyro distributions. Component variances are
+    uncertainty**2+jitter**2 and uncertainty**2+jitter**2+mismatch_scale**2.
+    Mixture mode does not support GP parameters; use_gp must be False or None.
+
+    The optional Gaussian residual GP is Matérn-3/2, shared across independent
     regions. GP masks must be concrete when tracing. GP amplitude/jitter are in
     flux units, GP scale in wavelength units. All physical/noise sites retain
     their native names; fixed inputs become deterministic sites.
@@ -257,6 +280,10 @@ def model_single(observation, specmodel, *, resolving_power=None,
     before computing spectra or likelihoods. It supports check_prior. Normal
     evaluation returns the same params after recording the spectrum factor.
     """
+    _validate_likelihood(
+        likelihood, use_gp is True or gp_amplitude is not None or gp_scale is not None
+        or bool({"gp_amplitude", "gp_scale"}.intersection(fixed or {})),
+        mismatch_fraction, mismatch_scale)
     _check_ip_choice(specmodel, resolving_power)
     _validate_gp_solver(gp_solver)
     fixed = dict(fixed or {})
@@ -378,7 +405,7 @@ def model_single(observation, specmodel, *, resolving_power=None,
         resolving_power = _draw(
             "resolving_power", resolving_power, regions=n_regions)
 
-    # Continuum prior scales and additive noise; coefficients are marginalized.
+    # Continuum prior scales and additive noise.
     sigma_constant = _draw("sigma_constant", sigma_constant, regions=n_regions)
     sigma_continuum = _draw(
         "sigma_continuum", sigma_continuum, regions=n_regions)
@@ -386,6 +413,21 @@ def model_single(observation, specmodel, *, resolving_power=None,
     if gp_enabled:
         gp_amplitude = _draw("gp_amplitude", gp_amplitude)
         gp_scale = _draw("gp_scale", gp_scale)
+    if likelihood == "gaussian_mixture":
+        mismatch_fraction, mismatch_scale = _mixture_parameters(
+            _draw("mismatch_fraction", mismatch_fraction), _draw("mismatch_scale", mismatch_scale))
+        degree = _degree(degree)
+        basis = chebyshev_basis(observation.wavelength, degree) if basis is None else _basis(basis)
+        if basis.shape != observation.shape + (degree + 1,):
+            raise ValueError("basis shape must be Observation.shape + (degree + 1,)")
+        prior = continuum_prior(
+            sigma_constant=sigma_constant, sigma_continuum=sigma_continuum,
+            degree=degree, n_regions=None if observation.ndim == 1 else n_regions)
+        coefficients = numpyro.sample(
+            "continuum_coefficients", dist.Normal(prior.mean, prior.scale).to_event(prior.mean.ndim),
+            infer={"prior": {
+                "depends_on": ("sigma_constant", "sigma_continuum"),
+                "expression": "Normal([1, 0, ...], [sigma_constant, sigma_continuum, ...])"}})
 
     # Convert limb darkening and evaluate the physical spectrum.
     params = single_star_params(
@@ -400,8 +442,13 @@ def model_single(observation, specmodel, *, resolving_power=None,
     if save_model_flux:
         numpyro.deterministic("model_flux", flux)
 
-    # Normalized likelihood with the continuum integrated out.
-    if not gp_enabled:
+    # Only the mixture samples continuum; its pixel indicators are summed out.
+    if likelihood == "gaussian_mixture":
+        usable_flux = jnp.where(observation.valid, flux, 0)
+        log_likelihood = gaussian_mixture_log_likelihood(
+            observation, apply_continuum(usable_flux, basis, coefficients),
+            mismatch_fraction=mismatch_fraction, mismatch_scale=mismatch_scale, jitter=jitter)
+    elif not gp_enabled:
         log_likelihood = marginalized_continuum_log_likelihood(
             observation, flux, degree=degree, basis=basis,
             sigma_constant=sigma_constant, sigma_continuum=sigma_continuum, jitter=jitter)
@@ -443,6 +490,7 @@ def _bound_pair(value, name, *, shape=(), positive=False, singleton=False):
 def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bounds=None,
                       vsini_max=None, vmacro_bounds=(1., 15.), fixed=None,
                       degree=4, basis=None, use_gp=True, gp_solver="auto",
+                      likelihood="gaussian", mismatch_fraction=None, mismatch_scale=None,
                       use_physical_logg_max=False, use_empirical_vmic=None,
                       use_empirical_vmacro=False, vmacro_empirical_sigma=1.,
                       sigma_constant=0.1, sigma_continuum=0.05,
@@ -463,6 +511,12 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     Resolving power is required, as a positive scalar/region value or a NumPyro
     distribution. Infinity disables the Gaussian instrumental profile. With a
     fixed_ip SpecModel, omit resolving_power; its fixed mixture is used instead.
+
+    ``likelihood="gaussian_mixture"`` requires ``use_gp=False`` and explicit
+    ``mismatch_fraction``/``mismatch_scale`` numbers or scalar distributions.
+    Both are global; the latter is an absolute flux amplitude. Continuum
+    coefficients are explicit inference sites, while pixel mixture indicators
+    are summed out. Both run_svi and run_nuts accept this configured model.
 
     CCF is required only when RV or vsini still needs a default. RV has one
     Uniform per region centered on median CCF RV, with half-width 5 km/s if
@@ -494,6 +548,9 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     spectra = sf.specmodel.spectra
     if not isinstance(use_gp, bool):
         raise TypeError("use_gp must be a bool")
+    _validate_likelihood(
+        likelihood, use_gp or bool({"gp_amplitude", "gp_scale"}.intersection(fixed or {})),
+        mismatch_fraction, mismatch_scale)
     degree = _degree(degree)
     _validate_gp_solver(gp_solver)
     for name, value in (("use_physical_logg_max", use_physical_logg_max),
@@ -637,6 +694,7 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
         vmacro_bounds=vmacro_bounds, fixed=fixed,
         resolving_power=resolving_power, degree=degree, basis=basis,
         use_gp=use_gp, gp_solver=gp_solver, sigma_constant=sigma_constant,
+        likelihood=likelihood, mismatch_fraction=mismatch_fraction, mismatch_scale=mismatch_scale,
         sigma_continuum=sigma_continuum,
         **noise_bounds,
         use_physical_logg_max=use_physical_logg_max, use_empirical_vmic=use_empirical_vmic,

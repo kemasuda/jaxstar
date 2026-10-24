@@ -156,9 +156,12 @@ def _plot_mixture_outliers(observation, baseline, fit_mask, regions, diagnostics
             histogram.set_ylim(bottom=.5)
             histogram.legend(fontsize=8, loc="lower left", bbox_to_anchor=(0, 1.02),
                              ncol=3, handlelength=1.5, columnspacing=1., borderaxespad=0, frameon=False)
+            fraction, mismatch = (diagnostics[name] for name in ("mismatch_fraction", "mismatch_scale"))
+            fraction = "not supplied" if fraction is None else f"{fraction:.4g}"
+            mismatch = "not supplied" if mismatch is None else f"{mismatch:.4g}"
             histogram.text(0, 1.15,
-                           f"f_mismatch = {diagnostics['mismatch_fraction']:.4g}\n"
-                           f"s_mismatch = {diagnostics['mismatch_scale']:.4g}\n"
+                           f"f_mismatch = {fraction}\n"
+                           f"s_mismatch = {mismatch}\n"
                            f"median(sqrt(V)) = {np.median(scale[valid]):.4g}\n"
                            "(scales in flux units)",
                            ha="left", va="bottom", transform=histogram.transAxes,
