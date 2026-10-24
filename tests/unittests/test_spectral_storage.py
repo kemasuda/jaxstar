@@ -66,6 +66,7 @@ def test_save_uses_exact_path_and_requires_explicit_overwrite(artifact, tmp_path
         save_spectral_grid(tmp_path / "bad.npz", spectra.grid)
 
 
+@pytest.mark.parametrize("select", [False, True])
 @pytest.mark.parametrize("problem,message", [
     ("missing-array", "missing.*arrays"), ("wrong-format", "format"),
     ("version", "unsupported.*version"), ("boolean-version", "unsupported.*version"),
@@ -76,7 +77,7 @@ def test_save_uses_exact_path_and_requires_explicit_overwrite(artifact, tmp_path
     ("wave-shape", "shape must match"), ("unit", "angstrom"),
     ("regions", "one region identifier"), ("library", "provenance label"),
 ])
-def test_malformed_common_artifact_fails(artifact, tmp_path, problem, message):
+def test_malformed_common_artifact_fails(artifact, tmp_path, problem, message, select):
     path, _ = artifact
     with np.load(path, allow_pickle=False) as data:
         arrays = {key: data[key] for key in data.files}
@@ -117,12 +118,105 @@ def test_malformed_common_artifact_fails(artifact, tmp_path, problem, message):
     bad = tmp_path / "malformed.npz"
     np.savez(bad, **arrays)
     with pytest.raises(ValueError, match=message):
-        load_spectral_grid(bad)
+        load_spectral_grid(bad, **({"wavelength": [5000., 5000.1], "wav_margin": 0.}
+                                  if select else {}))
 
 
-def test_common_loading_follows_jax_precision_setting(artifact, x64_context):
+@pytest.mark.parametrize("select", [False, True])
+def test_common_loading_follows_jax_precision_setting(artifact, x64_context, select):
     path, _ = artifact
     with x64_context(False):
-        spectra = load_spectral_grid(path)
+        spectra = load_spectral_grid(path, **({"wavelength": [6000., 6002.], "wav_margin": 0.}
+                                              if select else {}))
         assert spectra.grid.field("flux").values.dtype == np.float32
         assert spectra.wavelength.dtype == np.float32
+
+
+@pytest.mark.parametrize("labels", [None, ("first", "second", "first")])
+def test_wavelength_selection_preserves_values_schema_and_row_association(artifact, labels):
+    path, original = artifact
+    indices = [1, 0, 1]
+    # Requests may use only part of a saved region; saved samples stay intact.
+    wave = [[6000.4, 6001.6], [5000.2, 5000.8], [6000.5, 6001.5]]
+    result = load_spectral_grid(path, wavelength=wave, wav_margin=.1, regions=labels)
+    assert result.regions == ((7, "赤", 7) if labels is None else labels)
+    for key in ("library", "wavelength_medium", "wavelength_unit", "flux_kind", "sources"):
+        assert getattr(result, key) == getattr(original, key)
+    assert result.grid.axis_names == original.grid.axis_names
+    assert result.grid.axis_kinds == original.grid.axis_kinds
+    assert result.grid.field("flux").dims == original.grid.field("flux").dims
+    assert result.grid.boundary == original.grid.boundary
+    assert result.grid.fill_value == original.grid.fill_value
+    np.testing.assert_array_equal(result.wavelength, np.asarray(original.wavelength)[indices])
+    np.testing.assert_array_equal(result.grid.field("flux").values,
+                                  np.asarray(original.grid.field("flux").values)[..., indices, :])
+    point = {"temperature": 4550., "abundance_X": .2}
+    np.testing.assert_array_equal(result.grid.interpolate(point)["flux"],
+                                  np.asarray(original.grid.interpolate(point)["flux"])[indices])
+
+
+def test_selection_reaches_jax_only_after_host_subset(artifact, monkeypatch):
+    from jaxstar.specfit import storage
+
+    path, original = artifact
+    construct = storage.RectilinearGrid
+    inputs = []
+
+    def checked_grid(**kwargs):
+        flux = kwargs["fields"]["flux"].values
+        assert isinstance(flux, np.ndarray)
+        assert flux.shape == (3, 3, 1, 3)
+        inputs.append(flux)
+        return construct(**kwargs)
+
+    monkeypatch.setattr(storage, "RectilinearGrid", checked_grid)
+    result = load_spectral_grid(path, wavelength=[6000., 6002.], wav_margin=0.)
+    assert len(inputs) == 1
+    assert result.regions == (7,)
+    np.testing.assert_array_equal(result.wavelength, np.asarray(original.wavelength)[1:])
+    # Exactly sufficient margins also count as coverage.
+    assert load_spectral_grid(path, wavelength=[6000.5, 6001.5],
+                              wav_margin=.5).regions == (7,)
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_coverage_failure_precedes_flux_loading(artifact, tmp_path, monkeypatch, ambiguous):
+    path, _ = artifact
+    if ambiguous:
+        with np.load(path) as data:
+            arrays = {key: data[key] for key in data.files}
+        arrays["wavelength"][1] = arrays["wavelength"][0]
+        path = tmp_path / "overlapping.npz"
+        np.savez(path, **arrays)
+    with np.load(path) as data:
+        npz_type = type(data)
+    getitem = npz_type.__getitem__
+
+    def forbid_flux(self, key):
+        assert key != "flux", "coverage must be checked before reading flux"
+        return getitem(self, key)
+
+    monkeypatch.setattr(npz_type, "__getitem__", forbid_flux)
+    wave = [5000.2, 5000.8] if ambiguous else [4999., 5000.5]
+    with pytest.raises(ValueError, match=f"Region 'obs'.*found {2 if ambiguous else 0}") as error:
+        load_spectral_grid(path, wavelength=wave, regions=("obs",), wav_margin=.1)
+    assert str(path) in str(error.value)
+    assert "row 0 (region '赤')" in str(error.value)
+    assert "Angstrom" in str(error.value)
+
+
+@pytest.mark.parametrize("wave,options,message", [
+    ([], {}, "non-empty"),
+    ([[[5000., 5001.]]], {}, "shape"),
+    ([5001., 5000.], {}, "strictly increasing"),
+    ([5000., np.nan], {}, "finite"),
+    ([0., 1.], {}, "positive"),
+    ([5000., 5001.], {"wav_margin": -1.}, "wav_margin"),
+    ([5000., 5001.], {"wav_margin": np.inf}, "wav_margin"),
+    ([5000., 5001.], {"regions": (8, 9)}, "one identifier"),
+    (None, {"regions": (8,)}, "regions requires wavelength"),
+])
+def test_invalid_wavelength_selection(artifact, wave, options, message):
+    path, _ = artifact
+    with pytest.raises(ValueError, match=message):
+        load_spectral_grid(path, wavelength=wave, **options)

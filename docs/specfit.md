@@ -274,6 +274,17 @@ instrument wavelength CSVs between libraries, stores a common NPZ with recipe
 and input hashes, and keeps generated data outside the repository. The small
 multi-region examples use explicit equal pixel counts with log sampling.
 
+BOSZ and Coelho check all input paths before reading spectra. Use
+`check_spectral_inputs(library, data_dir, axes=axes)` to inspect the plan without
+loading spectra. Missing files are errors by default. For BOSZ,
+`missing_nodes="logg"` explicitly enables averaging the native logg +/- 0.5
+spectra at fixed Teff/composition/vmic. At the requested upper logg edge only,
+an absent upper neighbour permits copying the immediate lower neighbour.
+Other unresolved nodes fail together before any spectra are read. The script
+prints the plan in English and retains replacement methods, source coordinates
+and weights in its manifest. See its guide for the numerical procedure and
+the resulting flat logg dependence at copied upper-edge nodes.
+
 Use `save_spectral_grid(path, spectra)` to persist a prepared result.
 `load_spectral_grid(path)` then needs only that artifact. The jaxspec NPZ loaders
 preserve stored wavelength samples and flux normalization. Use
@@ -289,6 +300,60 @@ spectra = load_spectral_grid("coelho_log.npz")  # your prepared artifact
 specmodel = SpecModel(spectra, vmax=50.)  # broadening kernel support in km/s
 print(spectra.grid.axis_names)
 ```
+
+#### Select regions from a common prepared NPZ
+
+Pass the file written by `save_spectral_grid` or the preparation script to
+`SpecFit.from_grid` to select regions for an observation:
+
+```python
+from jaxstar.specfit import Observation, SpecFit
+
+obs = Observation(wav_obs, flux_obs, error_obs,
+                  mask=mask_obs, region=region_labels)
+sf = SpecFit.from_grid("/path/to/prepared/grid.npz", obs,
+                       wav_margin=3., vmax=50.)
+```
+
+The factory uses each row's full observed wavelength interval, including masked
+pixels, to find exactly one saved region covering that interval plus `wav_margin`
+Angstrom on **each** side. It selects and reorders regions to match the observed
+rows. One saved region may serve several rows. Zero or multiple covering regions
+fail before flux loading, with the candidate labels and coverages in the error.
+Observation labels name the output rows; they do not select saved identifiers or
+resolve overlapping candidates. If observation labels are omitted, selected
+saved labels are retained.
+
+Selected regions retain their complete saved wavelength spans and samples.
+The full flux array is read into host memory and selected in NumPy; only the
+selected subset enters the JAX grid. All atmosphere axes and their ordering,
+flux dtype (subject to JAX precision settings), and saved interpretation metadata
+are preserved. Source paths remain provenance for the full artifact.
+
+The common NPZ supplies `library`, `wavelength_medium` and `flux_kind`. If supplied,
+`library`, a medium other than `"unknown"`, and a flux kind other than `"as_stored"`
+must agree with the saved metadata. `pattern` applies only to legacy directories.
+The factory performs no wavelength conversion or flux normalization. Ensure that
+the artifact's wavelength medium and flux product match your observation.
+
+No sampling arguments are needed for a saved log-uniform grid. Specify either
+`pixels` or `velocity_step` to resample explicitly; this is required if the
+saved samples are not log-uniform. Resampling uses the selected regions' full
+spans, independently of the observed detector pixel count.
+
+`SpecModel.from_grid(path, obs.wavelength, regions=obs.region, ...)` provides the
+same selection without storing an observation. To load the selected carrier
+directly, use:
+
+```python
+spectra = load_spectral_grid(
+    "/path/to/prepared/grid.npz", wavelength=obs.wavelength,
+    regions=obs.region, wav_margin=3.,
+)
+```
+
+Omitting `wavelength` retains the original `load_spectral_grid(path)` behavior:
+all saved regions are restored. The NPZ schema and spectral carrier are unchanged.
 
 #### Select legacy grids for an observation
 
@@ -308,7 +373,7 @@ specmodel = sf.specmodel
 print(sf.rv_bounds)  # (n_region, 2), lower/upper effective RV in km/s
 ```
 
-`library` selects the existing Coelho, BOSZ or TLUSTY loader. `wav_margin` is
+`library` selects the existing Coelho (default), BOSZ or TLUSTY loader. `wav_margin` is
 the minimum required wavelength margin in Angstrom on **each** side of every
 observation row, including masked pixels. Selection reads actual stored
 `wavgrid` values; filenames only determine which files match `pattern`
@@ -323,8 +388,8 @@ loader/resampler requirements still apply: shared atmosphere axes, compatible
 dtypes and equal region pixel counts, including counts produced by a requested
 velocity step. Wavelength medium and flux kind are caller declarations;
 these factories do not convert air/vacuum wavelengths or normalize flux.
-This entry point takes legacy NPZs, not raw atmosphere files or common-format
-`save_spectral_grid` artifacts, and performs no downloads.
+The directory form accepts legacy NPZs; pass a common-format artifact as a file
+as shown above. Neither form accepts raw atmosphere files or performs downloads.
 
 To prepare only the model, or inspect just the selected paths, use:
 

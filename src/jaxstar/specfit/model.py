@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import NamedTuple
 
 import jax
@@ -143,42 +144,75 @@ class SpecModel:
     _ip_fourier: object
 
     @classmethod
-    def from_grid(cls, gridpath, wavelength, *, regions=None, library="coelho",
+    def from_grid(cls, gridpath, wavelength, *, regions=None, library=None,
                   pattern="*.npz", wav_margin=3., pixels=None, velocity_step=None,
                   vmax=50., wavelength_medium="unknown", flux_kind="as_stored",
                   broadening_operator=None, fixed_ip=None):
-        """Select legacy NPZ regions, resample to log wavelength and build a model.
+        """Select spectral regions from a common NPZ or legacy NPZ directory.
 
         ``wavelength`` (Angstrom; 1D or region-by-pixel) is used only to select
-        files, via :func:`select_grid_paths`. ``regions`` labels the selected
-        rows. ``library`` chooses 'coelho', 'bosz' or 'tlusty'; paths must satisfy
-        the corresponding loader's shared-axis, dtype and pixel-count rules.
-        Raw atmosphere files and common-format saved grids are not inputs here.
+        regions covering each full row plus ``wav_margin`` on both sides.
+        ``regions`` labels the output rows; it does not select stored labels.
+        Zero or multiple covering candidates fail before loading flux.
 
-        Specify exactly one of ``pixels`` or ``velocity_step`` (km/s). Each
-        selected file's full wavelength span is resampled, independently of
-        the requested detector pixels. The observation is not stored. Medium
-        and flux kind are declarations passed to the loader; neither wavelength
-        conversion nor flux normalization is performed. Selection/resampling
-        and file I/O happen once, outside JIT. No data are downloaded.
+        For a common-format NPZ file, metadata identifies the library, wavelength
+        medium and flux kind. Saved samples are retained unless ``pixels`` or
+        ``velocity_step`` (km/s) requests log resampling. Without resampling,
+        saved wavelengths must already be log-uniform. Explicit ``library``,
+        non-'unknown' medium and non-'as_stored' flux kind must match metadata.
+        Omitted ``regions`` retains the selected saved labels.
+
+        For a directory, ``select_grid_paths`` selects legacy files matching
+        ``pattern``. ``library`` chooses 'coelho' (default), 'bosz' or 'tlusty'.
+        Specify exactly one of ``pixels`` or ``velocity_step``. Medium and flux
+        kind are declarations passed to the legacy loader. Its shared-axis,
+        dtype and pixel-count requirements still apply.
+
+        Selection/resampling uses each selected region's full wavelength span,
+        independently of detector pixel counts. The observation is not stored.
+        Neither wavelength conversion nor flux normalization is performed.
+        Setup happens once, outside JIT; no raw files or downloads are used.
         ``fixed_ip`` is passed to SpecModel in the selected region row order.
         """
         from .libraries import select_grid_paths, load_coelho, load_bosz, load_tlusty
         from .observation import _identifiers
         from .sampling import _sampling_mode, resample_spectral_grid
+        from .storage import load_spectral_grid
 
-        loaders = {"coelho": load_coelho, "bosz": load_bosz, "tlusty": load_tlusty}
-        if library not in loaders:
-            raise ValueError("library must be 'coelho', 'bosz' or 'tlusty'")
-        _sampling_mode("log", pixels, velocity_step)
+        if wavelength is None:
+            raise ValueError("wavelength is required to select model regions")
+        path = Path(gridpath).expanduser()
         regions = None if regions is None else tuple(regions)
-        paths = select_grid_paths(gridpath, wavelength, wav_margin=wav_margin,
-                                  pattern=pattern, regions=regions)
-        regions = _identifiers(regions, "regions", len(paths))
-        spectra = loaders[library](paths, regions=regions,
-                                   wavelength_medium=wavelength_medium, flux_kind=flux_kind)
-        spectra = resample_spectral_grid(spectra, sampling="log", pixels=pixels,
-                                         velocity_step=velocity_step)
+        resample = pixels is not None or velocity_step is not None
+        if path.is_file():
+            if resample:
+                _sampling_mode("log", pixels, velocity_step)
+            spectra = load_spectral_grid(path, wavelength=wavelength,
+                                         wav_margin=wav_margin, regions=regions)
+            for name, value, unspecified in (
+                ("library", library, None),
+                ("wavelength_medium", wavelength_medium, "unknown"),
+                ("flux_kind", flux_kind, "as_stored"),
+            ):
+                stored = getattr(spectra, name)
+                if value != unspecified and value != stored:
+                    raise ValueError(f"{name}={value!r} conflicts with saved {name}={stored!r}")
+        elif path.is_dir():
+            loaders = {"coelho": load_coelho, "bosz": load_bosz, "tlusty": load_tlusty}
+            library = "coelho" if library is None else library
+            if library not in loaders:
+                raise ValueError("library must be 'coelho', 'bosz' or 'tlusty'")
+            _sampling_mode("log", pixels, velocity_step)
+            paths = select_grid_paths(path, wavelength, wav_margin=wav_margin,
+                                      pattern=pattern, regions=regions)
+            regions = _identifiers(regions, "regions", len(paths))
+            spectra = loaders[library](paths, regions=regions,
+                                       wavelength_medium=wavelength_medium, flux_kind=flux_kind)
+        else:
+            raise FileNotFoundError(f"Spectral grid path does not exist: {path}")
+        if resample:
+            spectra = resample_spectral_grid(spectra, sampling="log", pixels=pixels,
+                                             velocity_step=velocity_step)
         return cls(spectra, vmax=vmax, broadening_operator=broadening_operator, fixed_ip=fixed_ip)
 
     def __init__(self, spectra, *, vmax=50., broadening_operator=None, fixed_ip=None):

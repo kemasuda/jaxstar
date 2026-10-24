@@ -1,0 +1,44 @@
+{
+  "description": "Small BOSZ dwarf grid with [C/M]=0; expand the axes for your target sample.",
+  "library": "bosz",
+  "axes": {
+    "teff": [
+      5750,
+      6000,
+      6250
+    ],
+    "logg": [
+      4.0,
+      4.5
+    ],
+    "mh": [
+      -0.25,
+      0.0,
+      0.25
+    ],
+    "alpha": [
+      -0.25,
+      0.0,
+      0.25
+    ],
+    "carbon": [
+      0.0
+    ],
+    "vmic": [
+      0,
+      1,
+      2,
+      4
+    ]
+  },
+  "wavelength_ranges_file": "../wavelength_ranges/ird_h.csv",
+  "regions": [
+    8,
+    9
+  ],
+  "wav_margin": 5.0,
+  "sampling": {
+    "pixels": 5000
+  },
+  "normalized": true
+}

@@ -1,0 +1,19 @@
+{
+  "description": "Small BOSZ dwarf grid with [C/M]=0; expand the axes for your target sample.",
+  "library": "bosz",
+  "missing_nodes": "logg",
+  "axes": {
+    "teff": {"min": 5000, "max": 8000, "step": 250},
+    "logg": {"min": 3.0, "max": 5.0, "step": 0.5},
+    "mh": {"min": -1, "max": 0.5, "step": 0.25},
+    "alpha": [-0.25, 0.0, 0.25],
+    "carbon": [0.0],
+    "vmic": [0, 1, 2]
+  },
+  "wavelength_ranges_file": "../wavelength_ranges/gaoes_rv.csv",
+  "wav_margin": 5.0,
+  "sampling": {
+    "pixels": 7500
+  },
+  "normalized": true
+}

@@ -9,6 +9,7 @@ import pytest
 from jaxstar.specfit import (
     Observation, SpecFit, SpecModel, select_grid_paths,
     load_coelho, load_bosz, load_tlusty, resample_spectral_grid,
+    save_spectral_grid,
 )
 
 
@@ -207,3 +208,106 @@ def test_empty_rv_interval_and_custom_broadening(tmp_path):
     point["components"][0]["rv"] = 2000.
     with pytest.raises(ValueError, match="coverage"):
         custom.specmodel(point, wave)
+
+
+@pytest.mark.parametrize("library,loader", [
+    ("coelho", load_coelho), ("bosz", load_bosz), ("tlusty", load_tlusty),
+])
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_common_npz_factories_match_selected_legacy_models(tmp_path, library, loader, single, dtype):
+    paths, wave = write_grids(tmp_path, library, dtype)
+    spectra = resample_spectral_grid(loader(
+        paths, regions=("blue", "red"), wavelength_medium="air", flux_kind="normalized"),
+        pixels=501)
+    path = save_spectral_grid(tmp_path / "common.npz", spectra)
+    indices = [1] if single else [1, 0, 1]
+    selected_wave = wave[1] if single else wave[indices]
+    labels = (9,) if single else (9, 8, 9)
+    obs = observation(selected_wave, labels)
+    # No library/sampling/medium/product declarations: use saved information.
+    fit = SpecFit.from_grid(path, obs, vmax=30.)
+    model = SpecModel.from_grid(path, selected_wave, regions=np.asarray(labels), vmax=30.)
+    manual = SpecModel(resample_spectral_grid(loader(
+        [paths[i] for i in indices], regions=labels, wavelength_medium="air",
+        flux_kind="normalized"), pixels=501), vmax=30.)
+    point = params(manual)
+    expected = manual(point, selected_wave)
+    assert fit.observation is obs
+    assert fit.regions == labels
+    for result in (fit.specmodel, model):
+        assert result.spectra.regions == labels
+        assert result.spectra.library == library
+        assert result.spectra.wavelength_medium == "air"
+        assert result.spectra.flux_kind == "normalized"
+        assert result.spectra.sources == spectra.sources
+        assert result.spectra.grid.field("flux").values.dtype == dtype
+        np.testing.assert_array_equal(result.spectra.wavelength, manual.spectra.wavelength)
+        np.testing.assert_array_equal(result.spectra.grid.field("flux").values,
+                                      manual.spectra.grid.field("flux").values)
+        np.testing.assert_allclose(result(point, selected_wave), expected, atol=1e-12)
+    np.testing.assert_array_equal(fit.rv_bounds, SpecFit(obs, manual).rv_bounds)
+
+
+@pytest.mark.parametrize("sampling", [{"pixels": 601}, {"velocity_step": 2.}])
+def test_common_npz_optional_resampling_and_saved_labels(tmp_path, sampling):
+    paths, wave = write_grids(tmp_path, "bosz")
+    # A non-log-uniform prepared artifact needs explicit resampling to fit.
+    path = save_spectral_grid(tmp_path / "common.npz", load_bosz(paths, regions=(8, 9)))
+    with pytest.raises(ValueError, match="log-uniform"):
+        SpecFit.from_grid(path, observation(wave))
+    fit = SpecFit.from_grid(path, observation(wave[::-1]), vmax=30., **sampling)
+    assert fit.regions == (9, 8)
+    manual = resample_spectral_grid(load_bosz(paths[::-1], regions=(9, 8)), **sampling)
+    np.testing.assert_array_equal(fit.specmodel.spectra.wavelength, manual.wavelength)
+    np.testing.assert_array_equal(fit.specmodel.spectra.grid.field("flux").values,
+                                  manual.grid.field("flux").values)
+    with pytest.raises(ValueError, match="exactly one"):
+        SpecFit.from_grid(path, observation(wave), pixels=500, velocity_step=2.)
+
+
+def test_common_npz_declarations_masks_and_jit(tmp_path):
+    paths, wave = write_grids(tmp_path, "bosz")
+    spectra = resample_spectral_grid(load_bosz(
+        paths, wavelength_medium="air", flux_kind="normalized"), pixels=501)
+    path = save_spectral_grid(tmp_path / "common.npz", spectra)
+    fit = SpecFit.from_grid(path, observation(wave), library="bosz",
+                            wavelength_medium="air", flux_kind="normalized", vmax=30.)
+    model, point = fit.specmodel, params(fit.specmodel)
+    np.testing.assert_allclose(jax.jit(lambda m, p, w: m(p, w))(model, point, wave),
+                               model(point, wave), atol=1e-12)
+    for options in ({"library": "coelho"}, {"wavelength_medium": "vacuum"},
+                    {"flux_kind": "unnormalized"}):
+        with pytest.raises(ValueError, match="conflicts with saved"):
+            SpecFit.from_grid(path, observation(wave), **options)
+    full = np.asarray(spectra.wavelength)
+    obs = observation(full)
+    # The first pixel is masked, but selection still requires its margin.
+    with pytest.raises(ValueError, match="found 0"):
+        SpecFit.from_grid(path, obs, wav_margin=.01)
+    np.testing.assert_array_equal(
+        SpecFit.from_grid(path, obs, wav_margin=0., vmax=30.).rv_bounds,
+        SpecFit.from_grid(path, replace(obs, mask=np.ones_like(full, dtype=bool)),
+                          wav_margin=0., vmax=30.).rv_bounds)
+
+
+def test_common_npz_custom_broadening_and_missing_path(tmp_path):
+    paths, wave = write_grids(tmp_path)
+    spectra = replace(resample_spectral_grid(load_coelho(paths), pixels=501),
+                      library="custom_synthesis")
+    path = save_spectral_grid(tmp_path / "common.npz",
+                              spectra)
+
+    def unbroadened(wavelength, flux, **kwargs):
+        return wavelength, flux
+
+    fit = SpecFit.from_grid(path, observation(wave), broadening_operator=unbroadened)
+    assert fit.specmodel.spectra.library == "custom_synthesis"
+    assert fit.rv_bounds is None
+    assert np.isfinite(fit.specmodel(params(fit.specmodel), wave)).all()
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        SpecFit.from_grid(tmp_path / "missing.npz", observation(wave))
+    with pytest.raises(ValueError, match="not a common prepared"):
+        SpecFit.from_grid(paths[0], observation(wave[0]))
+    with pytest.raises(ValueError, match="wavelength is required"):
+        SpecModel.from_grid(path, None)

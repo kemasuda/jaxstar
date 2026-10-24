@@ -16,7 +16,7 @@ import numpy as np
 
 from jaxstar.grid import Field, RectilinearGrid
 from ._data import _SpectralLibrary, _validate_wavelength
-from .observation import _identifiers
+from ._selection import _covering_indices, _wavelength_request
 from .sampling import _sampling_mode, _target_wavelengths
 
 
@@ -46,21 +46,7 @@ def select_grid_paths(gridpath, wavelength, *, wav_margin=3., pattern="*.npz",
     their path. Common-format NPZs and raw atmosphere files are not supported.
     Wavelength medium/units are not converted or inferred from the files.
     """
-    wave = np.asarray(wavelength)
-    if wave.dtype.kind not in "fiu":
-        raise TypeError("wavelength must contain real numeric values")
-    if wave.ndim not in (1, 2):
-        raise ValueError("wavelength must have shape (pixel,) or (region, pixel)")
-    wave = np.atleast_2d(wave)
-    _validate_wavelength(wave, ndim=2)
-    labels = _identifiers(regions, "regions", len(wave))
-    if labels is None:
-        labels = tuple(range(len(wave)))
-    margin = np.asarray(wav_margin)
-    if (margin.ndim != 0 or margin.dtype.kind not in "fiu"
-            or not np.isfinite(margin) or margin < 0):
-        raise ValueError("wav_margin must be finite nonnegative Angstrom")
-    margin = float(margin)
+    wave, labels, margin = _wavelength_request(wavelength, regions, wav_margin)
     if not isinstance(pattern, str) or not pattern:
         raise ValueError("pattern must be a non-empty glob pattern")
     root = Path(gridpath).expanduser()
@@ -75,21 +61,10 @@ def select_grid_paths(gridpath, wavelength, *, wav_margin=3., pattern="*.npz",
                 if stored.dtype.kind not in "fiu":
                     raise ValueError("wavgrid must contain real numeric values")
                 _validate_wavelength(stored, ndim=1)
-                candidates.append((path, float(stored[0]), float(stored[-1])))
+                candidates.append((str(path), float(stored[0]), float(stored[-1])))
         except (KeyError, ValueError, OSError) as exc:
             raise ValueError(f"{path}: cannot read a valid legacy wavgrid: {exc}") from exc
-    selected = []
-    for label, row in zip(labels, wave):
-        low, high = float(row[0]) - margin, float(row[-1]) + margin
-        matches = [path for path, left, right in candidates if left <= low and right >= high]
-        if len(matches) != 1:
-            raise ValueError(
-                f"Region {label!r}: expected one covering grid, found {len(matches)} "
-                f"for [{low:g}, {high:g}] Angstrom including wav_margin={margin:g}. "
-                f"Matches: {[str(path) for path in matches]}. "
-                f"Candidates: {[(str(path), left, right) for path, left, right in candidates]}")
-        selected.append(matches[0])
-    return selected
+    return [paths[i] for i in _covering_indices(wave, labels, margin, candidates)]
 
 
 def load_coelho(paths, *, pixel_slices=None, regions=None,
@@ -235,18 +210,15 @@ def prepare_coelho(data_dir, *, axes, wavelength_ranges, pixels=None,
     Row 0 is normalized flux; row 1 is unnormalized flux. Raw output is float32,
     matching frozen preparation. ``source_overrides`` maps atmosphere tuples
     to explicit FITS paths for known missing-model replacements/naming aliases;
-    no replacement is applied silently. Paths are recorded in .sources.
+    no replacement is applied silently. All input paths are checked before
+    opening any spectra. Paths are recorded in .sources.
     Returns an in-memory private spectral carrier; persist it once with
     save_spectral_grid and use load_spectral_grid in subsequent processes.
     """
     axes = _preparation_axes("coelho", axes)
-    root = Path(data_dir).expanduser()
-    paths = {}
-    for node in product(*axes.values()):
-        t, g, f, a = node
-        filename = f"{_integer(t)}_{_integer(g * 10):02d}_{'p' if f >= 0 else 'm'}{_integer(abs(f) * 10):02d}p{_integer(a * 10):02d}.ms.fits"
-        paths[node] = root / filename
-    paths = _source_overrides(paths, source_overrides, root)
+    _sampling_mode(sampling, pixels, velocity_step)
+    paths, _, report = _spectral_source_plan("coelho", data_dir, axes, "error", source_overrides)
+    _require_source_plan(report)
     kind = "normalized" if normalized else "unnormalized"
     _output_medium(wavelength_medium)
 
@@ -273,7 +245,8 @@ def prepare_coelho(data_dir, *, axes, wavelength_ranges, pixels=None,
 
 def prepare_bosz(data_dir, *, axes, wavelength_ranges, pixels=None,
                  regions=None, wavelength_medium="vacuum", normalized=True,
-                 source_overrides=None, sampling=None, velocity_step=None):
+                 source_overrides=None, sampling=None, velocity_step=None,
+                 missing_nodes="error"):
     """Prepare BOSZ-2024 gzip ASCII nodes (wavelength, H, continuum).
 
     Axes are teff/logg/mh/alpha/carbon/vmic. Normalized flux is H/continuum;
@@ -284,8 +257,16 @@ def prepare_bosz(data_dir, *, axes, wavelength_ranges, pixels=None,
     alternative for compatibility/tests/special purposes. See prepare_coelho
     for region coverage and native/linear options.
     Filenames use mp for logg > 3, ms otherwise, and m±X.XX subdirectories.
-    Missing files fail; source_overrides explicitly supports deliberate
-    replacements instead of the old automatic logg=4 fallback.
+    All input paths are checked before opening any spectra. Missing files fail
+    by default. With ``missing_nodes='logg'``, missing nodes use the two native
+    neighbours at logg +/- 0.5, holding all other coordinates fixed. Each source
+    is resampled onto the output wavelengths before averaging its flux. At the
+    upper end of the requested logg axis only, an absent upper neighbour permits
+    copying the lower neighbour. There is no recursive filling or linear extrapolation.
+    Neighbours may lie outside the requested axes. Corrupt files and insufficient
+    wavelength coverage still fail. Use check_spectral_inputs to inspect and
+    retain the replacement report; .sources lists the actual files used.
+    ``source_overrides`` supports deliberate replacements in strict mode only.
     Native BOSZ wavelengths below 2000 Angstrom are already vacuum; above they
     are air. Vacuum conversion respects this convention. Air output requires
     selected regions above 2000 Angstrom. Some native ASCII files repeat a
@@ -295,16 +276,10 @@ def prepare_bosz(data_dir, *, axes, wavelength_ranges, pixels=None,
     Returns an in-memory private spectral carrier for save_spectral_grid.
     """
     axes = _preparation_axes("bosz", axes)
-    root = Path(data_dir).expanduser()
-    paths = {}
-    for node in product(*axes.values()):
-        t, g, m, a, c, v = node
-        for encoded in (g * 10, m * 100, a * 100, c * 100):
-            _integer(encoded)
-        geometry = "mp" if g > 3 else "ms"
-        filename = f"bosz2024_{geometry}_t{_integer(t)}_g{g:+.1f}_m{m:+.2f}_a{a:+.2f}_c{c:+.2f}_v{_integer(v)}_rorig_noresam.txt.gz"
-        paths[node] = root / f"m{m:+.2f}" / filename
-    paths = _source_overrides(paths, source_overrides, root)
+    _sampling_mode(sampling, pixels, velocity_step)
+    paths, node_sources, report = _spectral_source_plan(
+        "bosz", data_dir, axes, missing_nodes, source_overrides)
+    _require_source_plan(report)
     _output_medium(wavelength_medium)
     bounds = _region_bounds(wavelength_ranges)
     if wavelength_medium == "air" and np.any(bounds[:, 0] < 2000):
@@ -332,7 +307,105 @@ def prepare_bosz(data_dir, *, axes, wavelength_ranges, pixels=None,
 
     return _prepare_nodes("bosz", axes, reader, bounds, pixels, regions,
                           wavelength_medium, "normalized" if normalized else "unnormalized",
-                          tuple(paths.values()), sampling=sampling, velocity_step=velocity_step)
+                          tuple(report["sources"]), sampling=sampling, velocity_step=velocity_step,
+                          node_sources=node_sources)
+
+
+def check_spectral_inputs(library, data_dir, *, axes, missing_nodes="error", source_overrides=None):
+    """Check local BOSZ/Coelho paths without opening spectra or allocating a grid.
+
+    Return a JSON-serializable report with ready, requested_nodes, sources,
+    replacements and unresolved entries. Replacement entries identify target
+    coordinates, method, source coordinates/paths and weights. Unresolved entries
+    include every missing target and the unavailable neighbours. This checks
+    local file existence, not file contents or the upstream catalogue. Download
+    intended native inputs first; a missing download is also treated as missing.
+    Preparation repeats this check before reading spectra.
+
+    ``missing_nodes='logg'`` is BOSZ-only; see prepare_bosz for its interpolation
+    and upper-edge copy rules. The default is strict for both libraries.
+    """
+    if library not in {"bosz", "coelho"}:
+        raise ValueError("input checking supports only 'bosz' and 'coelho'")
+    axes = _preparation_axes(library, axes)
+    return _spectral_source_plan(library, data_dir, axes, missing_nodes, source_overrides)[2]
+
+
+def _native_spectral_path(library, root, node):
+    if library == "coelho":
+        t, g, f, a = node
+        filename = f"{_integer(t)}_{_integer(g * 10):02d}_{'p' if f >= 0 else 'm'}{_integer(abs(f) * 10):02d}p{_integer(a * 10):02d}.ms.fits"
+        return root / filename
+    t, g, m, a, c, v = node
+    for encoded in (g * 10, m * 100, a * 100, c * 100):
+        _integer(encoded)
+    geometry = "mp" if g > 3 else "ms"
+    filename = f"bosz2024_{geometry}_t{_integer(t)}_g{g:+.1f}_m{m:+.2f}_a{a:+.2f}_c{c:+.2f}_v{_integer(v)}_rorig_noresam.txt.gz"
+    return root / f"m{m:+.2f}" / filename
+
+
+def _spectral_source_plan(library, data_dir, axes, missing_nodes, source_overrides):
+    if missing_nodes not in ("error", "logg"):
+        raise ValueError("missing_nodes must be 'error' or 'logg'")
+    if missing_nodes == "logg":
+        if library != "bosz":
+            raise ValueError("missing_nodes='logg' is supported only for BOSZ")
+        if source_overrides:
+            raise ValueError("missing_nodes='logg' cannot be combined with source_overrides")
+        for g in axes["logg"]:
+            _integer(g * 2)
+    root = Path(data_dir).expanduser()
+    nodes = tuple(product(*axes.values()))
+    paths = {node: _native_spectral_path(library, root, node) for node in nodes}
+    paths = _source_overrides(paths, source_overrides, root)
+    node_sources, replacements, unresolved = {}, [], []
+
+    def coordinates(node):
+        return {key: float(value) for key, value in zip(axes, node)}
+
+    for node in nodes:
+        path = paths[node]
+        if path.is_file():
+            node_sources[node] = ((node, 1.),)
+            continue
+        entry = dict(node=coordinates(node), missing_path=str(path))
+        if missing_nodes == "error":
+            unresolved.append({**entry, "reason": "input file is missing"})
+            continue
+        t, g, *rest = node
+        lower, upper = (t, g - .5, *rest), (t, g + .5, *rest)
+        for neighbor in (lower, upper):
+            paths[neighbor] = _native_spectral_path(library, root, neighbor)
+        has_lower, has_upper = paths[lower].is_file(), paths[upper].is_file()
+        if has_lower and has_upper:
+            method, contributors = "linear_logg", ((lower, .5), (upper, .5))
+        elif has_lower and not has_upper and g == axes["logg"][-1]:
+            method, contributors = "copy_lower_logg", ((lower, 1.),)
+        else:
+            absent = [str(paths[n]) for n in (lower, upper) if not paths[n].is_file()]
+            unresolved.append({**entry, "missing_neighbors": absent,
+                               "reason": "adjacent native logg files are required; lower-only copying is allowed only at the requested upper edge"})
+            continue
+        node_sources[node] = contributors
+        replacements.append({**entry, "method": method, "sources": [
+            dict(node=coordinates(source), path=str(paths[source]), weight=weight)
+            for source, weight in contributors]})
+    sources = list(dict.fromkeys(str(paths[source]) for contributors in node_sources.values()
+                                for source, _ in contributors))
+    report = dict(ready=not unresolved, requested_nodes=len(nodes), missing_nodes=missing_nodes,
+                  sources=sources, replacements=replacements, unresolved=unresolved)
+    return paths, node_sources, report
+
+
+def _require_source_plan(report):
+    if report["unresolved"]:
+        details = []
+        for entry in report["unresolved"]:
+            details.append(f"{entry['missing_path']}: {entry['reason']}")
+            details.extend(f"  Missing neighbor: {path}" for path in entry.get("missing_neighbors", ()))
+        raise FileNotFoundError(
+            f"Input check failed for {len(report['unresolved'])} node(s); no spectra were read.\n"
+            + "\n".join(details))
 
 
 def prepare_tlusty(data_dir, *, wavelength_ranges, axes=None, pixels=None,
@@ -511,22 +584,26 @@ def _selected_regions(reader, node, bounds, *, bounds_only=False, median_scaled=
 
 
 def _prepare_nodes(library, axes, reader, bounds, pixels, regions, medium, kind, sources,
-                   *, sampling=None, velocity_step=None):
+                   *, sampling=None, velocity_step=None, node_sources=None):
     mode = _sampling_mode(sampling, pixels, velocity_step)
     bounds = _region_bounds(bounds)
     nodes = tuple(product(*axes.values()))
+    if node_sources is None:
+        node_sources = {node: ((node, 1.),) for node in nodes}
     wavelength, flux = None, None
     if mode == "log":
-        # Requested bounds determine the target once; each raw node is read
-        # only once and interpolated straight to this grid, without a linear
-        # prepared intermediate or an extra coverage-discovery pass.
+        # Requested bounds determine the target once; each source is interpolated
+        # straight to this grid, without a linear prepared intermediate or an
+        # extra coverage-discovery pass.
         wavelength = _target_wavelengths(bounds, mode, pixels, velocity_step)
     elif mode == "linear":
         # A bounds-only pass avoids retaining every native spectrum or building
         # large DataFrames. The second pass streams one node into the output.
         lower = np.full(len(bounds), -np.inf)
         upper = np.full(len(bounds), np.inf)
-        for node in nodes:
+        input_nodes = dict.fromkeys(source for contributors in node_sources.values()
+                                   for source, _ in contributors)
+        for node in input_nodes:
             samples = _selected_regions(reader, node, bounds, bounds_only=True)
             lower = np.maximum(lower, [wav[0] for wav, _ in samples])
             upper = np.minimum(upper, [wav[-1] for wav, _ in samples])
@@ -535,22 +612,27 @@ def _prepare_nodes(library, axes, reader, bounds, pixels, regions, medium, kind,
         wavelength = np.stack([np.linspace(lo, hi, pixels) for lo, hi in zip(lower, upper)])
 
     for flat_index, node in enumerate(nodes):
-        samples = _selected_regions(reader, node, bounds, median_scaled=kind == "median_scaled",
-                                    bracket=mode == "log")
-        if wavelength is None:
-            sizes = {wav.size for wav, _ in samples}
-            if len(sizes) != 1:
-                raise ValueError("native regions have different lengths; specify pixels or prepare separately")
-            wavelength = np.stack([wav for wav, _ in samples])
-        if flux is None:
-            flux = np.empty(tuple(len(axis) for axis in axes.values()) + wavelength.shape,
-                            dtype=np.float32)
+        combined = None
+        for source, weight in node_sources[node]:
+            samples = _selected_regions(reader, source, bounds, median_scaled=kind == "median_scaled",
+                                        bracket=mode == "log")
+            if wavelength is None:
+                sizes = {wav.size for wav, _ in samples}
+                if len(sizes) != 1:
+                    raise ValueError("native regions have different lengths; specify pixels or prepare separately")
+                wavelength = np.stack([wav for wav, _ in samples])
+            if flux is None:
+                flux = np.empty(tuple(len(axis) for axis in axes.values()) + wavelength.shape,
+                                dtype=np.float32)
+            if combined is None:
+                combined = np.zeros(wavelength.shape, dtype=np.float64)
+            for region, (wav, values) in enumerate(samples):
+                if mode == "native":
+                    if not np.array_equal(wav, wavelength[region]):
+                        raise ValueError("native wavelength samples differ across nodes; specify pixels")
+                    combined[region] += weight * values
+                else:
+                    combined[region] += weight * np.interp(wavelength[region], wav, values)
         index = np.unravel_index(flat_index, flux.shape[:len(axes)])
-        for region, (wav, values) in enumerate(samples):
-            if mode == "native":
-                if not np.array_equal(wav, wavelength[region]):
-                    raise ValueError("native wavelength samples differ across nodes; specify pixels")
-                flux[index + (region,)] = values
-            else:
-                flux[index + (region,)] = np.interp(wavelength[region], wav, values)
+        flux[index] = combined
     return _assemble(library, axes, wavelength, flux, regions, medium, kind, sources)
