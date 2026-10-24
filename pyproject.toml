@@ -68,6 +68,7 @@ packages = ["src/jaxstar"]
 include = [
     "src/jaxstar/**",
     "tests/**",
+    "scripts/specfit/**",
 ]
 
 [tool.pytest.ini_options]

@@ -58,6 +58,8 @@ priors. `SpecFit` combines it with `Observation` for sampling, fit masks and
 diagnostics. Use the supplied `model_single` or your own NumPyro model.
 
 - [SpecFit guide](docs/specfit.md): spectral data, predictions, continuum and NUTS.
+- [Spectral grid preparation](scripts/specfit/README.md): reusable BOSZ/Coelho
+  recipes, shared instrument wavelength ranges, and saved NPZ grids.
 - [Coelho fitting example](examples/specfit/coelho.ipynb): fit an IRD spectrum
   using the included grids and observation data, from CCF and SVI through
   masking, NUTS, diagnostics and result saving.

@@ -288,7 +288,10 @@ def prepare_bosz(data_dir, *, axes, wavelength_ranges, pixels=None,
     replacements instead of the old automatic logg=4 fallback.
     Native BOSZ wavelengths below 2000 Angstrom are already vacuum; above they
     are air. Vacuum conversion respects this convention. Air output requires
-    selected regions above 2000 Angstrom.
+    selected regions above 2000 Angstrom. Some native ASCII files repeat a
+    wavelength at their printed precision. Equal wavelengths are collapsed by
+    averaging H/continuum (or H when unnormalized), before resampling. Invalid
+    flux is not discarded in this average.
     Returns an in-memory private spectral carrier for save_spectral_grid.
     """
     axes = _preparation_axes("bosz", axes)
@@ -310,14 +313,21 @@ def prepare_bosz(data_dir, *, axes, wavelength_ranges, pixels=None,
     def reader(node, bounds_only=False):
         data = np.loadtxt(paths[node], ndmin=2, usecols=(0,) if bounds_only else (0, 1, 2))
         wav = data[:, 0]
+        flux = None
+        if not bounds_only:
+            flux = data[:, 1]
+            if normalized:
+                flux = np.divide(flux, data[:, 2], out=np.full_like(flux, np.nan),
+                                 where=data[:, 2] != 0)
+        if np.any(np.diff(wav) <= 0):
+            # Original-resolution ASCII nodes can round onto the same printed
+            # wavelength. Merge exact duplicates; preserve distinct close nodes.
+            order = np.argsort(wav, kind="stable")
+            wav, first, counts = np.unique(wav[order], return_index=True, return_counts=True)
+            if flux is not None:
+                flux = np.add.reduceat(flux[order], first) / counts
         if wavelength_medium == "vacuum":
             wav = np.where(wav > 2000, _air_to_vacuum(wav), wav)
-        if bounds_only:
-            return wav, None
-        flux = data[:, 1]
-        if normalized:
-            flux = np.divide(flux, data[:, 2], out=np.full_like(flux, np.nan),
-                             where=data[:, 2] != 0)
         return wav, flux
 
     return _prepare_nodes("bosz", axes, reader, bounds, pixels, regions,

@@ -268,6 +268,12 @@ local library files. For fitting, use `sampling="log"` and an explicit
 instrumental resolving power and observed detector pixels. Prepare wavelength
 regions wide enough for broadening and the requested RV range.
 
+For reusable BOSZ/Coelho generation, see the
+[recipe-based preparation script](../scripts/specfit/README.md). It shares
+instrument wavelength CSVs between libraries, stores a common NPZ with recipe
+and input hashes, and keeps generated data outside the repository. The small
+multi-region examples use explicit equal pixel counts with log sampling.
+
 Use `save_spectral_grid(path, spectra)` to persist a prepared result.
 `load_spectral_grid(path)` then needs only that artifact. The jaxspec NPZ loaders
 preserve stored wavelength samples and flux normalization. Use
