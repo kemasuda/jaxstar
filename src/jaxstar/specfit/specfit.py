@@ -614,7 +614,13 @@ class SpecFit:
         These diagnostics are a snapshot, not recomputed when the mask changes.
         Mixture plots use the same layout, with physical residuals in the middle,
         probabilities and their threshold at the bottom, and a histogram of
-        residual/sqrt(V) on the right. Final extended flags are highlighted.
+        residual/sqrt(V) on the right, stacking retained and masked counts.
+        Smooth overlays show the weighted normal and outlier densities and
+        their sum, accounting for each pixel's V. Densities are scaled by the
+        before-clipping pixel count and bin width. They use all pixels outside
+        the fixed mask and are omitted if either mixture parameter is unavailable.
+        Final extended flags are highlighted; these mask labels are distinct
+        from the mixture's latent component membership.
 
         ``method="sigma_clip"`` selects the legacy median-filter/MAD rule below.
         Predict once at ``point`` using ``model``, before updating the mask.

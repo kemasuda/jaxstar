@@ -1023,8 +1023,17 @@ for the correlated GP fit. `sigma_threshold` and `mask_v` apply only to sigma
 clipping. Mixture plots retain the sigma-clipping layout: data and physical
 model at the top, physical residuals in the middle, and outlier probabilities
 with their threshold at the bottom. The right-hand histogram shows residuals
-divided by `sqrt(V)`, with an `N(0, 1)` reference. Extended flags are highlighted
-throughout; no GP mean or median-filter trend is subtracted.
+divided by `sqrt(V)`, stacking retained and masked counts so the total is
+visible. Thin, smooth curves show the normal and outlier component densities
+and their sum, scaled by the before-clipping pixel count and bin width as
+with the original normal reference. They use all pixels outside the fixed mask:
+the normal component has weight `1-f` and unit width, while the outlier component has weight `f`
+and pixel-dependent width `sqrt(1 + s**2/V)`. Thus a large outlier fraction
+reduces the normal component's expected counts. The overlays are omitted if
+either mixture parameter is unavailable. Retained/masked histogram colors
+show the final classification including mask extension, not latent component
+membership. Extended flags are highlighted throughout; no GP mean or
+median-filter trend is subtracted.
 Custom model callbacks must supply `normal_residual_variance` alongside
 `model_flux`; the built-in model obtains it internally during masking.
 Custom models may supply `mismatch_probability` for direct masking, with the
