@@ -1,14 +1,15 @@
-"""Post-fit mixture classification leaves the Gaussian/GP inference unchanged."""
+"""Model probabilities or residual-mixture fitting feed the same masking rule."""
 
 from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
+import numpyro.distributions as dist
 import pytest
 from scipy.special import logsumexp
 from scipy.stats import norm
 
-from jaxstar.specfit import SpecFit
+from jaxstar.specfit import SpecFit, chebyshev_basis
 from jaxstar.specfit.specfit import _extend_mask
 from jaxstar.specfit.sampling import _C_KMS
 from jaxstar.specfit._outliers import _fit_gaussian_mixture
@@ -49,6 +50,7 @@ def test_fitted_covariance_and_physical_residual(single, solver, x64_context, mo
         flags = fit.mask_outliers(point=point, model=model,
                                   extend_outlier_mask=False)
         d = fit.outlier_diagnostics
+        assert d["probability_source"] == "residual_fit"
         variance = fit.observation.uncertainty**2 + (
             jitter if single else jitter[:, None])**2 + (0.02**2 if solver else 0.)
         np.testing.assert_allclose(d["normal_residual_variance"][~fixed], variance[~fixed], rtol=1e-12)
@@ -81,6 +83,129 @@ def custom_case():
                 "normal_residual_variance": np.full(observation.shape, .01**2)}
 
     return fit, {"baseline": baseline}, SimpleNamespace(predict=predict), calls
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("extend", [False, True])
+def test_mixture_prediction_reused_without_refitting_and_old_flags_reconsidered(single, extend, x64_context, monkeypatch):
+    with x64_context():
+        fit, settings, point = case(single)
+        flux = fit.observation.flux.copy()
+        flux[..., 50] -= .4
+        fit = SpecFit(replace(fit.observation, flux=flux), fit.specmodel)
+        settings.update(likelihood="gaussian_mixture", mismatch_fraction=dist.Beta(1., 9.),
+                        mismatch_scale=dist.HalfNormal(.1), degree=1,
+                        basis=chebyshev_basis(fit.observation.wavelength, 1))
+        point = dict(point, mismatch_fraction=.08, mismatch_scale=.1,
+                     continuum_coefficients=np.broadcast_to([1.01, .01],
+                         (2,) if single else (2, 2)).copy())
+        model = configured(fit, settings)
+        old = np.zeros(fit.observation.shape, bool)
+        old[..., [20, 50]] = True  # A good and a bad pixel, both previously excluded.
+        fit.set_fit_mask(old)
+        fixed = fit.observation.mask.copy()
+        predicted = np.asarray(fit.predict(point=point, model=model)["mismatch_probability"])
+        assert np.all(predicted[..., 50] > .99) and np.all(predicted[..., 20] < .5)
+
+        def no_refit(*args, **kwargs):
+            raise AssertionError("model probabilities must bypass residual-mixture optimization")
+
+        monkeypatch.setattr("jaxstar.specfit._outliers._fit_gaussian_mixture", no_refit)
+        flags = fit.mask_outliers(point=point, model=model, extend_outlier_mask=extend)
+        expected = np.zeros(fit.observation.shape, bool)
+        for wavelengths, q, row in zip(np.atleast_2d(fit.observation.wavelength),
+                                       np.atleast_2d(predicted), np.atleast_2d(expected)):
+            distances = _C_KMS * np.abs(np.log(wavelengths[:, None] / wavelengths[q > .5]))
+            row[:] = np.any(distances <= (10. if extend else 0.), axis=1)
+        np.testing.assert_array_equal(flags, expected & ~fixed)
+        assert flags[..., 50].all() and not flags[..., 20].any()
+        diagnostics = fit.outlier_diagnostics
+        assert diagnostics["probability_source"] == "model"
+        assert diagnostics["mismatch_fraction"] == .08
+        assert diagnostics["mismatch_scale"] == .1
+        assert "log_likelihood" not in diagnostics and "collapsed" not in diagnostics
+        np.testing.assert_array_equal(diagnostics["mismatch_probability"], predicted)
+        variance = fit.observation.uncertainty**2 + settings["jitter"]**2
+        np.testing.assert_allclose(diagnostics["normal_residual_variance"][~fixed], variance[~fixed])
+        np.testing.assert_array_equal(fit.observation.mask, fixed)
+        np.testing.assert_array_equal(fit.predict(point=point, model=model)["mismatch_probability"], predicted)
+        # Repeated calls with the same point cannot expand the mask recursively.
+        np.testing.assert_array_equal(fit.mask_outliers(point=point, model=model,
+                                                       extend_outlier_mask=extend), flags)
+
+
+@pytest.mark.parametrize("metadata", [False, True])
+def test_custom_probabilities_snapshot_and_plot(metadata, tmp_path, monkeypatch):
+    import matplotlib.pyplot as plt
+
+    fit, point, model, _ = custom_case()
+    prediction = model.predict(point, fit.observation, fit.specmodel)
+    q = np.full(fit.observation.shape, .1)
+    q[20] = .9  # Intentionally different from the residual-based outlier at pixel 10.
+    q[fit.observation.mask] = 1.  # Fixed masks must not seed dilation.
+    prediction["mismatch_probability"] = q
+    if metadata:
+        prediction.update(mismatch_fraction=.2, mismatch_scale=.15)
+    model = SimpleNamespace(predict=lambda *args: prediction)
+
+    def no_refit(*args, **kwargs):
+        raise AssertionError("supplied probabilities must be used verbatim")
+
+    monkeypatch.setattr("jaxstar.specfit._outliers._fit_gaussian_mixture", no_refit)
+    try:
+        flags = fit.mask_outliers(point=point, model=model, extend_outlier_mask=False,
+                                  plot=True, save_path=tmp_path / "prediction.png")
+        assert flags[20] and not flags[10] and not flags[fit.observation.mask].any()
+        diagnostics = fit.outlier_diagnostics
+        assert diagnostics["probability_source"] == "model"
+        assert diagnostics["mismatch_fraction"] == (.2 if metadata else None)
+        assert diagnostics["mismatch_scale"] == (.15 if metadata else None)
+        expected = np.where(fit.observation.mask, np.nan, q)
+        np.testing.assert_array_equal(diagnostics["mismatch_probability"], expected)
+        figure = plt.gcf()
+        np.testing.assert_array_equal(figure.axes[2].lines[0].get_ydata(), expected)
+        summary = figure.axes[3].texts[0].get_text()
+        assert ("f_mismatch = 0.2" if metadata else "f_mismatch = not supplied") in summary
+        assert (tmp_path / "prediction_region8.png").is_file()
+        # Diagnostics must not retain mutable references owned by a custom model.
+        q[:] = .7
+        prediction["normal_residual_variance"][:] = 4.
+        np.testing.assert_array_equal(diagnostics["mismatch_probability"], expected)
+        np.testing.assert_allclose(diagnostics["normal_residual_variance"], .01**2)
+    finally:
+        plt.close("all")
+
+
+@pytest.mark.parametrize("bad", [-.1, 1.1, np.nan, np.inf, [0., 1.]])
+def test_invalid_model_probabilities_preserve_mask_without_fallback(bad, monkeypatch):
+    fit, point, model, _ = custom_case()
+    old = fit.fit_mask.copy()
+    old[20] = True
+    fit.set_fit_mask(old)
+    prediction = model.predict(point, fit.fit_observation(), fit.specmodel)
+    q = np.full(fit.observation.shape, .1)
+    if np.ndim(bad):
+        q = np.asarray(bad)
+    else:
+        q[20] = bad  # Validation must cover old fit-masked pixels too.
+    prediction["mismatch_probability"] = q
+    model = SimpleNamespace(predict=lambda *args: prediction)
+    monkeypatch.setattr("jaxstar.specfit._outliers._fit_gaussian_mixture",
+                        lambda *args: pytest.fail("invalid model probabilities must not trigger a refit"))
+    with pytest.raises(ValueError):
+        fit.mask_outliers(point=point, model=model)
+    np.testing.assert_array_equal(fit.fit_mask, old)
+
+
+def test_sigma_clip_ignores_supplied_mismatch_probabilities():
+    fit, point, model, _ = custom_case()
+    options = dict(point=point, method="sigma_clip", mask_v=10., extend_outlier_mask=False)
+    expected = fit.mask_outliers(model=model, **options).copy()
+    fit.reset_fit_mask()
+    prediction = model.predict(point, fit.observation, fit.specmodel)
+    prediction["mismatch_probability"] = np.full(fit.observation.shape, np.nan)
+    model = SimpleNamespace(predict=lambda *args: prediction)
+    np.testing.assert_array_equal(fit.mask_outliers(model=model, **options), expected)
 
 
 def test_threshold_extension_reconsideration_and_single_prediction():
