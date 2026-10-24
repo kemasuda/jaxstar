@@ -16,6 +16,7 @@ from jaxstar.specfit import (
     Observation, SpecModel, model_single, single_star_params, chebyshev_basis,
     marginalized_continuum_log_likelihood, physical_logg_max, empirical_vmic,
     empirical_vmacro_valenti_fischer2005, load_spectral_grid, save_spectral_grid,
+    empirical_vmacro_doyle2014, empirical_vmacro_lubin2026,
 )
 from jaxstar.specfit._data import _SpectralLibrary
 
@@ -215,17 +216,27 @@ def test_empirical_vmic_requires_compatible_axes(stellar_case, missing):
 
 
 @pytest.mark.parametrize("sigma", [None, .4])
-def test_empirical_vmacro_prior_is_one_shared_stellar_latent(stellar_case, sigma):
+@pytest.mark.parametrize("option,helper,dependencies", [
+    (True, empirical_vmacro_valenti_fischer2005, ("teff",)),
+    ("valenti_fischer2005", empirical_vmacro_valenti_fischer2005, ("teff",)),
+    ("doyle2014", empirical_vmacro_doyle2014, ("teff", "logg")),
+    ("lubin2026", empirical_vmacro_lubin2026, ("teff", "logg")),
+])
+def test_empirical_vmacro_prior_is_one_shared_stellar_latent(stellar_case, sigma,
+                                                          option, helper, dependencies):
     obs, model, config, coordinates = stellar_case
     broadening = {k: v for k, v in config["broadening"].items() if k != "vmacro"}
-    config = dict(config, use_empirical_vmic=False, use_empirical_vmacro=True,
+    config = dict(config, use_empirical_vmic=False, use_empirical_vmacro=option,
                   broadening=broadening)
     if sigma is not None:
         config["vmacro_empirical_sigma"] = sigma
     values = dict(coordinates, vmacro=4.2)
     trace = trace_at(obs, model, config, values)
     site = trace["vmacro"]
-    expected = empirical_vmacro_valenti_fischer2005(coordinates["teff"], sigma=1. if sigma is None else sigma)
+    expected = helper(**{name: coordinates[name] for name in dependencies},
+                      **({} if sigma is None else {"sigma": sigma}))
+    assert site["infer"]["prior"]["depends_on"] == dependencies
+    assert helper.__name__ in site["infer"]["prior"]["expression"]
     assert site["type"] == "sample" and not site["is_observed"]
     assert jnp.shape(site["value"]) == ()
     assert site["fn"].batch_shape == site["fn"].event_shape == ()
@@ -239,19 +250,37 @@ def test_empirical_vmacro_prior_is_one_shared_stellar_latent(stellar_case, sigma
 
 
 @pytest.mark.parametrize("sigma", [0., -1., np.nan, np.inf, [1., 1.]])
-def test_empirical_vmacro_rejects_invalid_or_per_region_sigma(stellar_case, sigma):
+@pytest.mark.parametrize("option", [True, "doyle2014", "lubin2026"])
+def test_empirical_vmacro_rejects_invalid_or_per_region_sigma(stellar_case, sigma, option):
     obs, model, config, coordinates = stellar_case
     broadening = {k: v for k, v in config["broadening"].items() if k != "vmacro"}
-    config = dict(config, use_empirical_vmic=False, use_empirical_vmacro=True,
+    config = dict(config, use_empirical_vmic=False, use_empirical_vmacro=option,
                   broadening=broadening, vmacro_empirical_sigma=sigma)
     with pytest.raises(ValueError, match="vmacro_empirical_sigma must be a finite positive scalar"):
         trace_at(obs, model, config, coordinates)
 
 
-def test_empirical_vmacro_rejects_explicit_value(stellar_case):
+@pytest.mark.parametrize("option", [True, "doyle2014", "lubin2026"])
+def test_empirical_vmacro_rejects_explicit_value(stellar_case, option):
     obs, model, config, coordinates = stellar_case
     with pytest.raises(ValueError, match="omit broadening.*vmacro"):
-        trace_at(obs, model, dict(config, use_empirical_vmic=False, use_empirical_vmacro=True), coordinates)
+        trace_at(obs, model, dict(config, use_empirical_vmic=False, use_empirical_vmacro=option), coordinates)
+
+
+@pytest.mark.parametrize("option", [True, "valenti_fischer2005", "doyle2014", "lubin2026"])
+@pytest.mark.parametrize("missing", ["teff", "logg"])
+def test_vmacro_relations_require_their_stellar_axes(stellar_case, option, missing):
+    obs, model, config, coordinates = stellar_case
+    config = dict(config, use_empirical_vmic=False, use_empirical_vmacro=option,
+                  atmosphere={k: v for k, v in config["atmosphere"].items() if k != missing},
+                  broadening={k: v for k, v in config["broadening"].items() if k != "vmacro"},
+                  prior_only=True)
+    reduced = without_axis(model, missing)
+    if missing == "logg" and option in (True, "valenti_fischer2005"):
+        trace_at(obs, reduced, config, dict(coordinates, vmacro=4.2))
+    else:
+        with pytest.raises(ValueError, match=f"requires a {missing} atmosphere axis"):
+            trace_at(obs, reduced, config, coordinates)
 
 
 @pytest.mark.parametrize("kind", ["vmic", "vmacro", "other_atmosphere", "other_broadening"])
@@ -306,10 +335,11 @@ def test_teff_dependent_modes_require_axes(stellar_case, option, missing, messag
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
-def test_combined_relations_joint_density_jit_and_gradients(stellar_case, dtype, x64_context):
+@pytest.mark.parametrize("option", [True, "doyle2014", "lubin2026"])
+def test_combined_relations_joint_density_jit_and_gradients(stellar_case, dtype, x64_context, option):
     with x64_context(dtype == "float64"):
         obs, model, config, coordinates = stellar_case
-        config = derived_config(config, use_physical_logg_max=True, use_empirical_vmacro=True)
+        config = derived_config(config, use_physical_logg_max=True, use_empirical_vmacro=option)
         config["broadening"] = {k: v for k, v in config["broadening"].items() if k != "vmacro"}
         values = {k: jnp.asarray(v, dtype=dtype) for k, v in coordinates.items()
                   if k in ("teff", "logg", "mh")}

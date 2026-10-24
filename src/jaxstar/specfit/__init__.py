@@ -27,6 +27,8 @@ from .numpyro_model import (
     physical_logg_max,
     empirical_vmic,
     empirical_vmacro_valenti_fischer2005,
+    empirical_vmacro_doyle2014,
+    empirical_vmacro_lubin2026,
 )
 from .continuum import (
     ContinuumPrior,
@@ -63,6 +65,7 @@ __all__ = [
     "ConfiguredModel", "make_model_single", "reconstruct_single",
     "model_single", "single_star_params",
     "physical_logg_max", "empirical_vmic", "empirical_vmacro_valenti_fischer2005",
+    "empirical_vmacro_doyle2014", "empirical_vmacro_lubin2026",
     "ContinuumPrior", "ContinuumPosterior",
     "chebyshev_basis", "continuum_design_matrix", "evaluate_continuum",
     "apply_continuum", "continuum_prior",

@@ -1,4 +1,4 @@
-"""Frozen legacy relations and their JAX contracts, without a spectral grid."""
+"""Empirical relations and their JAX contracts, without a spectral grid."""
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +12,7 @@ from scipy.stats import truncnorm
 
 from jaxstar.specfit import (
     physical_logg_max, empirical_vmic, empirical_vmacro_valenti_fischer2005,
+    empirical_vmacro_doyle2014, empirical_vmacro_lubin2026,
 )
 
 
@@ -35,17 +36,54 @@ def test_frozen_legacy_values_and_jax_transforms(relation, inputs, expected, dty
             np.testing.assert_allclose(actual, expected, rtol=tolerance)
 
 
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_vmic_three_branches_and_jax_transforms(dtype, x64_context):
+    # Bergemann & Hoppe (2026): solar-like dwarf, F dwarf, cool dwarf, red giant.
+    with x64_context(dtype == "float64"):
+        inputs = tuple(jnp.asarray(value, dtype=dtype) for value in (
+            [5772., 6500., 4500., 4500.], [4.44, 4.2, 4.6, 2.], [0., -.5, -.5, -1.]))
+        tolerance = 3e-7 if dtype == "float32" else 1e-14
+        for evaluate in (empirical_vmic, jax.jit(empirical_vmic), jax.vmap(empirical_vmic)):
+            actual = evaluate(*inputs)
+            assert actual.dtype == jnp.dtype(dtype)
+            np.testing.assert_allclose(actual, [1.0668016, 1.4003, .8537, 1.379],
+                                       rtol=tolerance)
+
+
 def test_vmic_broadcasts_stellar_inputs():
-    teff = jnp.array([[5500.], [6000.]])
-    # At logg=4, feh=0 the legacy relation is 1.05 and 1.213 km/s.
-    # Metallicity and gravity offsets are shared by each temperature row.
-    actual = jax.jit(empirical_vmic)(teff, jnp.array([4., 4.5]), jnp.array([0., .3]))
-    np.testing.assert_allclose(actual, [[1.05, .99465], [1.213, 1.15765]], rtol=3e-7)
+    teff = jnp.array([[4500.], [5500.], [6000.]])
+    actual = jax.jit(empirical_vmic)(teff, jnp.array([4., 4.5, 2.]),
+                                    jnp.array([0., .3, -1.]))
+    np.testing.assert_allclose(actual, [[.962, .90665, 1.379], [1.05, .99465, 1.47],
+                                       [1.213, 1.15765, 1.748]], rtol=3e-7)
+
+
+def test_vmic_temperature_boundary_is_continuous(x64_context):
+    with x64_context():
+        teff = jnp.array([4999.999, 5000., 5000.001])
+        actual = jax.jit(empirical_vmic)(teff, 4.5, 0.)
+        np.testing.assert_allclose(actual, [.89075, .89075, .89075010100015], rtol=1e-14)
+
+
+@pytest.mark.parametrize("teff,dwarf,giant_limit", [
+    (4500., 1.03075, 1.22775),
+    (5000., 1.03075, 1.19575),
+    (5500., 1.11875, 1.31875),
+    (6500., 1.51975, 2.02975),
+])
+def test_vmic_gravity_boundary_preserves_published_jump(teff, dwarf, giant_limit, x64_context):
+    with x64_context():
+        logg = jnp.array([np.nextafter(3.5, -np.inf), 3.5, np.nextafter(3.5, np.inf)])
+        actual = jax.jit(empirical_vmic)(teff, logg, 0.)
+        np.testing.assert_allclose(actual, [giant_limit, dwarf, dwarf], rtol=1e-14)
 
 
 @pytest.mark.parametrize("relation,point,expected_gradient", [
     (physical_logg_max, (5770.,), (-0.000112702907538,)),
     (empirical_vmic, (6000., 4.5, .3), (.000401, -.145, .056)),
+    (empirical_vmic, (4500., 4.6, -.5), (0., -.146, .04)),
+    (empirical_vmic, (4500., 2., -1.), (-.000219, -.12, .03)),
+    (empirical_vmic, (5000., 4.5, 0.), (.000101, -.145, .05)),
 ])
 def test_scalar_relations_have_finite_jit_gradients(relation, point, expected_gradient):
     value, gradient = jax.jit(jax.value_and_grad(
@@ -75,6 +113,60 @@ def test_vmacro_prior_matches_legacy_location_and_scatter(dtype, x64_context):
             key, (32,)))(teff, jax.random.PRNGKey(0))
         assert samples.shape == (32, 4)
         assert np.all(np.isfinite(samples)) and np.all(samples >= 0.)
+
+
+@pytest.mark.parametrize("relation,temperatures,gravities,expected,sigma", [
+    (empirical_vmacro_doyle2014, [5200., 5777., 6400.], [4.6, 4.44, 4.0],
+     [2.211448, 3.21, 6.317848], .37),
+    (empirical_vmacro_lubin2026, [5772., 6000., 5300.], [4.44, 4.2, 4.5],
+     [3.02, 4.021878413012682, 2.564165946055237], .09),
+])
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_teff_logg_vmacro_priors(relation, temperatures, gravities, expected, sigma,
+                               dtype, x64_context):
+    with x64_context(dtype == "float64"):
+        teff, logg = (jnp.asarray(values, dtype=dtype) for values in (temperatures, gravities))
+        tolerance = 2e-5 if dtype == "float32" else 1e-12
+        prior = relation(teff, logg)
+        np.testing.assert_allclose(prior.base_dist.loc, expected, rtol=tolerance)
+        np.testing.assert_allclose(prior.base_dist.scale, sigma, rtol=tolerance)
+        np.testing.assert_array_equal(prior.low, 0.)
+        location = lambda t, g: relation(t, g).base_dist.loc
+        for evaluate in (jax.jit(location), jax.vmap(location)):
+            actual = evaluate(teff, logg)
+            assert actual.dtype == jnp.dtype(dtype)
+            np.testing.assert_allclose(actual, expected, rtol=tolerance)
+        values = jnp.asarray(expected, dtype=dtype) + .1
+        expected_logp = truncnorm.logpdf(values, -np.asarray(expected) / sigma, np.inf,
+                                         loc=expected, scale=sigma)
+        logp = jax.jit(lambda t, g, v: relation(t, g).log_prob(v))
+        np.testing.assert_allclose(logp(teff, logg, values), expected_logp, rtol=tolerance)
+        samples = jax.jit(lambda t, g, key: relation(t, g).sample(key, (32,)))(
+            teff, logg, jax.random.PRNGKey(0))
+        assert samples.shape == (32, 3)
+        assert np.all(np.isfinite(samples)) and np.all(samples >= 0.)
+
+
+@pytest.mark.parametrize("relation", [empirical_vmacro_doyle2014, empirical_vmacro_lubin2026])
+def test_teff_logg_vmacro_broadcasts_sigma_and_has_jit_gradients(relation):
+    teff = jnp.array([[5772.], [6000.]])
+    logg = jnp.array([4.0, 4.44, 4.6])
+    sigma = jnp.array([.2, .4, .6])
+    prior = relation(teff, logg, sigma=sigma)
+    assert prior.batch_shape == (2, 3) and prior.event_shape == ()
+    np.testing.assert_array_equal(jnp.broadcast_to(prior.base_dist.scale, (2, 3)),
+                                  jnp.broadcast_to(sigma, (2, 3)))
+    density = lambda t, g, s: relation(t, g, sigma=s).log_prob(4.2).sum()
+    value, gradients = jax.jit(jax.value_and_grad(density, argnums=(0, 1, 2)))(teff, logg, sigma)
+    assert np.isfinite(value)
+    assert all(np.all(np.isfinite(g)) and np.any(g != 0.) for g in gradients)
+
+
+def test_lubin_uses_solar_ratio_and_does_not_clip_location():
+    ratios = jnp.array([.4, 1., 1.4, 3.])
+    prior = empirical_vmacro_lubin2026(5772., 4.44 + jnp.log10(ratios))
+    np.testing.assert_allclose(prior.base_dist.loc, [4.4, 3.02, 2.1, -1.58], rtol=3e-6)
+    assert np.all(prior.low == 0.)
 
 
 def test_vmacro_prior_broadcasts_custom_scatter_and_has_jit_gradients():

@@ -224,7 +224,7 @@ def test_empirical_switches_and_conditional_display(use_vmic):
     report = model.check_prior()
     assert list(report.columns) == ["prior"]
     assert report.loc["logg | teff", "prior"] == "Uniform(logg_min, physical_logg_max(teff))"
-    assert report.loc["vmacro | teff", "prior"] == "TruncatedNormal(μ(teff), σ=0.7, low=0)"
+    assert report.loc["vmacro | teff", "prior"] == "empirical_vmacro_valenti_fischer2005(teff, sigma=0.7)"
     assert report.equals(model.check_prior(rng_key=jax.random.PRNGKey(9)))
     conditional = model.check_prior(condition={"teff": 5800.})
     assert conditional.loc["logg | teff", "prior"] == report.loc["logg | teff", "prior"]
@@ -243,6 +243,34 @@ def test_empirical_switches_and_conditional_display(use_vmic):
         model.check_prior(condition={"teff": 10000.})
     with pytest.raises(ValueError, match="sampled parameter"):
         model.check_prior(condition={"typo": 1.})
+
+
+@pytest.mark.parametrize("option,default_sigma,expected_location", [
+    (True, 1., 3.983076923076923),
+    ("valenti_fischer2005", 1., 3.983076923076923),
+    ("doyle2014", .37, 3.1984),
+    ("lubin2026", .09, 3.02),
+])
+@pytest.mark.parametrize("sigma", [None, .5])
+def test_vmacro_factory_defaults_overrides_and_conditional_display(option, default_sigma,
+                                                                 expected_location, sigma):
+    fit = make_fit()
+    model = make_model_single(fit, resolving_power=70000., use_gp=False,
+                             use_empirical_vmacro=option, vmacro_empirical_sigma=sigma)
+    condition = {"teff": 5772., "logg": 4.44}
+    prior = model.prior_trace(condition=condition)["vmacro"]["fn"]
+    width = default_sigma if sigma is None else sigma
+    np.testing.assert_allclose(prior.base_dist.loc, expected_location, rtol=1e-12)
+    np.testing.assert_allclose(prior.base_dist.scale, width)
+    assert model.settings["vmacro_empirical_sigma"] == width
+    assert model.settings["use_empirical_vmacro"] == option
+    relation = "valenti_fischer2005" if option is True else option
+    dependencies = "teff" if relation == "valenti_fischer2005" else "teff, logg"
+    report = model.check_prior(condition=condition)
+    row = report.loc[f"vmacro | {dependencies}"]
+    assert row["prior"] == f"empirical_vmacro_{relation}({dependencies}, sigma={width})"
+    assert f"scale={width:g}" in row["conditional"]
+    assert report.equals(model.check_prior(condition=condition, rng_key=jax.random.PRNGKey(9)))
 
 
 def test_overrides_fixed_values_and_settings_snapshots():
@@ -297,6 +325,12 @@ def test_explicit_defaults_need_no_ccf_and_resolution_can_be_sampled():
     ({"use_empirical_vmic": True}, "empirical vmic requires"),
     ({"use_empirical_vmacro": True, "fixed": {"vmacro": 3.}}, "omit fixed vmacro"),
     ({"use_empirical_vmacro": True, "vmacro_empirical_sigma": 0.}, "sigma"),
+    ({"use_empirical_vmacro": "doyle2014", "fixed": {"vmacro": 3.}}, "omit fixed vmacro"),
+    ({"use_empirical_vmacro": "lubin2026", "fixed": {"vmacro": 3.}}, "omit fixed vmacro"),
+    ({"use_empirical_vmacro": "unknown"}, "use_empirical_vmacro"),
+    ({"use_empirical_vmacro": ""}, "use_empirical_vmacro"),
+    ({"use_empirical_vmacro": 1}, "use_empirical_vmacro"),
+    ({"use_empirical_vmacro": None}, "use_empirical_vmacro"),
     ({"use_gp": False, "fixed": {"gp_scale": 1.}}, "GP parameters conflict"),
 ])
 def test_invalid_settings(options, message):
