@@ -209,16 +209,17 @@ class SpecFit:
     """
 
     @classmethod
-    def from_grid(cls, gridpath, observation, *, library="coelho", pattern="*.npz",
+    def from_grid(cls, gridpath, observation, *, library=None, pattern="*.npz",
                   wav_margin=3., pixels=None, velocity_step=None, vmax=50.,
                   wavelength_medium="unknown", flux_kind="as_stored",
                   broadening_operator=None, fixed_ip=None):
-        """Prepare a SpecModel from legacy NPZs and associate an Observation.
+        """Select a common NPZ's regions or legacy files for an Observation.
 
         Delegates to ``SpecModel.from_grid`` using the observation's wavelengths
         and region labels. Its loading/resampling options have identical
-        meanings here; specify exactly one of pixels or velocity_step. Arrays,
-        fixed masks and labels in the supplied observation are preserved.
+        meanings here. A common NPZ retains its saved sampling by default;
+        a legacy directory requires exactly one of pixels or velocity_step.
+        Arrays, fixed masks and labels in the supplied observation are preserved.
         """
         if not isinstance(observation, Observation):
             raise TypeError("SpecFit.from_grid requires an Observation")

@@ -8,6 +8,7 @@ from .libraries import (
     prepare_bosz,
     prepare_coelho,
     prepare_tlusty,
+    check_spectral_inputs,
 )
 from .storage import load_spectral_grid, save_spectral_grid
 from .ip_calibration import IPCalibration, read_ip_calibration
@@ -51,6 +52,7 @@ __all__ = [
     "select_grid_paths",
     "load_coelho", "load_bosz", "load_tlusty",
     "prepare_coelho", "prepare_bosz", "prepare_tlusty",
+    "check_spectral_inputs",
     "load_spectral_grid", "save_spectral_grid",
     "IPCalibration", "read_ip_calibration",
     "FitResult", "load_fit_result", "save_fit_result",

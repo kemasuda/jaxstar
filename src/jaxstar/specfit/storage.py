@@ -6,7 +6,8 @@ from pathlib import Path
 import numpy as np
 
 from jaxstar.grid import Axis, Field, RectilinearGrid
-from ._data import _SpectralLibrary
+from ._data import _SpectralLibrary, _validate_wavelength
+from ._selection import _covering_indices, _wavelength_request
 
 
 _FORMAT = "jaxstar.spectral_grid"
@@ -63,12 +64,25 @@ def save_spectral_grid(path, spectra, *, overwrite=False):
     return path
 
 
-def load_spectral_grid(path):
+def load_spectral_grid(path, *, wavelength=None, wav_margin=3., regions=None):
     """Load a common prepared artifact, without consulting any source library.
 
     Only the versioned format written by ``save_spectral_grid`` is accepted.
     For legacy jaxspec NPZs use ``load_coelho``, ``load_bosz`` or ``load_tlusty``
     once, then save their result in the common format if desired.
+
+    Without ``wavelength``, restore all saved regions in their original order.
+    With observed ``wavelength`` in Angstrom, shaped (pixel,) or (region, pixel),
+    select one saved region covering each row with at least ``wav_margin`` on
+    EACH side. All pixels, including masked endpoints, participate. Zero or
+    multiple covering regions fail before flux is read. Selected regions keep
+    their full wavelength spans and samples; a saved region may be repeated.
+    ``regions`` optionally labels the output rows, rather than selecting saved
+    identifiers. Omit it to retain selected saved labels.
+
+    The full flux array is read into host memory, then selected in NumPy before
+    creating JAX arrays. Only selected regions enter the returned grid. Source
+    paths remain provenance for the complete saved artifact.
 
     Returns the same private immutable carrier as raw preparers. Numerical
     interpolation belongs to ``result.grid``. No wavelength transformation or
@@ -76,6 +90,11 @@ def load_spectral_grid(path):
     the same x64 setting to retain saved float64 precision across processes.
     """
     path = Path(path).expanduser()
+    request = None
+    if wavelength is not None:
+        request = _wavelength_request(wavelength, regions, wav_margin)
+    elif regions is not None:
+        raise ValueError("regions requires wavelength; it labels the selected observation rows")
     with np.load(path, allow_pickle=False) as data:
         metadata = _read_metadata(data)
         names = metadata["axis_names"]
@@ -85,15 +104,43 @@ def load_spectral_grid(path):
         missing = required - set(data.files)
         if missing:
             raise ValueError(f"{path}: missing prepared spectral-grid arrays {sorted(missing)}")
+        saved_wave = data["wavelength"]
+        selected_regions = metadata["regions"]
+        indices = None
+        if request is not None:
+            # Check the saved payload before selecting so slicing cannot hide
+            # malformed metadata or mismatched wavelength/flux dimensions.
+            if metadata["payload_dims"] != ["region", "pixel"]:
+                raise ValueError("flux payload dimensions must be ('region', 'pixel')")
+            if metadata["wavelength_unit"] != "angstrom":
+                raise ValueError("spectral wavelengths must be in angstrom")
+            if not np.issubdtype(saved_wave.dtype, np.floating):
+                raise TypeError("wavelength must have a floating-point dtype")
+            _validate_wavelength(saved_wave, ndim=2)
+            if len(selected_regions) != len(saved_wave):
+                raise ValueError("one region identifier is required per wavelength row")
+            if any(not isinstance(label, (str, int)) for label in selected_regions):
+                raise ValueError("region identifiers must be strings or integers")
+            candidates = [(f"{path}: row {i} (region {label!r})", float(row[0]), float(row[-1]))
+                          for i, (label, row) in enumerate(zip(selected_regions, saved_wave))]
+            indices = _covering_indices(*request, candidates)
+            selected_regions = (request[1] if regions is not None else
+                                tuple(selected_regions[i] for i in indices))
+        flux = data["flux"]
+        if indices is not None:
+            if flux.shape[len(metadata["flux_dims"]):] != saved_wave.shape:
+                raise ValueError("wavelength shape must match the flux (region, pixel) payload")
+            flux = flux[..., indices, :]
+            saved_wave = saved_wave[indices, :]
         grid = RectilinearGrid(
             axes={name: Axis(data[f"axis_{i}"], kind)
                   for i, (name, kind) in enumerate(zip(names, metadata["axis_kinds"]))},
-            fields={"flux": Field(data["flux"], metadata["flux_dims"],
+            fields={"flux": Field(flux, metadata["flux_dims"],
                                   payload_dims=metadata["payload_dims"])},
             boundary=metadata["boundary"], fill_value=data["fill_value"],
         )
         return _SpectralLibrary(
-            grid=grid, wavelength=data["wavelength"], regions=metadata["regions"],
+            grid=grid, wavelength=saved_wave, regions=selected_regions,
             library=metadata["library"], wavelength_medium=metadata["wavelength_medium"],
             flux_kind=metadata["flux_kind"], sources=metadata["sources"],
             wavelength_unit=metadata["wavelength_unit"],
@@ -126,6 +173,8 @@ def _read_metadata(data):
         raise ValueError("prepared spectral-grid axis names must be non-empty and unique")
     if len(metadata["axis_kinds"]) != len(names):
         raise ValueError("one prepared spectral-grid axis kind is required per axis")
+    if len(metadata["flux_dims"]) != len(names) or set(metadata["flux_dims"]) != set(names):
+        raise ValueError("prepared spectral-grid flux_dims must name every grid axis exactly once")
     if not isinstance(metadata["regions"], list):
         raise ValueError("prepared spectral-grid regions must be a list")
     for key in ("boundary", "library", "wavelength_medium", "wavelength_unit", "flux_kind"):

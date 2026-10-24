@@ -318,6 +318,37 @@ def test_bosz_native_uv_is_already_vacuum(tmp_path):
         prepare_bosz(tmp_path, axes=axes, wavelength_ranges=[(1499, 1601)], wavelength_medium="air")
 
 
+@pytest.mark.parametrize("normalized", [True, False])
+@pytest.mark.parametrize("sampling", ["native", "linear", "log"])
+def test_bosz_merges_printed_duplicate_wavelengths(tmp_path, normalized, sampling):
+    axes = dict(teff=[5000.], logg=[4.], mh=[0.], alpha=[0.], carbon=[0.], vmic=[1.])
+    path = tmp_path / "m+0.00" / "bosz2024_mp_t5000_g+4.0_m+0.00_a+0.00_c+0.00_v1_rorig_noresam.txt.gz"
+    # Unsorted input, differing continua, and a close but distinct wavelength.
+    # A duplicate outside the selected region must not prevent preparation.
+    write_gzip(path, [[5002, 8, 4], [5001, 2, 2], [5001, 6, 3],
+                      [5000, 1, 2], [5001.0001, 9, 3], [6000, 1, 2], [6000, 2, 2]])
+    options = dict(sampling=sampling)
+    if sampling != "native":
+        options["pixels"] = 9
+    bounds = [(5000, 5002)] if sampling == "log" else [(4999, 5003)]
+    library = prepare_bosz(tmp_path, axes=axes, wavelength_ranges=bounds,
+                           normalized=normalized, wavelength_medium="air", **options)
+    native_wave = np.array([5000, 5001, 5001.0001, 5002])
+    native_flux = np.array([.5, 1.5, 3., 2.]) if normalized else np.array([1., 4., 9., 8.])
+    expected = np.interp(library.wavelength[0], native_wave, native_flux)
+    if sampling == "native":
+        np.testing.assert_array_equal(library.wavelength[0], native_wave)
+    np.testing.assert_allclose(library.grid.field("flux").values.reshape(-1), expected, rtol=1e-6)
+
+
+def test_bosz_duplicate_average_preserves_invalid_flux(tmp_path):
+    axes = dict(teff=[5000.], logg=[4.], mh=[0.], alpha=[0.], carbon=[0.], vmic=[1.])
+    path = tmp_path / "m+0.00" / "bosz2024_mp_t5000_g+4.0_m+0.00_a+0.00_c+0.00_v1_rorig_noresam.txt.gz"
+    write_gzip(path, [[5000, 1, 2], [5001, 1, 2], [5001, 1, 0], [5002, 1, 2]])
+    with pytest.raises(ValueError, match="nonfinite flux"):
+        prepare_bosz(tmp_path, axes=axes, wavelength_ranges=[(4999, 5003)], wavelength_medium="air")
+
+
 def write_tlusty(directory, temperature, gravity, base, *, ostar=False):
     stem = f"{'G' if ostar else 'BG'}{temperature}g{int(round(gravity * 100)):03d}v2"
     wav = np.array([5000., 5000.2, 5000.7, 5001.1, 5001.9, 5002.4, 5003.])
