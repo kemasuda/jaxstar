@@ -1,4 +1,4 @@
-"""Reconstruction paired with the marginalized-continuum single-star model."""
+"""Reconstruction paired with the built-in single-star likelihoods."""
 
 from collections.abc import Mapping
 from numbers import Integral
@@ -6,7 +6,7 @@ from numbers import Integral
 import numpy as np
 
 from .continuum import _region_jitter, chebyshev_basis, continuum_posterior, evaluate_continuum
-from .likelihood import gp_continuum_posterior, gp_conditional_mean
+from .likelihood import gp_continuum_posterior, gp_conditional_mean, gaussian_mixture_responsibility
 
 
 def _mean_prediction(predict, samples, *, max_draws):
@@ -25,7 +25,8 @@ def _mean_prediction(predict, samples, *, max_draws):
             raise ValueError("max_draws must be a positive integer or None")
         count = min(count, max_draws)
     indices = np.linspace(0, len(next(iter(samples.values()))) - 1, count, dtype=int)
-    curve_names = ("physical_flux", "continuum", "model_flux", "mean_flux", "gp_mean")
+    curve_names = ("physical_flux", "continuum", "model_flux", "mean_flux", "gp_mean",
+                   "mismatch_probability")
     means = {}
     model_draws = []
     gp_draws = []
@@ -53,12 +54,12 @@ def _mean_prediction(predict, samples, *, max_draws):
 
 
 def reconstruct_single(obs, specmodel, params, trace, settings):
-    """Reconstruct continuum/GP conditional means from a replayed model trace.
+    """Reconstruct a continuum/GP spectrum from a replayed model trace.
 
-    This callback is specific to Gaussian, analytically marginalized continuum
-    coefficients. A custom likelihood or sampled-continuum model supplies its
-    own callback to ConfiguredModel. Settings must already include the model's
-    resolved degree and basis, plus gp_solver when a GP is used.
+    Gaussian mode uses conditional continuum/GP means. Gaussian-mixture mode
+    uses the explicit continuum and computes pixel mismatch responsibilities.
+    Other custom models supply their own callback. Settings include resolved
+    degree and basis, plus gp_solver when a GP is used.
     Vecchia reconstructs the continuum only: mean_flux equals model_flux,
     gp_mean is omitted, and normal_residual_variance supplies diag(C) for masking.
     """
@@ -71,6 +72,16 @@ def reconstruct_single(obs, specmodel, params, trace, settings):
     basis = settings["basis"]
     if basis is None:
         basis = chebyshev_basis(obs.wavelength, degree=degree)
+    if settings.get("likelihood", "gaussian") == "gaussian_mixture":
+        coefficients = trace["continuum_coefficients"]["value"]
+        continuum = evaluate_continuum(basis, coefficients)
+        baseline = physical * continuum
+        noise = {name: trace[name]["value"] for name in (
+            "jitter", "mismatch_fraction", "mismatch_scale")}
+        return {"params": params, "physical_flux": physical, "continuum": continuum,
+                "continuum_coefficients": coefficients, "model_flux": baseline,
+                "mean_flux": baseline, **noise,
+                "mismatch_probability": gaussian_mixture_responsibility(obs, baseline, **noise)}
     noise = {name: trace[name]["value"] for name in names}
     gp_names = ("gp_amplitude", "gp_scale")
     gp = {name: trace[name]["value"] for name in gp_names if name in trace}

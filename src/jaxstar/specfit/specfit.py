@@ -411,6 +411,93 @@ class SpecFit:
         return find_map_svi(bound, step_size, num_steps, rng_key=rng_key,
                             p_initial=p_initial, progress_bar=progress_bar)
 
+    def run_mixture_prefit(self, *, rng_key, model_kwargs=None, p_initial=None,
+                           step_size=.01, num_steps=2000, progress_bar=True):
+        """Return (model, point) from a Gaussian-mixture SVI prefit.
+
+        model_kwargs configures make_model_single; this method selects
+        likelihood="gaussian_mixture" and use_gp=False. Omitted mismatch priors
+        are Beta(1, 9) for the fraction and HalfNormal(0.1) for the absolute
+        flux scale. Numeric mixture settings remain fixed.
+
+        Sampled continuum coefficients start at [1, 0, ...] in each region;
+        sampled jitter, mismatch_scale and mismatch_fraction start at 0.002,
+        0.1 and 0.01. These defaults assume normalized flux. p_initial overrides
+        selected sampled sites, in physical units and with their exact shapes.
+        Remaining sites are drawn from their priors conditional on those values.
+        All sampled initial values must be finite, in support, and finite after
+        transforming to unconstrained coordinates. Supply p_initial if custom
+        priors exclude the defaults; fixed/derived sites cannot be overridden.
+
+        SVI uses the current fixed and fit masks without modifying either.
+        Pass the returned model and point to predict, plot_models or
+        mask_outliers; mask selection and final inference are separate calls.
+        """
+        import jax
+        import jax.numpy as jnp
+        import numpyro.distributions as dist
+        from numpyro.distributions.transforms import biject_to
+
+        from .numpyro_model import make_model_single
+
+        for name, value in (("model_kwargs", model_kwargs), ("p_initial", p_initial)):
+            if value is not None and not isinstance(value, Mapping):
+                raise TypeError(f"{name} must be a mapping")
+        options = dict(model_kwargs or {})
+        if options.get("likelihood", "gaussian_mixture") != "gaussian_mixture":
+            raise ValueError(
+                "run_mixture_prefit requires likelihood='gaussian_mixture'")
+        if options.get("use_gp", False) is not False:
+            raise ValueError("run_mixture_prefit requires use_gp=False")
+        options.update(likelihood="gaussian_mixture", use_gp=False)
+        options.setdefault("mismatch_fraction", dist.Beta(1., 9.))
+        options.setdefault("mismatch_scale", dist.HalfNormal(0.1))
+        model = make_model_single(self, **options)
+
+        init_key, svi_key = jax.random.split(rng_key)
+        supplied = {name: jnp.asarray(value)
+                    for name, value in (p_initial or {}).items()}
+        for name, value in supplied.items():
+            if not np.all(np.isfinite(value)):
+                raise ValueError(f"initial value for {name!r} must be finite")
+        trace = model.prior_trace(rng_key=init_key, condition=supplied)
+        sites = {name: site for name, site in trace.items()
+                 if site["type"] == "sample" and not site["is_observed"]}
+        defaults = {
+            name: jnp.full_like(sites[name]["value"], value)
+            for name, value in (("jitter", .002), ("mismatch_scale", .1),
+                                ("mismatch_fraction", .01)) if name in sites
+        }
+        coefficients = jnp.zeros_like(sites["continuum_coefficients"]["value"])
+        defaults["continuum_coefficients"] = coefficients.at[..., 0].set(1.)
+
+        # Substitute before drawing dependent sites (e.g. logg given Teff).
+        # Supplying every latent to run_svi also avoids init_to_value's uniform
+        # fallback for parameters omitted from a partial p_initial dictionary.
+        trace = model.prior_trace(rng_key=init_key, condition={
+                                  **defaults, **supplied})
+        initial = {}
+        for name, site in trace.items():
+            if site["type"] != "sample" or site["is_observed"]:
+                continue
+            value, prior = jnp.asarray(site["value"]), site["fn"]
+            if prior.support.is_discrete:
+                raise ValueError(
+                    f"prefit requires a continuous prior for {name!r}")
+            if not (np.all(np.isfinite(value)) and np.all(prior.support.check(value))):
+                raise ValueError(
+                    f"initial value for {name!r} must be finite and inside its prior support")
+            if not np.all(np.isfinite(biject_to(prior.support).inv(value))):
+                raise ValueError(
+                    f"initial value for {name!r} must be finite in unconstrained coordinates; "
+                    "set p_initial away from prior boundaries")
+            initial[name] = value
+
+        point = self.run_svi(model=model, rng_key=svi_key, p_initial=initial,
+                             step_size=step_size, num_steps=num_steps,
+                             progress_bar=progress_bar)
+        return model, point
+
     def run_nuts(self, *, model, rng_key, num_warmup=500, num_samples=500,
                  num_chains=1, progress_bar=True, nuts_kwargs=None,
                  mcmc_kwargs=None):
@@ -436,7 +523,10 @@ class SpecFit:
         """Predict at a native point or average predictions over posterior draws.
 
         Supply exactly one of point or samples. All physical/continuum/GP
-        calculations delegate to model.predict using the current fit mask.
+        calculations delegate to model.predict. Gaussian continuum/GP
+        predictions use the current fit mask. The built-in Gaussian mixture
+        has an explicit continuum and uses only the fixed observation mask,
+        so its probabilities also cover fit-masked pixels at the supplied point.
         A point returns the model's full prediction dict. The built-in model
         returns model_flux = physical_flux * continuum and mean_flux equal to
         model_flux plus the GP conditional mean, when available. With vecchia1,
@@ -446,16 +536,23 @@ class SpecFit:
         evenly spaced draws are used; None uses all draws. Sample predictions
         return the mean curves (physical_flux, continuum, model_flux,
         mean_flux and gp_mean when supplied by the model) and draw_indices.
+        Mixture models also return mismatch_probability, averaged after
+        evaluating responsibilities separately at each draw. Fixed-masked pixels
+        have NaN probabilities. Explicit continuum uncertainty is included
+        across mixture draws; fresh observational noise is not.
         When model_flux is supplied, model_flux_quantiles and
         gp_mean_quantiles contain pointwise 16th/84th percentiles of
         model_flux and mean_flux - model_flux, respectively, with shape
         (2, *observation.shape), using the same draws. The difference is taken
-        within each draw. These describe the spread of conditional means across
-        draws, excluding within-draw continuum/GP uncertainty and fresh noise.
+        within each draw. These describe the spread of model curves across
+        draws. Gaussian models exclude within-draw continuum/GP uncertainty;
+        mixture draws include their explicit continuum coefficients. Neither
+        includes fresh observational noise.
         Parameter dictionaries and conditional covariance objects are not
-        averaged. These are conditional-mean predictions, not predictive draws.
+        averaged. These predictions do not draw fresh observational noise.
         """
         from .reconstruction import _mean_prediction
+        from .numpyro_model import model_single
 
         if (point is None) == (samples is None):
             raise ValueError("supply exactly one of point or samples")
@@ -463,7 +560,12 @@ class SpecFit:
         if not callable(predict):
             raise TypeError(
                 "prediction requires a configured model with a predict method")
-        observation = self.fit_observation()
+        # Explicit mixture coefficients fix the curves independently of the
+        # fit mask. Classify excluded pixels too; inference still uses fit_observation.
+        observation = (self.observation if (
+            getattr(model, "function", None) is model_single
+            and model.settings.get("likelihood") == "gaussian_mixture")
+            else self.fit_observation())
 
         def predict_point(values):
             return predict(values, observation, self.specmodel)
@@ -487,11 +589,14 @@ class SpecFit:
                       mask_velocity=10.):
         """Replace the fit mask; default to Gaussian-mixture classification.
 
-        ``method="gaussian_mixture"`` fits one global contamination fraction
-        and extra absolute flux scale to data minus model_flux, without
-        subtracting the GP mean or median filtering. The narrow variance is
-        diag(K + observation variance + jitter variance) from the fitted normal
-        model. Pixels with mismatch probability > p_outlier (default .5) are
+        ``method="gaussian_mixture"`` uses prediction['mismatch_probability']
+        when supplied, without re-estimating mixture parameters. Probabilities
+        must be finite in [0, 1] on every pixel outside the fixed observation
+        mask, including previous fit-masked pixels. Otherwise, fit one global
+        contamination fraction and extra absolute flux scale to data minus
+        model_flux, without subtracting the GP mean or median filtering. The
+        narrow variance is diag(K + observation variance + jitter variance)
+        from the fitted normal model. Pixels with probability > p_outlier (default .5) are
         flagged, then extended. sigma_threshold and mask_v
         apply only to sigma_clip. The inference likelihood is never changed.
         For mixture masking, mask_velocity (default 10.) sets a fixed half-width
@@ -502,14 +607,17 @@ class SpecFit:
         After a mixture call, ``outlier_diagnostics`` contains
         mismatch_probability (NaN on fixed masks), mismatch_fraction,
         mismatch_scale, and normal_residual_variance from that masking pass.
+        probability_source is 'model' or 'residual_fit'. Model probabilities
+        retain the prediction's mixture parameters (None if a custom model
+        omits them); no residual-fit parameters are substituted.
         These diagnostics are a snapshot, not recomputed when the mask changes.
         Mixture plots use the same layout, with physical residuals in the middle,
         probabilities and their threshold at the bottom, and a histogram of
         residual/sqrt(V) on the right. Final extended flags are highlighted.
 
         ``method="sigma_clip"`` selects the legacy median-filter/MAD rule below.
-        Predict once at ``point`` using ``model`` and the current fit mask,
-        before updating the mask. The baseline is prediction['model_flux'],
+        Predict once at ``point`` using ``model``, before updating the mask.
+        The baseline is prediction['model_flux'],
         excluding GP mean. ``mask_v`` is in km/s; absent an override it is the
         largest predicted component vsini, matching the old shared filter-width
         choice. All pixels outside the fixed mask are then reconsidered for
@@ -558,16 +666,36 @@ class SpecFit:
             fixed = np.asarray(self.observation.mask)
             baseline = self._prediction(prediction["model_flux"], fixed)
             variance = self._prediction(
-                _normal_residual_variance(self.observation, prediction, model, trace), fixed)
+                _normal_residual_variance(self.observation, prediction, model, trace), fixed).copy()
             if np.any(variance[~fixed] <= 0):
                 raise ValueError(
                     "normal_residual_variance must be positive on usable pixels")
-            probability = np.full(self.observation.shape, np.nan)
-            fitted = dict(mismatch_fraction=None,
-                          mismatch_scale=None, log_likelihood=0.)
-            if np.any(~fixed):
-                fitted, probability[~fixed] = _fit_gaussian_mixture(
-                    self.observation.flux[~fixed] - baseline[~fixed], variance[~fixed])
+            if "mismatch_probability" in prediction:
+                probability = self._prediction(
+                    prediction["mismatch_probability"], fixed)
+                if np.any((probability[~fixed] < 0) | (probability[~fixed] > 1)):
+                    raise ValueError("mismatch_probability must be in [0, 1]")
+                probability = np.where(fixed, np.nan, probability)
+                fitted = {}
+                for name in ("mismatch_fraction", "mismatch_scale"):
+                    value = prediction.get(name)
+                    if value is not None:
+                        value = np.asarray(value)
+                        if (value.ndim != 0 or not np.isfinite(value) or value < 0
+                                or (name == "mismatch_fraction" and value > 1)):
+                            raise ValueError(f"{name} must be a finite nonnegative scalar"
+                                             + (" in [0, 1]" if name == "mismatch_fraction" else ""))
+                        value = float(value)
+                    fitted[name] = value
+                source = "model"
+            else:
+                probability = np.full(self.observation.shape, np.nan)
+                fitted = dict(mismatch_fraction=None,
+                              mismatch_scale=None, log_likelihood=0.)
+                if np.any(~fixed):
+                    fitted, probability[~fixed] = _fit_gaussian_mixture(
+                        self.observation.flux[~fixed] - baseline[~fixed], variance[~fixed])
+                source = "residual_fit"
             flags = probability > float(threshold)
             if extend_outlier_mask:
                 if mask_velocity is None:
@@ -585,7 +713,8 @@ class SpecFit:
                         for start, end in zip(left, right):
                             row[start:end] = True
                 flags &= ~fixed
-            diagnostics = dict(fitted, method=method, p_outlier=float(threshold),
+            diagnostics = dict(fitted, method=method, probability_source=source,
+                               p_outlier=float(threshold),
                                mismatch_probability=probability,
                                normal_residual_variance=variance)
             self.set_fit_mask(flags)
@@ -668,6 +797,8 @@ class SpecFit:
         Jitter comes from the prediction (zero if omitted by a custom model),
         in additive flux units, scalar or one value per region. Standardization
         uses sqrt(uncertainty**2 + jitter**2), without GP whitening.
+        For the Gaussian mixture this is the narrow-component standard
+        deviation, not sqrt(uncertainty**2+jitter**2+f*mismatch_scale**2).
 
         Only currently usable pixels contribute. Lag-1 pairs are adjacent in
         the original wavelength array; masked gaps are never bridged.
@@ -714,7 +845,7 @@ class SpecFit:
         return stats
 
     def plot_models(self, *, point=None, samples=None, model, show_gp=False,
-                    show_interval=False, max_draws=50, res_factor=1.5,
+                    show_mismatch=False, show_interval=False, max_draws=50, res_factor=1.5,
                     show_masked=True, save_path=None):
         """Predict and plot continuum-corrected spectra and baseline residuals.
 
@@ -727,8 +858,9 @@ class SpecFit:
         With samples, show_interval=True adds pointwise 16th-84th percentile
         bands for model_flux in the upper panel and, with show_gp, the GP
         mean in the lower panel. Bands are hidden by default. They
-        show the spread of conditional means across draws, excluding within-draw
-        continuum/GP uncertainty and fresh noise. The lower panel subtracts the
+        show the spread of model curves across draws. Gaussian models exclude
+        within-draw continuum/GP uncertainty; mixture draws include explicit
+        continuum uncertainty. Neither includes fresh noise. The lower panel subtracts the
         mean model_flux; its zero line shares the upper model's C0 color.
         show_masked=False hides fixed- and fit-masked data points in both panels;
         model/GP curves and bands still cover all wavelengths. The default is True.
@@ -738,6 +870,11 @@ class SpecFit:
         has its own figure with closely spaced, shared-x panels and a common
         vertical legend to their right. Return a list
         of (figure, axes) pairs in region order; each axes array has shape (2,).
+        With show_mismatch=True, a third panel shows mismatch_probability on
+        [0, 1], and axes has shape (3,). Fixed-masked pixels are omitted;
+        fit-masked probabilities are shown only when show_masked=True. This requires
+        a model that returns mismatch probabilities. For samples these are
+        averages of per-draw probabilities. This option never changes masks.
         save_path="models.png" saves models_region8.png, etc., even for a single
         region. Region labels are URL-escaped for filenames. If no extension
         is supplied, use Matplotlib's default save format.
@@ -762,15 +899,23 @@ class SpecFit:
         gp_interval = (np.stack([_rows(self._prediction(bound, self.effective_mask))
                                  for bound in prediction["gp_mean_quantiles"]])
                        if samples is not None and show_gp and show_interval else None)
+        mismatch = None
+        if show_mismatch:
+            if "mismatch_probability" not in prediction:
+                raise ValueError(
+                    "show_mismatch requires a model returning mismatch_probability")
+            mismatch = self._prediction(prediction["mismatch_probability"],
+                                        self.observation.mask if show_masked else self.effective_mask)
         plots = []
         output = Path(save_path) if save_path is not None else None
         for i, (wave, flux, fixed, fitted, model_flux) in enumerate(zip(
                 _rows(self.observation.wavelength), _rows(
                     self.observation.flux),
                 _rows(self.observation.mask), _rows(self.fit_mask), _rows(baseline))):
-            fig, axes = plt.subplots(2, 1, sharex=True, figsize=(11, 5),
-                                     gridspec_kw={"height_ratios": (7, 3)})
-            upper, lower = axes
+            fig, axes = plt.subplots(3 if show_mismatch else 2, 1, sharex=True,
+                                     figsize=(11, 6.5 if show_mismatch else 5),
+                                     gridspec_kw={"height_ratios": (7, 3, 2) if show_mismatch else (7, 3)})
+            upper, lower = axes[:2]
             for select, style, color, label in ((~(fixed | fitted), "o", "gray", "data"),
                                                 (fixed, "x", "lightgray",
                                                  "fixed mask"),
@@ -824,7 +969,14 @@ class SpecFit:
             lower.axhline(0, color="C0", lw=.5)
             upper.set_ylabel("Normalized flux")
             upper.set_title(f"Region {self.regions[i]}")
-            lower.set(xlabel="Wavelength [Å]", ylabel="Residual")
+            lower.set_ylabel("Residual")
+            if show_mismatch:
+                probability = np.where(
+                    ~fixed if show_masked else valid, _rows(mismatch)[i], np.nan)
+                axes[2].plot(wave, probability, color="C3", lw=1)
+                axes[2].set(ylabel="Mismatch\nprobability",
+                            ylim=(-.03, 1.03), yticks=[0., .5, 1.])
+            axes[-1].set_xlabel("Wavelength [Å]")
             lower.set_xlim(wave[0], wave[-1])
             fig.tight_layout(rect=(0, 0, .81, .92), h_pad=0.2)
             fig.legend(loc="center left", bbox_to_anchor=(.81, .5),

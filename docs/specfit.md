@@ -534,12 +534,14 @@ argument.
 
 A multiplicative Chebyshev continuum is applied after the physical model.
 Gaussian coefficient priors shrink the constant toward one and the other
-coefficients toward zero. The likelihood integrates these coefficients
-analytically. `sigma_constant` and `sigma_continuum` set the two prior scales.
-Jitter is in absolute flux units; the total noise variance is
+coefficients toward zero. The default Gaussian likelihood integrates these
+coefficients analytically; the Gaussian-mixture option below infers them explicitly.
+`sigma_constant` and `sigma_continuum` set the two prior scales.
+Jitter is in absolute flux units; the Gaussian noise variance is
 `error_obs**2 + jitter**2`.
 
-At a chosen physical model and noise setting, recover the conditional continuum:
+For the Gaussian likelihood, recover the conditional continuum at a chosen
+physical model and noise setting:
 
 ```python
 from jaxstar.specfit import continuum_posterior, apply_continuum
@@ -576,8 +578,8 @@ model = make_model_single(
 model.check_prior()  # Compact table of parameters and priors/fixed values
 ```
 
-`run_svi`, `run_nuts` and `predict` require `model=model`; there is no separate
-`priors` or `model_kwargs` argument. Inference accepts any callable of
+`run_svi`, `run_nuts` and `predict` require `model=model`; these methods have no
+separate `priors` or `model_kwargs` argument. Inference accepts any callable of
 `(observation, specmodel)`, including an ordinary custom function or partial.
 Prediction requires a configured model with its own `predict` method.
 Every run uses the current fit mask. A factory-created model is associated with
@@ -659,6 +661,180 @@ prior. The expression/dependency annotations describe the model; numerical
 parameters come from the actual NumPyro trace. `model.prior_trace(rng_key=...)`
 provides the underlying sites and prior draws for more detailed inspection.
 
+### Gaussian mixture for local mismatch
+
+The Gaussian-mixture option models each pixel independently as
+
+```text
+r_i = y_i - physical_flux_i * continuum_i
+v_i = error_obs_i**2 + jitter_region**2
+p(r_i) = (1 - f) * Normal(r_i | 0, variance=v_i)
+           + f * Normal(r_i | 0, variance=v_i + s_mismatch**2)
+```
+
+The narrow component represents pixels adequately described by the model;
+the broader component allows local mismatch, such as missing or incorrect
+spectral lines. `mismatch_fraction` is the prior fraction `f`, shared by all
+regions. `mismatch_scale` is the global **absolute flux amplitude**
+`s_mismatch`, not a multiplier of the observational errors. The full mixture
+variance is `v_i + f * s_mismatch**2`.
+
+```python
+import numpyro.distributions as dist
+
+model = make_model_single(
+    sf, resolving_power=70000., degree=4,
+    likelihood="gaussian_mixture", use_gp=False,
+    mismatch_fraction=dist.Beta(1., 9.),
+    mismatch_scale=dist.HalfNormal(.05),
+)
+model.check_prior()
+p_fit = sf.run_svi(model=model, rng_key=jax.random.PRNGKey(0))
+```
+
+Both `model_single` and `make_model_single` accept these arguments. Supply
+both mixture parameters explicitly as numbers to fix them or as scalar
+NumPyro distributions to infer them. The factory has no default mixture priors;
+the prefit convenience method below supplies its own normalized-flux priors
+when omitted. Fractions must be in `[0, 1]` and
+scales nonnegative, with finite values. For inference choose priors inside
+`(0, 1)` and on positive scales. Fixed `f=0`/`f=1` select the pure components;
+`s_mismatch=0` makes them identical. Near these limits the mixture parameters
+are weakly identified; near `f=1`, mismatch scale and jitter can trade off.
+
+Mixture mode requires no GP. Set `use_gp=False` explicitly on the factory,
+whose default remains `True`; conflicting GP settings raise an error.
+`likelihood="gaussian"` remains the default and preserves analytic continuum
+marginalization. In mixture mode, `continuum_coefficients` is an explicit
+inference site under the existing Gaussian priors, optimized by `sf.run_svi`
+or sampled by `sf.run_nuts`, with shape `(degree + 1,)` for 1D observations
+or `(n_regions, degree + 1)` for 2D observations. It appears in `check_prior`
+and in inference results. Predictions use these same coefficients.
+
+Pixel membership indicators are **not sampled**. The likelihood sums the two
+weighted, normalized Gaussian densities using `logsumexp` separately for
+each pixel, then sums pixel log densities. This follows the standard
+[finite-mixture marginalization](https://mc-stan.org/docs/stan-users-guide/finite-mixtures.html#summing-out-the-responsibility-parameter).
+
+The broad component reduces the influence of mismatched pixels. Known
+bad-pixel and other fixed observation masks still apply.
+The mixture likelihood does not automatically change either mask. If reusing
+a fit with previous residual clipping, explicitly call `sf.reset_fit_mask()` to clear
+that additional mask while retaining the observation's fixed mask. Broad
+pixels still carry weight; this model neither ignores them completely nor
+models wavelength correlations or repairs incorrect spectral lines.
+
+`predict` and `plot_models` leave masks unchanged. To turn the mixture model's
+probabilities into a fit mask, call `mask_outliers(method="gaussian_mixture")`:
+it uses the predicted probabilities directly, without re-estimating the
+mixture fraction or scale.
+
+Posterior mismatch probabilities (responsibilities) are available as:
+
+```python
+prediction = sf.predict(point=p_fit, model=model)
+q = prediction["mismatch_probability"]  # Same shape as observation.flux
+sf.plot_models(point=p_fit, model=model, show_mismatch=True)
+```
+
+For posterior draws obtained by sampling this same mixture model:
+
+```python
+prediction = sf.predict(samples=mcmc.get_samples(), model=model, max_draws=50)
+q = prediction["mismatch_probability"]
+sf.plot_models(samples=mcmc.get_samples(), model=model, show_mismatch=True)
+```
+
+At a supplied parameter point, `q_i = f * Normal_broad(r_i) / p(r_i)`.
+For posterior samples, probabilities are evaluated at each selected draw and
+then averaged; they are not computed from the average spectrum. With the
+built-in mixture model, `sf.predict` evaluates probabilities on all pixels
+outside the fixed observation mask, including fit-masked pixels, at the supplied
+parameters. Only fixed-masked pixels have `NaN` probabilities. Inference still
+excludes both fixed- and fit-masked pixels. Gaussian continuum/GP predictions
+continue to condition on the current fit mask.
+`show_mismatch=True` adds a third plot panel with probabilities between 0 and 1.
+It includes fit-masked probabilities when `show_masked=True` (the default) and
+hides them when `show_masked=False`; fixed-masked probabilities are always
+omitted. Plotting does not change masks.
+Point predictions also return `continuum_coefficients`, `mismatch_fraction`
+and `mismatch_scale`, without a Gaussian `continuum_posterior`. Supply every
+sampled site when predicting a point.
+
+Custom models can use `gaussian_mixture_log_likelihood` and
+`gaussian_mixture_responsibility`, both with arguments
+`(observation, model_flux, mismatch_fraction=..., mismatch_scale=..., jitter=...)`.
+Here `model_flux` already includes the explicit continuum. The density ignores
+masked pixels exactly, and the responsibility helper creates no sample sites.
+
+### Mixture prefit
+
+`run_mixture_prefit` builds the no-GP mixture model, prepares all initial values
+and calls `run_svi`. It returns `(model, point)` for use with the existing
+prediction, plotting and masking APIs:
+
+```python
+model_kwargs = dict(
+    resolving_power=70000., use_physical_logg_max=True,
+    use_empirical_vmic=False, use_empirical_vmacro=False,
+)
+prefit_model, prefit_point = sf.run_mixture_prefit(
+    rng_key=jax.random.PRNGKey(0),
+    model_kwargs=model_kwargs,
+    p_initial={"teff": 5800.},  # Optional; use values inside the loaded grid
+    step_size=.01, num_steps=2000,
+)
+prefit_model.check_prior()
+sf.plot_models(model=prefit_model, point=prefit_point, show_mismatch=True)
+
+# This separate call changes the fit mask using the prefit probabilities.
+sf.mask_outliers(
+    model=prefit_model, point=prefit_point, method="gaussian_mixture",
+    p_outlier=.5, mask_velocity=10.,
+)
+```
+
+`model_kwargs` forwards factory settings, including physical priors, fixed
+parameters, continuum degree/scales and optional mixture priors. The wrapper
+sets `likelihood="gaussian_mixture"`, `use_gp=False` and rejects conflicts.
+CCF is still required if the factory needs default RV or rotation bounds.
+The SVI defaults are `step_size=.01`, `num_steps=2000`, `progress_bar=True`.
+
+| Parameter | Default prior | Prefit initial value, when sampled |
+| --- | --- | --- |
+| `continuum_coefficients` | Existing Gaussian continuum priors | `[1, 0, ...]` per region |
+| `jitter` | Factory LogUniform(0.001, 0.05) | `0.002` |
+| `mismatch_fraction` | Beta(1, 9) | `0.01` |
+| `mismatch_scale` | HalfNormal(0.1) | `0.1` |
+
+These scales assume normalized flux. Prior settings and initial values are
+independent: change the former through `model_kwargs` and the latter through
+`p_initial`. For example, `model_kwargs={..., "mismatch_scale": dist.HalfNormal(.2)}`
+changes its prior width, while `p_initial={"mismatch_scale": .2}` changes its
+starting point. Numeric mixture parameters and entries in `fixed` stay fixed;
+do not include fixed or derived sites in `p_initial`.
+
+Partial `p_initial` mappings override the prefit defaults. Shapes must match
+the sample sites, including continuum and region-vector parameters. Remaining
+parameters are drawn from their priors conditional on the supplied values
+(for example, `logg` conditional on the starting `teff`). Every latent is then
+passed to SVI, avoiding the uniform fallback used by an ordinary `run_svi`
+call with a partial initial-value mapping. Initial values outside support,
+nonfinite values and boundaries mapping to infinite unconstrained coordinates
+raise an error before SVI. If a custom prior excludes a default initial value,
+supply a compatible override; the method does not clip it into the prior.
+
+The prefit uses the current fixed and fit masks and changes neither. Clear an
+earlier fit mask explicitly with `reset_fit_mask()` if needed. After selecting
+and fixing the mask, construct a separate Gaussian GP/Vecchia model with the
+shared physical settings for final inference. Passing `p_initial=prefit_point`
+to its `run_svi` call reuses shared parameters; mixture-only and deterministic
+entries are ignored. The new GP parameters use NumPyro's `init_to_uniform`
+fallback in unconstrained coordinates. The final continuum is analytically
+marginalized, so it needs no coefficient initialization. The
+[prefit notebook](../examples/specfit/coelho_mixture_prefit.ipynb) shows this
+transition, a final SVI and NUTS run.
+
 ### Outlier plots
 
 `mask_outliers` defaults to `method="gaussian_mixture"`, with `p_outlier=0.5`
@@ -673,7 +849,7 @@ sf.mask_outliers(point=p_fit, model=model, method="sigma_clip",
                  sigma_threshold=3., plot=True)
 ```
 
-With `method="sigma_clip"`, `mask_outliers` calls `predict` once using the current mask, before updating it.
+With `method="sigma_clip"`, `mask_outliers` calls `predict` once before updating the mask.
 It uses `model_flux` as the baseline and the largest component `vsini` for
 the median-filter width; `mask_v` can override that velocity in km/s. Previously
 flagged pixels are reconsidered, so they can return to the sf. Custom model
@@ -732,6 +908,23 @@ noise and jitter counted once); without a GP it is observational variance plus
 jitter variance. It is not the conditional GP predictive variance or continuum
 uncertainty. The continuum marginalization and inference likelihood are unchanged.
 
+If the model prediction already contains `mismatch_probability`, the same call
+uses those probabilities instead of fitting a mixture to residuals. For example,
+after SVI with `likelihood="gaussian_mixture"`:
+
+```python
+sf.mask_outliers(point=p_fit, model=model, method="gaussian_mixture",
+                 p_outlier=0.5, mask_velocity=10., plot=True)
+```
+
+This only applies the probability threshold and mask extension. It preserves
+the model's inferred `mismatch_fraction` and `mismatch_scale`. Probabilities
+must have the observation shape and be finite in `[0, 1]` outside the fixed
+observation mask, including previously fit-masked pixels. Invalid supplied
+probabilities raise an error without changing the mask or falling back to a
+residual fit. `method="sigma_clip"` ignores these probabilities and retains its
+existing behavior.
+
 Pixels with `q > p_outlier` are flagged. For mixture masking, the default
 `mask_velocity=10.` extends each original flagged pixel by ±10 km/s within its
 region, using log-wavelength distances. Overlapping windows are combined
@@ -742,7 +935,10 @@ to the mixture method and is separate from the sigma-clipping filter's `mask_v`.
 As with sigma clipping, fixed masked pixels are excluded and previous fit-mask
 pixels are reconsidered. Probabilities are NaN on fixed
 masks. `outlier_diagnostics` also records `mismatch_fraction`, `mismatch_scale`,
-and `normal_residual_variance` from that call. These are conditional
+and `normal_residual_variance` from that call. `probability_source` is `"model"`
+when probabilities are supplied by the prediction, or `"residual_fit"` when a
+mixture is fitted to the residuals. The diagnostics are a snapshot of the
+probabilities and parameters actually used for that pass. These are conditional
 classification probabilities treating pixels independently, not a replacement
 for the correlated GP fit. `sigma_threshold` and `mask_v` apply only to sigma
 clipping. Mixture plots retain the sigma-clipping layout: data and physical
@@ -752,6 +948,10 @@ divided by `sqrt(V)`, with an `N(0, 1)` reference. Extended flags are highlighte
 throughout; no GP mean or median-filter trend is subtracted.
 Custom model callbacks must supply `normal_residual_variance` alongside
 `model_flux`; the built-in model obtains it internally during masking.
+Custom models may supply `mismatch_probability` for direct masking, with the
+same full-pixel coverage described above. Also return scalar `mismatch_fraction`
+and `mismatch_scale` to report those values in diagnostics; if omitted, they
+are recorded as `None` and displayed as "not supplied", without fitting them.
 
 ### Mask summary and residual diagnostics
 
@@ -780,6 +980,10 @@ defaults to zero when omitted by a custom reconstruction callback.
 
 Statistics use only usable pixels. Standardized residuals divide by
 `sqrt(error_obs**2 + jitter**2)`; they are not whitened by the GP covariance.
+For Gaussian mixtures this is the narrow-component standard deviation, not
+the full mixture standard deviation. The `n_gt_3sigma`/`n_gt_5sigma` counts
+refer to this same narrow-component scale; use mismatch probabilities for
+the mixture's assessment of individual pixels.
 Lag-1 correlation uses pairs adjacent in the original wavelength array with
 both pixels usable, without bridging masked gaps. The return fields remain
 `region`, `n_usable`, `rms`, `mad_scale`, `standardized_rms`, `n_gt_3sigma`,
@@ -814,7 +1018,7 @@ This predicts at up to 50 evenly spaced draws, then averages the returned curves
 (`physical_flux`, `continuum`, `model_flux`, `mean_flux`, `gp_mean`, where
 provided). `max_draws=None` uses all draws. The result also includes
 `draw_indices`; physical parameter dictionaries, conditional covariance objects
-and jitter are not averaged. In particular, GP means are computed at each draw
+and noise parameters are not averaged. GP means are computed at each draw
 before averaging. `model_flux` averages the product evaluated at each draw,
 not the product of the separately averaged `physical_flux` and `continuum`.
 When `model_flux` is available, the result also includes
@@ -822,9 +1026,13 @@ When `model_flux` is available, the result also includes
 percentiles of `model_flux` and `mean_flux - model_flux`, respectively,
 across the same draws, with shape `(2, *observation.shape)`. The GP difference
 is computed within each draw before taking percentiles. These describe the
-spread of conditional means across posterior draws. They exclude the conditional
-continuum/GP uncertainty remaining within each draw and fresh observational
-noise (including jitter); they are not a full posterior predictive interval.
+spread of model curves across posterior draws. Gaussian predictions exclude
+the conditional continuum/GP uncertainty remaining within each draw. In
+Gaussian-mixture mode the continuum coefficients are sampled, so their
+posterior uncertainty is included in the bands. Neither includes fresh
+observational noise, so these are not full posterior predictive intervals.
+When supplied by the model,
+`mismatch_probability` is also averaged across the selected draws.
 
 `plot_models` calls `predict` internally:
 
@@ -835,8 +1043,8 @@ plots = sf.plot_models(samples=mcmc.get_samples(), model=model,
 ```
 
 It returns `[(fig, axes), ...]` in region order, with one figure per region and
-two axes per figure. Flux and residual panels share their x axis and have a
-small vertical gap; only the lower panel shows x tick labels. The x limits match
+two axes per figure, or three when `show_mismatch=True`. The panels share their
+x axis and have a small vertical gap; only the bottom panel shows x tick labels. The x limits match
 the region's wavelength endpoints. A common legend sits vertically to the right
 of the panels. Observed points use open gray circles labeled `data`, matching
 the outlier check; mask entries are omitted when that region has no such masked pixels.
@@ -849,7 +1057,7 @@ Without a filename extension, Matplotlib's default save format is used.
 The upper panel shows data and the physical model including its continuum
 prediction (`model_flux`). Bands are hidden by default (`show_interval=False`).
 With `samples` and `show_interval=True`, it shades the pointwise 16th-84th
-percentile range of the conditional means described above. The lower
+percentile range of the model curves described above. The lower
 shows `data - model_flux`, subtracting the mean curve for `samples`. Its
 zero line uses C0 to match the continuum model in the upper panel.
 `show_gp=True` overlays `mean_flux - model_flux` in C1 in the lower panel,
@@ -860,7 +1068,9 @@ Vecchia models omit the GP overlay even with `show_gp=True`, because their
 latent GP mean is not reconstructed.
 Masked points are distinguished by default. Set `show_masked=False` to hide
 both observation- and fit-masked data points in the upper and residual panels.
-Model and GP curves/bands still cover all wavelengths.
+It also hides fit-masked probabilities in the optional mismatch panel.
+Fixed-masked probabilities are always omitted. Model and GP curves/bands
+still cover all wavelengths.
 Upper y limits include unmasked data and all
 finite displayed model and band values, including those at masked pixels. Residual limits
 use unmasked residuals and all finite displayed GP curve/band values.
@@ -1021,9 +1231,11 @@ The callback has signature
 the point; missing latents raise an error. The callback receives the model's
 return value and full trace, and decides how to compute predictions. For example,
 a model sampling continuum coefficients uses those coefficients directly.
-`reconstruct_single` is the existing Gaussian marginalized-continuum/GP callback;
-it returns physical, continuum and mean flux, plus continuum posterior, jitter
-and optional GP mean. Custom callbacks used with the standard diagnostics should
+`reconstruct_single` supports the built-in likelihoods. Gaussian mode returns
+physical, continuum and mean flux, plus continuum posterior, jitter and optional
+GP mean. Gaussian-mixture mode uses the sampled coefficients and also returns
+mismatch probabilities and parameters, without a Gaussian continuum posterior.
+Custom callbacks used with the standard diagnostics should
 return the corresponding prediction fields. An inference-only model needs no
 reconstruction callback.
 
@@ -1037,7 +1249,7 @@ The physical IP kernel belongs to `SpecModel`/its broadening operator, while its
 parameter priors belong to the NumPyro model. The fixed two-Gaussian IP above is
 supported by the built-in physical model. Sampling additional IP parameters or
 using other IP families requires extending that interface. This custom-model
-API does not add a built-in sampled-continuum model.
+API also supports the Gaussian-mixture model's sampled continuum described above.
 
 `model_single` is an ordinary NumPyro model. Supply fixed numbers or NumPyro
 distributions for the physical and noise parameters. Fixed values are recorded
@@ -1161,8 +1373,10 @@ Point predictions also return `normal_residual_variance`, equal to
 conditional innovation variance `v`. Standard `mask_outliers` uses it for
 Gaussian-mixture selection without constructing a dense covariance or GP mean.
 The model and variance cover previously fit-masked pixels as well, so those
-pixels can be reconsidered. Continuum coefficients remain analytically
-marginalized in the inference likelihood; the mixture is used only for masking.
+pixels can be reconsidered. In this Gaussian/Vecchia configuration, continuum
+coefficients remain analytically marginalized and the mixture is used only
+for masking. The separate `likelihood="gaussian_mixture"` option requires
+`use_gp=False` and infers continuum coefficients explicitly.
 
 The [comparison benchmark](../benchmarks/benchmark_vecchia1.py) measures
 likelihoods and gradients separately, including the analytic continuum
@@ -1175,6 +1389,9 @@ integral, and can fit both densities to a spectrum drawn from the exact model.
   `examples/specfit/coelho/`. It covers CCF, SVI, outlier masking and refitting,
   NUTS, plots and result saving. Set `GP_SOLVER="auto"` (default) for exact GP
   inference, or `GP_SOLVER="vecchia1"` to try the experimental approximation.
+- [Coelho mixture prefit](../examples/specfit/coelho_mixture_prefit.ipynb) uses
+  the mixture only for prefit/masking, then runs a Gaussian GP/Vecchia model
+  with analytic continuum marginalization and a fixed mask.
 - [SpecModel](tutorials/specfit/specmodel.ipynb) demonstrates the physical
   stages and multiple stellar components. It requires reference data from a
   sibling `jaxspec` checkout; see the notebook's setup instructions.

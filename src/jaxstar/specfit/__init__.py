@@ -1,4 +1,4 @@
-"""Spectral grids, physical models, observations and Gaussian likelihoods."""
+"""Spectral grids, physical models, observations and spectral likelihoods."""
 
 from .libraries import (
     select_grid_paths,
@@ -38,6 +38,8 @@ from .continuum import (
     continuum_posterior,
 )
 from .likelihood import (
+    gaussian_mixture_log_likelihood,
+    gaussian_mixture_responsibility,
     marginalized_continuum_log_likelihood,
     prepare_gp_observation,
     gp_marginalized_continuum_log_likelihood,
@@ -63,6 +65,7 @@ __all__ = [
     "chebyshev_basis", "continuum_design_matrix", "evaluate_continuum",
     "apply_continuum", "continuum_prior",
     "marginalized_continuum_log_likelihood", "continuum_posterior",
+    "gaussian_mixture_log_likelihood", "gaussian_mixture_responsibility",
     "prepare_gp_observation", "gp_marginalized_continuum_log_likelihood",
     "gp_continuum_posterior", "gp_conditional_mean",
 ]
