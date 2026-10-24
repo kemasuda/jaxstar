@@ -704,8 +704,16 @@ direct `model_single` calls retain their existing numeric GP scale bounds.
 
 RV priors are not clipped to `sf.rv_bounds`; spectrum evaluation still checks
 coverage. `use_empirical_vmic=None` enables BOSZ's deterministic relation;
-`False` makes vmic explicit. `use_empirical_vmacro=True` selects the conditional
-prior with `vmacro_empirical_sigma` (default 1 km/s). Fixed values for active
+`False` makes vmic explicit. `use_empirical_vmacro=True` (or
+`"valenti_fischer2005"`) selects the Valenti & Fischer conditional prior;
+`"doyle2014"` and `"lubin2026"` also depend on logg. With
+`vmacro_empirical_sigma=None`, their widths are 1.0, 0.37 and 0.09 km/s,
+respectively. A positive scalar overrides the width. The Doyle and Lubin
+defaults adopt observed residual RMS values, not measurement-error-corrected
+intrinsic scatter. All three helpers return a zero-truncated Normal prior;
+the inputs and empirical locations are not clipped. Calibration ranges and
+sources are documented in `empirical_vmacro_valenti_fischer2005`,
+`empirical_vmacro_doyle2014` and `empirical_vmacro_lubin2026`. Fixed values for active
 empirical vmic/vmacro conflict with those options.
 
 `use_physical_logg_max=True` intersects the chosen Teff bounds with 4500--7000 K
@@ -1015,8 +1023,17 @@ for the correlated GP fit. `sigma_threshold` and `mask_v` apply only to sigma
 clipping. Mixture plots retain the sigma-clipping layout: data and physical
 model at the top, physical residuals in the middle, and outlier probabilities
 with their threshold at the bottom. The right-hand histogram shows residuals
-divided by `sqrt(V)`, with an `N(0, 1)` reference. Extended flags are highlighted
-throughout; no GP mean or median-filter trend is subtracted.
+divided by `sqrt(V)`, stacking retained and masked counts so the total is
+visible. Thin, smooth curves show the normal and outlier component densities
+and their sum, scaled by the before-clipping pixel count and bin width as
+with the original normal reference. They use all pixels outside the fixed mask:
+the normal component has weight `1-f` and unit width, while the outlier component has weight `f`
+and pixel-dependent width `sqrt(1 + s**2/V)`. Thus a large outlier fraction
+reduces the normal component's expected counts. The overlays are omitted if
+either mixture parameter is unavailable. Retained/masked histogram colors
+show the final classification including mask extension, not latent component
+membership. Extended flags are highlighted throughout; no GP mean or
+median-filter trend is subtracted.
 Custom model callbacks must supply `normal_residual_variance` alongside
 `model_flux`; the built-in model obtains it internally during masking.
 Custom models may supply `mismatch_probability` for direct masking, with the
@@ -1367,8 +1384,10 @@ continuum-corrected spectra afterward with the helpers above.
 - `use_empirical_vmic=None` enables the empirical microturbulence relation for
   BOSZ automatically. Omit `vmic` from `atmosphere` in this mode, or set the
   option to `False` to supply an explicit value/prior.
-- `use_empirical_vmacro=True` adds a shared empirical macroturbulence prior;
-  omit `vmacro` from `broadening`. Its width is `vmacro_empirical_sigma=1.` km/s.
+- `use_empirical_vmacro=True` (or `"valenti_fischer2005"`), `"doyle2014"` or
+  `"lubin2026"` adds a shared empirical macroturbulence prior; omit `vmacro`
+  from `broadening`. `vmacro_empirical_sigma=None` uses the relation's default
+  width (1.0, 0.37 or 0.09 km/s); a positive scalar overrides it.
 - `use_physical_logg_max=True` applies a Teff-dependent gravity ceiling. For a
   scalar Uniform logg prior, it replaces the supplied upper bound and retains
   the lower bound. The relation is not clipped to the grid; choose compatible

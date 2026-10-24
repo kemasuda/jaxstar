@@ -38,22 +38,36 @@ def physical_logg_max(teff):
 
 
 def empirical_vmic(teff, logg, feh):
-    """Return the legacy microturbulent velocity in km/s.
+    """Return the empirical microturbulent velocity in km/s.
 
-    Inputs are Teff in kelvin, logg in log10 cgs, and metallicity ``feh`` in
-    dex. The relation is copied from ``jaxspec.numpyro_model.get_empirical_vmic``,
-    which notes Teff > 5000 K and logg > 3.5. Its BOSZ caller supplied ``mh``
-    as ``feh``; this helper performs no metallicity conversion.
+    Inputs are Teff in kelvin, logg in log10 cgs, and ``feh`` = [Fe/H] in
+    dex; no metallicity conversion is performed. This is the Gaia-ESO
+    prescription of Bergemann & Hill (v2, 2013), given in Bergemann & Hoppe
+    (2026), Living Reviews in Computational Astrophysics 12, 7,
+    https://doi.org/10.1007/s41115-026-00029-3. Its stated validity range is
+    4000 < Teff < 7000 K, 0 < logg < 5, and -4.5 < [Fe/H] < 1.
 
-    The polynomial is evaluated without clipping or applicability checks.
-    Inputs broadcast under JAX; the caller decides whether the result is
-    fixed deterministically or used to construct a prior with scatter.
+    For logg >= 3.5, dwarfs/subgiants with Teff >= 5000 K use the original
+    hot-dwarf polynomial; cooler dwarfs use its temperature terms evaluated
+    at 5000 K, retaining the gravity and metallicity terms. Giants (logg <
+    3.5) use a separate polynomial at their actual Teff. Values are continuous
+    at 5000 K, with a slope change, but discontinuous across logg = 3.5.
+
+    Apart from the prescribed cool-dwarf temperature freeze, no input or
+    output clipping or validity checks are applied. Inputs broadcast under
+    JAX; the caller chooses deterministic use or a prior with scatter.
     """
-    dt = jnp.asarray(teff) - 5500
-    dg = jnp.asarray(logg) - 4.0
+    teff = jnp.asarray(teff)
+    logg = jnp.asarray(logg)
     feh = jnp.asarray(feh)
-    return (1.05 + 2.51e-4 * dt + 1.5e-7 * dt**2
-            - 0.14 * dg - 0.05e-1 * dg**2 + 0.05 * feh + 0.01 * feh**2)
+    dt = teff - 5500
+    dg = logg - 4.0
+    dt_dwarf = jnp.where(teff >= 5000, dt, -500)
+    dwarf = (1.05 + 2.51e-4 * dt_dwarf + 1.5e-7 * dt_dwarf**2
+             - 0.14 * dg - 0.005 * dg**2 + 0.05 * feh + 0.01 * feh**2)
+    giant = (1.25 + 4.01e-4 * dt + 3.1e-7 * dt**2
+             - 0.14 * dg - 0.005 * dg**2 + 0.05 * feh + 0.01 * feh**2)
+    return jnp.where(logg >= 3.5, dwarf, giant)
 
 
 def empirical_vmacro_valenti_fischer2005(teff, *, sigma=1.0):
@@ -71,12 +85,85 @@ def empirical_vmacro_valenti_fischer2005(teff, *, sigma=1.0):
     no sample sites; use ``numpyro.sample("vmacro", helper(teff))`` inside a
     custom model. Sigma is fixed by default, but an already sampled value may
     be passed explicitly. Applicability and spectral coverage are the caller's
-    responsibility. Future Teff/logg relations can have separate named helpers.
+    responsibility.
     """
     teff = jnp.asarray(teff)
     sigma = jnp.asarray(sigma)
     location = 3.98 + (teff - 5770.) / 650.
     return dist.TruncatedNormal(loc=location, scale=sigma, low=0.)
+
+
+def empirical_vmacro_doyle2014(teff, logg, *, sigma=0.37):
+    """Return a macroturbulence prior around the Doyle et al. (2014) relation.
+
+    Inputs are Teff in kelvin and logg in log10 cgs; the returned NumPyro
+    TruncatedNormal is in km/s, with the empirical relation as its location
+    and lower bound zero. Equation (8) of MNRAS 444, 3592,
+    https://doi.org/10.1093/mnras/stu1692, is calibrated over 5200--6400 K
+    and logg 4.0--4.6 for radial-tangential macroturbulence.
+
+    The default sigma=0.37 km/s adopts the observed residual RMS as a prior
+    width, not a measurement-error-corrected intrinsic scatter. It does not
+    use the paper's combined error of 0.73 km/s. Sigma must be positive and
+    sets the standard deviation before truncation. Inputs broadcast under
+    JAX; no sample sites, input/location clipping or validity checks are
+    added. Applicability is the caller's responsibility.
+    """
+    dt = jnp.asarray(teff) - 5777.
+    logg = jnp.asarray(logg)
+    sigma = jnp.asarray(sigma)
+    location = 3.21 + 2.33e-3 * dt + 2.00e-6 * dt**2 - 2.00 * (logg - 4.44)
+    return dist.TruncatedNormal(loc=location, scale=sigma, low=0.)
+
+
+def empirical_vmacro_lubin2026(teff, logg, *, sigma=0.09):
+    """Return a macroturbulence prior around the Lubin et al. (2026) relation.
+
+    Inputs are Teff in kelvin and logg in log10 cgs; the returned NumPyro
+    TruncatedNormal is in km/s, with location 5.32 - 2.30*r and lower bound
+    zero. Here r = 10**(logg - 4.44) * (teff / 5772)**(-0.5) is the
+    dimensionless solar nu_max ratio, not a frequency in microhertz.
+    This follows equations (2)--(3) and the table values in
+    https://arxiv.org/abs/2609.17693 (v1); equation (3)'s printed slope units
+    are inconsistent with that normalization. The radial-tangential
+    calibration is restricted to r=0.4--1.4 in F/G/K dwarfs.
+
+    The default sigma=0.09 km/s adopts the gold sample's observed residual
+    RMS as a prior width, not a measurement-error-corrected intrinsic scatter.
+    Sigma must be positive and sets the standard deviation before truncation.
+    Inputs broadcast under JAX; no sample sites, input/location clipping or
+    validity checks are added. Applicability is the caller's responsibility.
+    """
+    teff = jnp.asarray(teff)
+    logg = jnp.asarray(logg)
+    sigma = jnp.asarray(sigma)
+    ratio = 10.**(logg - 4.44) * (teff / 5772.)**(-0.5)
+    return dist.TruncatedNormal(loc=5.32 - 2.30 * ratio, scale=sigma, low=0.)
+
+
+def _resolve_empirical_vmacro(option, sigma):
+    """Resolve the static selector and its optional scalar prior width."""
+    if option is False:
+        return None, (), sigma
+    if option is True:
+        option = "valenti_fischer2005"
+    if not isinstance(option, str):
+        raise TypeError("use_empirical_vmacro must be a bool or a relation name")
+    relations = {
+        "valenti_fischer2005": (empirical_vmacro_valenti_fischer2005, ("teff",), 1.0),
+        "doyle2014": (empirical_vmacro_doyle2014, ("teff", "logg"), 0.37),
+        "lubin2026": (empirical_vmacro_lubin2026, ("teff", "logg"), 0.09),
+    }
+    if option not in relations:
+        raise ValueError(f"use_empirical_vmacro must be False, True or one of {tuple(relations)}")
+    helper, dependencies, default_sigma = relations[option]
+    sigma = default_sigma if sigma is None else sigma
+    value = jnp.asarray(sigma)
+    if value.ndim != 0 or value.dtype.kind not in "fiu":
+        raise ValueError("vmacro_empirical_sigma must be a finite positive scalar")
+    _require(jnp.isfinite(value) & (value > 0),
+             "vmacro_empirical_sigma must be a finite positive scalar")
+    return helper, dependencies, sigma
 
 
 def single_star_params(atmosphere, *, vsini, vmacro, q1, q2, rv, resolving_power=None):
@@ -116,7 +203,7 @@ def _draw(name, prior_or_value, *, regions=None, infer=None):
 
 def _validate_single_config(observation, specmodel, atmosphere, broadening, *,
                             use_physical_logg_max, use_empirical_vmic,
-                            use_empirical_vmacro, vmacro_empirical_sigma):
+                            use_empirical_vmacro, vmacro_dependencies):
     """Check configuration and resolve BOSZ-auto vmic before sampling."""
     if not isinstance(observation, Observation) or not isinstance(specmodel, SpecModel):
         raise TypeError("model_single requires Observation and SpecModel")
@@ -127,10 +214,8 @@ def _validate_single_config(observation, specmodel, atmosphere, broadening, *,
         raise ValueError(
             "observation region labels must match SpecModel row order")
 
-    for name, value in (("use_physical_logg_max", use_physical_logg_max),
-                        ("use_empirical_vmacro", use_empirical_vmacro)):
-        if not isinstance(value, bool):
-            raise TypeError(f"{name} must be a bool")
+    if not isinstance(use_physical_logg_max, bool):
+        raise TypeError("use_physical_logg_max must be a bool")
     if use_empirical_vmic is not None and not isinstance(use_empirical_vmic, bool):
         raise TypeError("use_empirical_vmic must be None or a bool")
 
@@ -143,9 +228,9 @@ def _validate_single_config(observation, specmodel, atmosphere, broadening, *,
     if empirical_vmic_active and not {"teff", "logg", "mh", "vmic"}.issubset(axes):
         raise ValueError(
             "empirical vmic requires teff, logg, mh and vmic atmosphere axes")
-    if use_empirical_vmacro and "teff" not in axes:
-        raise ValueError(
-            "use_empirical_vmacro requires a teff atmosphere axis")
+    for name in vmacro_dependencies:
+        if name not in axes:
+            raise ValueError(f"use_empirical_vmacro requires a {name} atmosphere axis")
 
     required_axes = tuple(name for name in axes if not (
         empirical_vmic_active and name == "vmic"))
@@ -174,17 +259,10 @@ def _validate_single_config(observation, specmodel, atmosphere, broadening, *,
         use_empirical_vmacro and name == "vmacro"))
     if isinstance(broadening, Mapping) and use_empirical_vmacro and "vmacro" in broadening:
         raise ValueError(
-            "omit broadening['vmacro'] when use_empirical_vmacro=True")
+            "omit broadening['vmacro'] when empirical vmacro is active")
     if not isinstance(broadening, Mapping) or set(broadening) != set(required_broadening):
         raise ValueError(
             f"broadening must supply exactly {', '.join(required_broadening)}")
-    if use_empirical_vmacro:
-        sigma = jnp.asarray(vmacro_empirical_sigma)
-        if sigma.ndim != 0 or sigma.dtype.kind not in "fiu":
-            raise ValueError(
-                "vmacro_empirical_sigma must be a finite positive scalar")
-        _require(jnp.isfinite(sigma) & (sigma > 0),
-                 "vmacro_empirical_sigma must be a finite positive scalar")
     return axes, count, empirical_vmic_active
 
 
@@ -230,7 +308,7 @@ def model_single(observation, specmodel, *, resolving_power=None,
                  use_gp=None, gp_solver="auto", use_physical_logg_max=False,
                  likelihood="gaussian", mismatch_fraction=None, mismatch_scale=None,
                  use_empirical_vmic=None, use_empirical_vmacro=False,
-                 vmacro_empirical_sigma=1., degree=4, basis=None,
+                 vmacro_empirical_sigma=None, degree=4, basis=None,
                  prior_only=False, save_model_flux=False,
                  atmosphere=None, broadening=None, rv=None, jitter=None,
                  gp_amplitude=None, gp_scale=None):
@@ -255,6 +333,14 @@ def model_single(observation, specmodel, *, resolving_power=None,
     vmic uses empirical_vmic(teff, logg, mh). These relations are evaluated
     without clipping. make_model_single checks the gravity support and prepares
     a compatible Teff interval; direct callers choose compatible bounds.
+
+    use_empirical_vmacro=True (or "valenti_fischer2005") selects the legacy
+    Teff-only prior; "doyle2014" and "lubin2026" also depend on logg. All
+    return one shared vmacro sample with a zero-truncated Normal prior.
+    vmacro_empirical_sigma=None uses widths of 1.0, 0.37 and 0.09 km/s,
+    respectively; a positive scalar overrides the width. The latter two
+    defaults are observed residual RMS values, not inferred intrinsic scatter.
+    See the helpers for calibration ranges; inputs/locations are not clipped.
 
     With likelihood="gaussian" (default), continuum coefficients are analytically
     marginalized under Gaussian priors. With likelihood="gaussian_mixture", the
@@ -286,6 +372,8 @@ def model_single(observation, specmodel, *, resolving_power=None,
         mismatch_fraction, mismatch_scale)
     _check_ip_choice(specmodel, resolving_power)
     _validate_gp_solver(gp_solver)
+    vmacro_helper, vmacro_dependencies, vmacro_empirical_sigma = _resolve_empirical_vmacro(
+        use_empirical_vmacro, vmacro_empirical_sigma)
     fixed = dict(fixed or {})
     empirical_vmic_active = (specmodel.spectra.library == "bosz"
                              if use_empirical_vmic is None else use_empirical_vmic)
@@ -298,7 +386,7 @@ def model_single(observation, specmodel, *, resolving_power=None,
     if empirical_vmic_active and "vmic" in fixed:
         raise ValueError("omit fixed vmic when empirical vmic is active")
     if use_empirical_vmacro and "vmacro" in fixed:
-        raise ValueError("omit fixed vmacro when use_empirical_vmacro=True")
+        raise ValueError("omit fixed vmacro when empirical vmacro is active")
 
     # Uniform atmosphere priors over prepared bounds; singleton axes are fixed.
     if atmosphere is None:
@@ -350,7 +438,7 @@ def model_single(observation, specmodel, *, resolving_power=None,
     axes, n_regions, empirical_vmic_active = _validate_single_config(
         observation, specmodel, atmosphere, broadening,
         use_physical_logg_max=use_physical_logg_max, use_empirical_vmic=use_empirical_vmic,
-        use_empirical_vmacro=use_empirical_vmacro, vmacro_empirical_sigma=vmacro_empirical_sigma)
+        use_empirical_vmacro=use_empirical_vmacro, vmacro_dependencies=vmacro_dependencies)
     gp_enabled = _validate_gp_config(axes, gp_amplitude, gp_scale)
 
     # Resolve stellar coordinates in dependency order: Teff -> logg -> mh/vmic.
@@ -392,10 +480,12 @@ def model_single(observation, specmodel, *, resolving_power=None,
     # Broadening and kinematics: shared values or one value per region.
     vsini = _draw("vsini", broadening["vsini"], regions=n_regions)
     if use_empirical_vmacro:
-        vmacro = numpyro.sample("vmacro", empirical_vmacro_valenti_fischer2005(
-            teff, sigma=vmacro_empirical_sigma), infer={"prior": {
-                "depends_on": ("teff",),
-                "expression": f"TruncatedNormal(μ(teff), σ={vmacro_empirical_sigma}, low=0)"}})
+        inputs = {name: coordinates[name] for name in vmacro_dependencies}
+        vmacro = numpyro.sample("vmacro", vmacro_helper(
+            **inputs, sigma=vmacro_empirical_sigma), infer={"prior": {
+                "depends_on": vmacro_dependencies,
+                "expression": (f"{vmacro_helper.__name__}({', '.join(vmacro_dependencies)}, "
+                               f"sigma={vmacro_empirical_sigma})")}})
     else:
         vmacro = _draw("vmacro", broadening["vmacro"], regions=n_regions)
     q1 = _draw("q1", broadening["q1"], regions=n_regions)
@@ -492,7 +582,7 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
                       degree=4, basis=None, use_gp=True, gp_solver="auto",
                       likelihood="gaussian", mismatch_fraction=None, mismatch_scale=None,
                       use_physical_logg_max=False, use_empirical_vmic=None,
-                      use_empirical_vmacro=False, vmacro_empirical_sigma=1.,
+                      use_empirical_vmacro=False, vmacro_empirical_sigma=None,
                       sigma_constant=0.1, sigma_continuum=0.05,
                       jitter_bounds=None, gp_amplitude_bounds=None,
                       gp_scale_bounds=None):
@@ -537,6 +627,9 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     gravity prior must fit the loaded grid. The model's temperature-dependent
     ceiling replaces a Uniform logg upper bound, retaining its lower bound.
     Other empirical relations retain their unclipped behavior.
+    use_empirical_vmacro accepts False, True/"valenti_fischer2005",
+    "doyle2014" or "lubin2026" as in model_single. With
+    vmacro_empirical_sigma=None, the selected relation supplies its default.
 
     Returns ConfiguredModel: call it as an ordinary NumPyro model, inspect
     model.settings/check_prior(), and pass model=model to SpecFit methods.
@@ -553,10 +646,10 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
         mismatch_fraction, mismatch_scale)
     degree = _degree(degree)
     _validate_gp_solver(gp_solver)
-    for name, value in (("use_physical_logg_max", use_physical_logg_max),
-                        ("use_empirical_vmacro", use_empirical_vmacro)):
-        if not isinstance(value, bool):
-            raise TypeError(f"{name} must be a bool")
+    if not isinstance(use_physical_logg_max, bool):
+        raise TypeError("use_physical_logg_max must be a bool")
+    _, _, vmacro_empirical_sigma = _resolve_empirical_vmacro(
+        use_empirical_vmacro, vmacro_empirical_sigma)
     if use_empirical_vmic is not None and not isinstance(use_empirical_vmic, bool):
         raise TypeError("use_empirical_vmic must be None or a bool")
     empirical_vmic_active = spectra.library == "bosz" if use_empirical_vmic is None else use_empirical_vmic

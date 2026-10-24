@@ -96,6 +96,23 @@ def _fit_gaussian_mixture(residual, variance):
     }, probability
 
 
+def _mixture_residual_densities(x, variance, fraction, mismatch):
+    """Weighted component densities in residual/sqrt(V).
+
+    All usable pixels contribute, independently of their final mask labels.
+    The outlier width is pixel-dependent because mismatch is in flux units.
+    """
+    normal = (1. - fraction) * np.exp(-.5 * x**2) / np.sqrt(2 * np.pi)
+    widths = np.hypot(1., mismatch / np.sqrt(variance))
+    outlier = np.zeros_like(x, dtype=float)
+    # Bound temporary storage when plotting long spectral regions.
+    for start in range(0, widths.size, 2048):
+        width = widths[start:start + 2048]
+        outlier += (np.exp(-.5 * (x[:, None] / width)**2) / width).sum(axis=1)
+    outlier *= fraction / (widths.size * np.sqrt(2 * np.pi))
+    return normal, outlier
+
+
 def _plot_mixture_outliers(observation, baseline, fit_mask, regions, diagnostics,
                            *, save_path=None, keep_open=True):
     """Match the legacy layout, with physical residuals and outlier probability."""
@@ -144,22 +161,38 @@ def _plot_mixture_outliers(observation, baseline, fit_mask, regions, diagnostics
         if np.any(valid):
             standardized = residual / scale
             bins = np.histogram_bin_edges(standardized[valid], bins=50)
+            bottom = np.zeros(len(bins) - 1, dtype=int)
             for selected, color, label in ((valid & ~flags, "gray", "retained"),
                                            (flags, "salmon", "fit mask")):
                 counts, _ = np.histogram(standardized[selected], bins=bins)
-                histogram.stairs(counts, bins, fill=True, color=color, alpha=.5, label=label)
-            normal_x = np.linspace(-6., 6., 401)
-            count_scale = np.count_nonzero(valid) * (bins[1] - bins[0])
-            histogram.plot(normal_x, count_scale * np.exp(-.5 * normal_x**2) / np.sqrt(2 * np.pi),
-                           color="black", ls="--", lw=1.2, label="N(0, 1)")
+                histogram.stairs(bottom + counts, bins, baseline=bottom,
+                                 fill=True, color=color, alpha=.5, label=label)
+                bottom = bottom + counts
+            fraction, mismatch = (diagnostics[name] for name in ("mismatch_fraction", "mismatch_scale"))
+            if fraction is not None and mismatch is not None:
+                curve_x = np.unique(np.concatenate((
+                    np.linspace(-6., 6., 401),
+                    np.linspace(min(-6., bins[0]), max(6., bins[-1]), 601))))
+                normal, outlier = _mixture_residual_densities(
+                    curve_x, variance[valid], fraction, mismatch)
+                count_scale = np.count_nonzero(valid) * (bins[1] - bins[0])
+                normal *= count_scale
+                outlier *= count_scale
+                # Keep the normal reference's original +/-6 range, while
+                # following the broad component across the observed tails.
+                normal_range = np.abs(curve_x) <= 6.
+                for x, counts, color, style, label in (
+                        (curve_x[normal_range], normal[normal_range], "C0", "--", "normal component"),
+                        (curve_x, outlier, "C3", "-.", "outlier component"),
+                        (curve_x, normal + outlier, "black", "-", "total mixture")):
+                    histogram.plot(x, counts, color=color, ls=style, lw=.8, label=label)
             histogram.set_yscale("log")
             histogram.set_ylim(bottom=.5)
             histogram.legend(fontsize=8, loc="lower left", bbox_to_anchor=(0, 1.02),
-                             ncol=3, handlelength=1.5, columnspacing=1., borderaxespad=0, frameon=False)
-            fraction, mismatch = (diagnostics[name] for name in ("mismatch_fraction", "mismatch_scale"))
+                             ncol=2, handlelength=1.5, columnspacing=1., borderaxespad=0, frameon=False)
             fraction = "not supplied" if fraction is None else f"{fraction:.4g}"
             mismatch = "not supplied" if mismatch is None else f"{mismatch:.4g}"
-            histogram.text(0, 1.15,
+            histogram.text(0, 1.22,
                            f"f_mismatch = {fraction}\n"
                            f"s_mismatch = {mismatch}\n"
                            f"median(sqrt(V)) = {np.median(scale[valid]):.4g}\n"

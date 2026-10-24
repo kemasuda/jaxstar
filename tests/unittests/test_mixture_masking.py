@@ -12,7 +12,7 @@ from scipy.stats import norm
 from jaxstar.specfit import SpecFit, chebyshev_basis
 from jaxstar.specfit.specfit import _extend_mask
 from jaxstar.specfit.sampling import _C_KMS
-from jaxstar.specfit._outliers import _fit_gaussian_mixture
+from jaxstar.specfit._outliers import _fit_gaussian_mixture, _mixture_residual_densities
 from test_specfit import case, configured, clipping_case, clipping_model
 
 
@@ -134,7 +134,8 @@ def test_mixture_prediction_reused_without_refitting_and_old_flags_reconsidered(
                                                        extend_outlier_mask=extend), flags)
 
 
-@pytest.mark.parametrize("metadata", [False, True])
+@pytest.mark.parametrize("metadata", [(), ("mismatch_fraction",), ("mismatch_scale",),
+                                      ("mismatch_fraction", "mismatch_scale")])
 def test_custom_probabilities_snapshot_and_plot(metadata, tmp_path, monkeypatch):
     import matplotlib.pyplot as plt
 
@@ -144,8 +145,8 @@ def test_custom_probabilities_snapshot_and_plot(metadata, tmp_path, monkeypatch)
     q[20] = .9  # Intentionally different from the residual-based outlier at pixel 10.
     q[fit.observation.mask] = 1.  # Fixed masks must not seed dilation.
     prediction["mismatch_probability"] = q
-    if metadata:
-        prediction.update(mismatch_fraction=.2, mismatch_scale=.15)
+    parameters = dict(mismatch_fraction=.2, mismatch_scale=.15)
+    prediction.update({name: parameters[name] for name in metadata})
     model = SimpleNamespace(predict=lambda *args: prediction)
 
     def no_refit(*args, **kwargs):
@@ -158,14 +159,32 @@ def test_custom_probabilities_snapshot_and_plot(metadata, tmp_path, monkeypatch)
         assert flags[20] and not flags[10] and not flags[fit.observation.mask].any()
         diagnostics = fit.outlier_diagnostics
         assert diagnostics["probability_source"] == "model"
-        assert diagnostics["mismatch_fraction"] == (.2 if metadata else None)
-        assert diagnostics["mismatch_scale"] == (.15 if metadata else None)
+        assert diagnostics["mismatch_fraction"] == (.2 if "mismatch_fraction" in metadata else None)
+        assert diagnostics["mismatch_scale"] == (.15 if "mismatch_scale" in metadata else None)
         expected = np.where(fit.observation.mask, np.nan, q)
         np.testing.assert_array_equal(diagnostics["mismatch_probability"], expected)
         figure = plt.gcf()
         np.testing.assert_array_equal(figure.axes[2].lines[0].get_ydata(), expected)
-        summary = figure.axes[3].texts[0].get_text()
-        assert ("f_mismatch = 0.2" if metadata else "f_mismatch = not supplied") in summary
+        histogram = figure.axes[3]
+        summary = histogram.texts[0].get_text()
+        assert ("f_mismatch = 0.2" if "mismatch_fraction" in metadata
+                else "f_mismatch = not supplied") in summary
+        retained, masked = [patch.get_data() for patch in histogram.patches if patch.get_fill()]
+        np.testing.assert_array_equal(masked.baseline, retained.values)
+        assert masked.values.sum() == np.count_nonzero(~fit.observation.mask)
+        assert retained.values.sum() == np.count_nonzero(~fit.observation.mask & ~flags)
+        overlays = {line.get_label(): line for line in histogram.lines}
+        if len(metadata) == 2:
+            assert set(overlays) == {"normal component", "outlier component", "total mixture"}
+            assert all(line.get_linewidth() == .8 for line in overlays.values())
+            x = overlays["total mixture"].get_xdata()
+            normal_range = np.abs(x) <= 6.
+            np.testing.assert_array_equal(overlays["normal component"].get_xdata(), x[normal_range])
+            np.testing.assert_allclose(overlays["total mixture"].get_ydata()[normal_range],
+                                       overlays["normal component"].get_ydata()
+                                       + overlays["outlier component"].get_ydata()[normal_range])
+        else:
+            assert not overlays
         assert (tmp_path / "prediction_region8.png").is_file()
         # Diagnostics must not retain mutable references owned by a custom model.
         q[:] = .7
@@ -320,6 +339,25 @@ def test_default_is_gaussian_mixture():
     actual = fit.mask_outliers(point=point, model=model)
     np.testing.assert_array_equal(actual, expected)
     assert fit.outlier_diagnostics["method"] == "gaussian_mixture"
+
+
+@pytest.mark.parametrize("fraction", [0., .8, 1.])
+def test_mixture_residual_component_densities(fraction):
+    from scipy.integrate import simpson
+
+    # The two variance groups give outlier widths 2 and 4 after normalization.
+    # Check peak heights and integrated component weights, including a
+    # majority of outliers; averaging V_i would give the wrong density.
+    x = np.linspace(-40., 40., 4001)
+    variance = np.array([1., .2, 1., .2])
+    normal, outlier = _mixture_residual_densities(x, variance, fraction, np.sqrt(3.))
+    np.testing.assert_allclose(normal[x == 0.], (1 - fraction) * .3989422804014327)
+    np.testing.assert_allclose(outlier[x == 0.], fraction * .14960335515053727)
+    np.testing.assert_allclose(outlier[x == 4.], fraction * .04374408219318993)
+    np.testing.assert_allclose((simpson(normal, x=x), simpson(outlier, x=x)), (1 - fraction, fraction))
+    # Changing flux units must not change this standardized diagnostic.
+    rescaled = _mixture_residual_densities(x, variance * 37.**2, fraction, np.sqrt(3.) * 37.)
+    np.testing.assert_allclose(rescaled, (normal, outlier))
 
 
 def test_probabilities_plot_and_fully_masked(tmp_path):
