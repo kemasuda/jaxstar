@@ -184,6 +184,26 @@ def _assemble(library, axes, wavelength, flux, regions, medium, flux_kind, sourc
                             medium, flux_kind, tuple(sources))
 
 
+def prepare_korg(*, axes, wavelength_ranges, wavelength_medium, pixels=None,
+                 regions=None, normalized=True, sampling="log", velocity_step=None,
+                 synthesis_step=.0025, line_buffer=10., cache_dir=None,
+                 progress=None, return_report=False):
+    """Prepare a normalized Korg grid with optional JuliaCall dependencies.
+
+    Axes are teff/logg/feh/alpha, with alpha=[alpha/Fe]. Microturbulence uses
+    empirical_vmic at each node; it is not an independent axis. wavelength_medium
+    must explicitly be 'air' or 'vacuum'. See :func:`jaxstar.specfit.korg.prepare_korg`
+    for physics, installation, sampling, caching and provenance options.
+    Importing this entry point does not initialize Julia.
+    """
+    from .korg import prepare_korg as synthesize_grid
+    return synthesize_grid(
+        axes=axes, wavelength_ranges=wavelength_ranges, wavelength_medium=wavelength_medium,
+        pixels=pixels, regions=regions, normalized=normalized, sampling=sampling,
+        velocity_step=velocity_step, synthesis_step=synthesis_step, line_buffer=line_buffer,
+        cache_dir=cache_dir, progress=progress, return_report=return_report)
+
+
 def prepare_coelho(data_dir, *, axes, wavelength_ranges, pixels=None,
                    regions=None, wavelength_medium="vacuum", normalized=True,
                    source_overrides=None, sampling=None, velocity_step=None):

@@ -1,0 +1,15 @@
+{
+  "description": "GES/MARCS Korg grid for all GAOES regions; alpha=[alpha/Fe], empirical vmic at every node.",
+  "library": "korg",
+  "axes": {
+    "teff": {"min": 4000, "max": 7000, "step": 150},
+    "logg": {"min": 3.0, "max": 5.0, "step": 0.5},
+    "feh": {"min": -0.5, "max": 0.5, "step": 0.25},
+    "alpha": {"min": -0.25, "max": 0.25, "step": 0.25}
+  },
+  "wavelength_ranges_file": "../wavelength_ranges/gaoes_rv.csv",
+  "wav_margin": 5.0,
+  "sampling": {"pixels": 7500},
+  "normalized": true,
+  "korg": {"synthesis_step": 0.0025, "line_buffer": 10.0}
+}

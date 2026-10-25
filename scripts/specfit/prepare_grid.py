@@ -1,4 +1,4 @@
-"""Build a reusable BOSZ or Coelho NPZ from a recipe and local raw spectra."""
+"""Build a reusable spectral NPZ from BOSZ/Coelho files or optional Korg synthesis."""
 
 import argparse
 import csv
@@ -17,10 +17,11 @@ import numpy as np
 AXES = {
     "bosz": ("teff", "logg", "mh", "alpha", "carbon", "vmic"),
     "coelho": ("teff", "logg", "feh", "alpha"),
+    "korg": ("teff", "logg", "feh", "alpha"),
 }
 REQUIRED = {"library", "axes", "wavelength_ranges_file", "wav_margin",
             "sampling", "normalized"}
-OPTIONAL = {"description", "regions", "wavelength_medium", "missing_nodes"}
+OPTIONAL = {"description", "regions", "wavelength_medium", "missing_nodes", "korg"}
 
 
 def resolve_axis(name, values):
@@ -54,7 +55,7 @@ def read_recipe(path):
         raise ValueError(f"unknown recipe keys: {sorted(recipe.keys() - REQUIRED - OPTIONAL)}")
     library = recipe["library"]
     if library not in AXES:
-        raise ValueError("library must be 'bosz' or 'coelho'")
+        raise ValueError("library must be 'bosz', 'coelho' or 'korg'")
     missing_nodes = recipe.get("missing_nodes", "error")
     if missing_nodes not in ("error", "logg"):
         raise ValueError("missing_nodes must be 'error' or 'logg'")
@@ -66,6 +67,16 @@ def read_recipe(path):
     axes = {name: resolve_axis(name, values) for name, values in axes.items()}
     if type(recipe["normalized"]) is not bool:
         raise ValueError("normalized must be true or false")
+    korg_options = recipe.get("korg", {})
+    if library == "korg":
+        from jaxstar.specfit.korg import validate_korg_axes, validate_korg_options
+        if not isinstance(korg_options, dict) or korg_options.keys() - {"synthesis_step", "line_buffer"}:
+            raise ValueError("korg options support only synthesis_step and line_buffer")
+        korg_options = {"synthesis_step": .0025, "line_buffer": 10., **korg_options}
+        validate_korg_axes(axes)
+        validate_korg_options(normalized=recipe["normalized"], **korg_options)
+    elif "korg" in recipe:
+        raise ValueError("korg options require library='korg'")
     margin = recipe["wav_margin"]
     if (type(margin) not in (int, float) or not np.isfinite(margin) or margin < 0):
         raise ValueError("wav_margin must be finite nonnegative Angstrom")
@@ -117,6 +128,8 @@ def read_recipe(path):
                   sampling="log", **sampling)
     if library == "bosz" and "missing_nodes" in recipe:
         kwargs["missing_nodes"] = missing_nodes
+    if library == "korg":
+        kwargs.update(korg_options)
     return recipe, csv_path, kwargs
 
 
@@ -163,11 +176,19 @@ def check_inputs(library, data_dir, kwargs, *, stream=None):
     return report
 
 
-def build(recipe_path, data_dir, output_dir):
+def build(recipe_path, data_dir, output_dir, *, cache_dir=None):
     """Publish a new directory only after the grid and provenance are complete."""
     recipe, csv_path, kwargs = read_recipe(recipe_path)
     if output_dir.exists() or output_dir.is_symlink():
         raise FileExistsError(f"{output_dir} already exists; choose a new output directory")
+    if recipe["library"] == "korg":
+        if data_dir is not None:
+            raise ValueError("--data-dir is not used for Korg")
+        return _build_korg(recipe_path, recipe, csv_path, kwargs, output_dir, cache_dir)
+    if cache_dir is not None:
+        raise ValueError("--cache-dir is currently supported only for Korg")
+    if data_dir is None:
+        raise ValueError("--data-dir is required for BOSZ/Coelho")
     if not data_dir.is_dir():
         raise NotADirectoryError(data_dir)
 
@@ -220,15 +241,72 @@ def build(recipe_path, data_dir, output_dir):
     return output_dir
 
 
+def _build_korg(recipe_path, recipe, csv_path, kwargs, output_dir, cache_dir):
+    import jax
+    import jaxstar
+    from jaxstar.specfit import prepare_korg, save_spectral_grid
+    from jaxstar.specfit import korg
+
+    jax.config.update("jax_enable_x64", True)
+    cache_dir = (output_dir.with_name(output_dir.name + ".cache") if cache_dir is None
+                 else cache_dir.expanduser().resolve())
+    if cache_dir.resolve() == output_dir.resolve() or output_dir.resolve() in cache_dir.resolve().parents:
+        raise ValueError("Korg --cache-dir must be outside the new output directory")
+
+    def progress(event):
+        if event["stage"] == "preflight":
+            if event["done"] == event["total"]:
+                print(f"MARCS preflight passed: {event['total']} nodes", flush=True)
+        elif event["stage"] == "node":
+            verb = "Reused" if event["cached"] else "Synthesized"
+            print(f"{verb} {event['done']}/{event['total']} {event['point']}: "
+                  f"vmic={event['vmic_km_s']:.6g} km/s, {event['seconds']:.3f} s", flush=True)
+        else:
+            print(f"Korg: {event['stage']}", flush=True)
+
+    spectra, report = prepare_korg(**kwargs, cache_dir=cache_dir, progress=progress, return_report=True)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".prepare-grid-", dir=output_dir.parent) as staging:
+        stage = Path(staging)
+        save_spectral_grid(stage / "grid.npz", spectra)
+        write_json(stage / "recipe.json", {**recipe, "wavelength_ranges_file": "wavelength_ranges.csv"})
+        (stage / "wavelength_ranges.csv").write_bytes(csv_path.read_bytes())
+        wave = np.asarray(spectra.wavelength)
+        write_json(stage / "manifest.json", dict(
+            created_utc=datetime.now(timezone.utc).isoformat(), library="korg",
+            versions=dict(jaxstar=jaxstar.__version__, **report["contract"]["runtime"]["versions"]),
+            implementations={"prepare_grid.py": file_record(Path(__file__)),
+                             "korg.py": file_record(Path(korg.__file__))},
+            input_recipe=file_record(recipe_path), input_wavelength_ranges=file_record(csv_path),
+            resolved_preparation=kwargs, korg=report,
+            flux_shape=list(spectra.grid.field("flux").values.shape),
+            actual_wavelength_ranges=wave[:, [0, -1]].tolist(),
+            actual_velocity_step_kms=(299792.458 * np.log(wave[:, -1] / wave[:, 0]) / (wave.shape[1]-1)).tolist(),
+            outputs={name: file_record(stage / name)
+                     for name in ("grid.npz", "recipe.json", "wavelength_ranges.csv")},
+        ))
+        if output_dir.exists() or output_dir.is_symlink():
+            raise FileExistsError(f"{output_dir} appeared during preparation")
+        stage.rename(output_dir)
+    print(f"Saved {output_dir / 'grid.npz'}", flush=True)
+    return output_dir
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("recipe", type=Path, help="JSON recipe; CSV paths are relative to this file")
     parser.add_argument("--data-dir", type=Path, help="local BOSZ rorig/ or Coelho FITS directory")
     parser.add_argument("--output-dir", type=Path, help="new directory for grid.npz and provenance")
+    parser.add_argument("--cache-dir", type=Path, help="Korg node cache; default: OUTPUT_DIR.cache")
     parser.add_argument("--dry-run", action="store_true", help="resolve settings; also check input paths if --data-dir is supplied; do not read spectra or write files")
     args = parser.parse_args(argv)
     try:
         recipe_path = args.recipe.expanduser().resolve()
+        recipe, _, _ = read_recipe(recipe_path)
+        if recipe["library"] == "korg" and args.data_dir is not None:
+            parser.error("--data-dir is not used for Korg")
+        if recipe["library"] != "korg" and args.cache_dir is not None:
+            parser.error("--cache-dir is currently supported only for Korg")
         if args.dry_run:
             recipe, csv_path, kwargs = read_recipe(recipe_path)
             summary = dict(library=recipe["library"], wavelength_ranges_file=str(csv_path), preparation=kwargs)
@@ -239,10 +317,11 @@ def main(argv=None):
                 summary["input_check"]["source_file_count"] = len(report["sources"])
             print(json.dumps(summary, indent=2, allow_nan=False))
             return
-        if args.data_dir is None or args.output_dir is None:
-            parser.error("--data-dir and --output-dir are required unless --dry-run is used")
-        build(recipe_path, args.data_dir.expanduser().resolve(), args.output_dir.expanduser().absolute())
-    except (OSError, ValueError, TypeError) as error:
+        if args.output_dir is None:
+            parser.error("--output-dir is required unless --dry-run is used")
+        data_dir = None if args.data_dir is None else args.data_dir.expanduser().resolve()
+        build(recipe_path, data_dir, args.output_dir.expanduser().absolute(), cache_dir=args.cache_dir)
+    except (OSError, ValueError, TypeError, RuntimeError, ImportError) as error:
         parser.exit(1, f"Error: {error}\n")
 
 
