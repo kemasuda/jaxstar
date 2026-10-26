@@ -1,8 +1,9 @@
 # Reusable spectral grids
 
-`prepare_grid.py` calls the public `prepare_bosz` or `prepare_coelho` API and
-`save_spectral_grid`. It reads local raw spectra; it does not download models or
-fit observations. Run it from a checkout installed with
+`prepare_grid.py` calls the public `prepare_bosz`, `prepare_coelho` or optional
+`prepare_korg` API and `save_spectral_grid`. BOSZ/Coelho read local raw spectra;
+Korg synthesizes spectra through Python/JuliaCall and may download its model
+data on first use. The script does not fit observations. Run it from a checkout installed with
 `python -m pip install -e .`, or use `PYTHONPATH=src` from the repository root
 as below.
 
@@ -17,6 +18,8 @@ scripts/specfit/
   recipes/coelho_gaoes.json
   recipes/bosz_ird_h.json
   recipes/coelho_ird_h.json
+  recipes/korg_gaoes.json
+  recipes/korg_gaoes_mini.json
   wavelength_ranges/*.csv
 ```
 
@@ -56,7 +59,7 @@ The recipes specify reusable atmosphere domains; inspect their axes and region
 selection before a production build. `bosz_gaoes.json` uses all GAOES table
 regions, Teff 5000--8000 K, logg 3--5, `[C/M]=0` and native `vmic=[0, 1, 2]`.
 The other recipes illustrate smaller domains and explicit region selection.
-Every build checks all requested input paths before reading any spectra. Coelho
+Every BOSZ/Coelho build checks all requested input paths before reading any spectra. Coelho
 and BOSZ with the default `missing_nodes="error"` require every Cartesian-product
 node. BOSZ can explicitly enable the logg replacement policy below; the GAOES
 BOSZ recipe enables it.
@@ -269,3 +272,180 @@ coverage. KPF-red is marked `unknown` because its original CSV has no medium
 metadata and was reused with both settings. Confirm its definition before
 adding a recipe with an explicit declaration. The GAOES and IRD examples share
 their respective tables between BOSZ and Coelho.
+
+## Korg optical grids
+
+The public Python entry point is `jaxstar.specfit.prepare_korg`. Its synthesis
+backend lives in `src/jaxstar/specfit/korg.py`; `libraries.py` supplies the entry
+point. Korg does not use the fixed legacy-NPZ `_SCHEMAS` table. Common NPZs store
+their own axis names and coordinates, with `library="korg"`.
+
+Install the optional Python extra, then register Korg in JuliaCall's environment:
+
+```bash
+python -m pip install -e '.[korg]'
+python -c 'import juliapkg; juliapkg.add("Korg", "acafc109-a718-429c-b0e5-afd7f8c7ae46", version="=1.3.1")'
+```
+
+JuliaCall manages Julia and PythonCall in the active Python environment. On its
+first import it resolves the registered Korg dependency. This backend currently
+requires **Korg 1.3.1**. No Julia dependency is registered globally by importing
+jaxstar, and no Julia package is needed to load or fit an already generated NPZ.
+An existing compatible Julia environment can also be selected using the
+[JuliaCall configuration options](https://juliapy.github.io/PythonCall.jl/stable/juliacall/).
+The initial GES download is about 0.87 GB unpacked; Julia/Korg manage their data
+under the Julia depot. Subsequent nodes reuse the parsed line list in one process.
+
+`recipes/korg_gaoes.json` uses all 15 GAOES regions with a 5 Å margin and
+7500 log-spaced pixels per region. Its axes are Teff 4000–7000 K in 150 K steps,
+logg 3–5 in 0.5 steps, [Fe/H] −0.5–0.5 in 0.25 steps, and [alpha/Fe]
+−0.25–0.25 in 0.25 steps (inclusive endpoints): **1575 atmosphere nodes**.
+Microturbulence is empirical at each node, with no vmic axis.
+
+The smaller `recipes/korg_gaoes_mini.json` has 27 atmosphere nodes and GAOES
+regions 2 and 3:
+
+```bash
+PYTHONPATH=src python scripts/specfit/prepare_grid.py \
+  scripts/specfit/recipes/korg_gaoes_mini.json --dry-run
+
+JULIA_NUM_THREADS=1 PYTHONPATH=src python scripts/specfit/prepare_grid.py \
+  scripts/specfit/recipes/korg_gaoes_mini.json \
+  --output-dir /path/to/prepared/korg_gaoes_mini
+```
+
+Korg needs no `--data-dir`. `--dry-run` validates and expands the recipe without
+starting Julia, downloading data, checking MARCS or writing output. A build
+checks MARCS interpolation at **every requested node before synthesis**.
+Unsupported points, invalid microturbulence, uncovered wavelengths and synthesis
+failures raise errors with context. No missing-node replacement is performed.
+Parameter limits and region selection come from the recipe; the mini recipe is
+an example, not a backend domain restriction.
+
+The initial supported physics configuration is:
+
+| Quantity | Definition |
+| --- | --- |
+| Axes | `teff` (K), `logg` (log10 cgs), `feh` = [Fe/H], `alpha` = [alpha/Fe] |
+| Solar composition | Korg's explicit `bergemann_2025_solar_abundances` |
+| Alpha elements | Korg standard O, Ne, Mg, Si, S, Ar, Ca, Ti |
+| Abundance mapping | `format_A_X(feh, feh + alpha, solar_abundances=...)`; second argument is [alpha/H] |
+| Atmosphere | `interpolate_marcs(teff, logg, A_X)`, no abundance clamping or node perturbation |
+| Line list | GES with molecules, including Korg's built-in line filtering |
+| Microturbulence | Existing `empirical_vmic(teff, logg, feh)` at each node; no independent vmic axis |
+| Output | Intrinsic normalized `solution.flux / solution.cntm` |
+| Hydrogen | Hydrogen lines and MHD occupation probabilities enabled for this optical backend |
+| Additional broadening | No rotation, macroturbulence or instrumental convolution |
+
+The abundance and atmosphere calls follow the
+[Korg API documentation](https://ajwheeler.github.io/Korg.jl/stable/API/) and
+[abundance guide](https://ajwheeler.github.io/Korg.jl/stable/Abundances/).
+MARCS uses its own Grevesse 2007 reference mixture; passing `A_X` lets Korg map
+onto those atmosphere coordinates. It interpolates existing structures rather
+than recomputing the structure for the chosen synthesis microturbulence or
+arbitrary elemental mixtures. Korg uses spherical atmospheres for logg < 3.5
+and planar ones otherwise. Its very metal-poor MARCS branch fixes the atmosphere
+alpha/C mixture; this remains Korg's documented behavior.
+
+The existing empirical vmic relation is used without adding clipping or a new
+hard temperature cutoff. Its documented domain is 4000 < Teff < 7000 K,
+0 < logg < 5, -4.5 < [Fe/H] < 1. Recipe points outside that domain evaluate the
+same prescription and are listed in the manifest's
+`korg.vmic_outside_documented_range`; they are extrapolations, not newly validated
+microturbulence predictions. Nonpositive/nonfinite values are errors.
+The relation is discontinuous at logg=3.5, so interpolation across that boundary
+needs separate validation. Individual abundance axes and an independent vmic
+axis are not supported in this implementation and are rejected explicitly.
+
+### Wavelengths and sampling
+
+CSV/recipe wavelengths must explicitly specify air or vacuum. Output preserves
+that convention. For air output, Korg's `air_to_vacuum` converts each target
+coordinate before synthesis/resampling. GES source wavelengths are air; Korg's
+GES loader converts the line positions to vacuum. Korg synthesizes in vacuum
+at **0.0025 Å** by default, merges overlapping windows and linearly interpolates
+onto the requested output rows. Each row must be bracketed by native samples;
+there is no extrapolation across a gap or beyond a window.
+
+The optional recipe block `"korg": {"synthesis_step": 0.0025, "line_buffer": 10.0}`
+controls native vacuum spacing and the line inclusion buffer (both in Å).
+These are distinct from `sampling.pixels` or `sampling.velocity_step`, which
+control the saved wavelength grid. Native spacing cannot exceed the smallest
+output spacing in vacuum. No resolving power is imposed during generation.
+
+GES has line wavelengths spanning approximately 4748.793–8949.973 Å **in air**.
+A request, including synthesis padding and the line buffer, must fit inside
+that span after conversion to vacuum. The full GAOES CSV is covered. GES is not
+an infrared line list; requests outside its coverage fail. Coverage is a check
+of the available wavelength span, not a claim of completeness of atomic data.
+
+### Checkpoints and Python API
+
+The CLI stores one completed node per file in `OUTPUT_DIR.cache/`, or under an
+explicit `--cache-dir`. A failed build leaves these checkpoints and publishes no
+final bundle. Repeat the same command to resume. Existing completed output
+bundles are still refused; to rebuild a bundle from the same cache, choose a new
+output directory and pass the old cache path explicitly.
+
+Cache namespaces hash axes, output coordinates/medium, synthesis settings,
+empirical-vmic values/source, solar composition, Korg source/artifact definitions,
+the actual GES file, Julia environment/version/thread count and backend source.
+Changing these settings selects a different namespace. Each node records its
+coordinates, vmic, namespace and flux checksum; corrupt checkpoints raise an
+error. Keep Julia packages and artifact data unchanged during a build. Save
+`manifest.json` alongside `grid.npz` for physics provenance; the NPZ alone is
+sufficient for subsequent loading and fitting.
+
+```python
+import jax
+jax.config.update("jax_enable_x64", True)
+from jaxstar.specfit import prepare_korg, save_spectral_grid
+
+spectra, report = prepare_korg(
+    axes={"teff": [5750, 6000], "logg": [4.0, 4.5],
+          "feh": [-0.25, 0.0], "alpha": [0.0]},
+    wavelength_ranges=[(5700, 5800)], wavelength_medium="air",
+    sampling="log", pixels=7500, cache_dir="/path/to/korg-cache",
+    return_report=True,
+)
+save_spectral_grid("/path/to/grid.npz", spectra)
+```
+
+The saved grid embeds the empirical relation in its fluxes. During fitting,
+use its four atmospheric axes; the BOSZ-specific `use_empirical_vmic=True`
+inference option is not needed or supported for this grid.
+
+### Optional numerical validation
+
+After building the mini recipe, run:
+
+```bash
+JULIA_NUM_THREADS=1 PYTHONPATH=src python scripts/specfit/validate_korg_grid.py \
+  /path/to/prepared/korg_gaoes_mini \
+  --output-dir /path/to/validation/korg_gaoes_mini
+```
+
+This checks exact nodes, `SpecFit.from_grid`, direct Korg spectra at every cell
+center, one center at half the native wavelength step, and a nonzero-alpha
+synthesis. It writes residual metrics, numerical arrays and an overlay/residual
+plot. It launches additional real syntheses and is intended for small grids.
+Interpolation and sampling errors depend on the recipe; this is not a test of
+parameter-inference accuracy against observations. Ordinary unit tests use a
+fake synthesis backend and require no Julia/network access.
+
+Local numerical check (2026-10-25, Korg 1.3.1 / Julia 1.13.2, one Julia thread):
+
+- 27 mini-recipe nodes produced shape `(3, 3, 3, 1, 2, 7500)`.
+- All exact-node interpolation errors were zero. Cached regeneration reproduced
+  the flux arrays exactly. A separate Python process loaded the grid into
+  `SpecFit.from_grid` without importing JuliaCall.
+- Eight cell centers: normalized-flux RMS error `0.00128502`, maximum absolute
+  error `0.00797217` relative to direct synthesis.
+- Native step 0.0025 versus 0.00125 Å at the first center: RMS `3.49665e-5`,
+  maximum absolute difference `0.000533065`.
+- The alpha=0.2 direct synthesis passed. Empirical vmic ranged from 1.039 to
+  1.33575 km/s across the grid. Median warm node time was 5.32 s for the two
+  selected regions, excluding setup, preflight and line-list loading.
+
+These numbers describe the checked mini recipe only. Local generated artifacts
+are in ignored `benchmark-results/korg-grid/`; they are not package data.

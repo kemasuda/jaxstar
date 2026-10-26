@@ -39,6 +39,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+korg = ["juliacall>=0.9.37,<0.10"]
 
 [project.urls]
 Homepage = "https://github.com/kemasuda/jaxstar"
