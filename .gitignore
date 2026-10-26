@@ -9,6 +9,7 @@
 !/dev_notebooks/specfit/spectral_inference_real_setup.py
 /examples/tutorials/.specmodel-data/
 /benchmark-results/
+/experiments/
 
 # Python caches and build artifacts
 __pycache__/
