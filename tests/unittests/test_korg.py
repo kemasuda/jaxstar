@@ -8,6 +8,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import jax
 import numpy as np
 import pytest
 
@@ -20,6 +21,18 @@ ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("prepare_korg_script", ROOT / "scripts/specfit/prepare_grid.py")
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
+
+
+@pytest.fixture
+def cli_builder():
+    """Restore the global precision flag after calling the CLI in-process."""
+    previous = jax.config.x64_enabled
+    try:
+        yield builder
+    finally:
+        # The CLI sets a process-wide default; a thread-local x64 context alone
+        # does not undo that update on newer JAX versions.
+        jax.config.update("jax_enable_x64", previous)
 
 
 class FakeRuntime:
@@ -228,25 +241,25 @@ def recipe_file(tmp_path):
     return path, recipe
 
 
-def test_script_dry_run_build_and_resume(runtime, tmp_path, capsys):
+def test_script_dry_run_build_and_resume(runtime, tmp_path, capsys, cli_builder):
     path, recipe = recipe_file(tmp_path)
     output = tmp_path / "bundle"
-    builder.main([str(path), "--dry-run"])
+    cli_builder.main([str(path), "--dry-run"])
     assert json.loads(capsys.readouterr().out)["preparation"]["synthesis_step"] == .0025
     assert not runtime.calls
     runtime.fail_at = 2
     with pytest.raises(ValueError, match="interrupted synthesis"):
-        builder.build(path, None, output)
+        cli_builder.build(path, None, output)
     assert not output.exists() and (tmp_path / "bundle.cache").is_dir()
     runtime.fail_at = None
-    builder.build(path, None, output)
+    cli_builder.build(path, None, output)
     manifest = json.loads((output / "manifest.json").read_text())
     assert [n["cached"] for n in manifest["korg"]["nodes"]] == [True, False]
-    assert builder.read_recipe(output / "recipe.json")[2] == manifest["resolved_preparation"]
+    assert cli_builder.read_recipe(output / "recipe.json")[2] == manifest["resolved_preparation"]
     for name, record in manifest["outputs"].items():
         assert korg._digest_file(output / name) == record["sha256"]
     with pytest.raises(FileExistsError):
-        builder.build(path, None, output)
+        cli_builder.build(path, None, output)
 
 
 @pytest.mark.parametrize("changes", [{"normalized": False}, {"korg": {"linelist": "GALAH"}},
