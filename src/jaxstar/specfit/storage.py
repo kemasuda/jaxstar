@@ -25,7 +25,8 @@ def save_spectral_grid(path, spectra, *, overwrite=False):
     This offline step saves the numerical arrays currently held by ``spectra``
     without conversion, normalization or resampling. All axes and their order,
     flux dimensions, wavelengths, region identifiers and interpretation metadata
-    are retained. Source paths are provenance only, never runtime dependencies.
+    are retained, including optional producer provenance. Source paths are
+    provenance only, never runtime dependencies.
 
     Uses uncompressed NPZ without pickle or a raw-library-specific schema. The
     exact path is used (no extension is appended); returns that path as a Path.
@@ -51,6 +52,7 @@ def save_spectral_grid(path, spectra, *, overwrite=False):
         "wavelength_unit": spectra.wavelength_unit,
         "flux_kind": spectra.flux_kind,
         "sources": spectra.sources,
+        "provenance": spectra.provenance,
     }
     arrays = {f"axis_{i}": np.asarray(grid.axis(name))
               for i, name in enumerate(grid.axis_names)}
@@ -144,6 +146,7 @@ def load_spectral_grid(path, *, wavelength=None, wav_margin=3., regions=None):
             library=metadata["library"], wavelength_medium=metadata["wavelength_medium"],
             flux_kind=metadata["flux_kind"], sources=metadata["sources"],
             wavelength_unit=metadata["wavelength_unit"],
+            provenance_json=json.dumps(metadata.get("provenance", {}), allow_nan=False),
         )
 
 
@@ -177,6 +180,8 @@ def _read_metadata(data):
         raise ValueError("prepared spectral-grid flux_dims must name every grid axis exactly once")
     if not isinstance(metadata["regions"], list):
         raise ValueError("prepared spectral-grid regions must be a list")
+    if not isinstance(metadata.get("provenance", {}), dict):
+        raise ValueError("prepared spectral-grid provenance must be an object")
     for key in ("boundary", "library", "wavelength_medium", "wavelength_unit", "flux_kind"):
         if not isinstance(metadata[key], str):
             raise ValueError(f"prepared spectral-grid {key} must be a string")

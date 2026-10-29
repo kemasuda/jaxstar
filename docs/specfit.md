@@ -268,22 +268,43 @@ local library files. For fitting, use `sampling="log"` and an explicit
 instrumental resolving power and observed detector pixels. Prepare wavelength
 regions wide enough for broadening and the requested RV range.
 
-For reusable BOSZ/Coelho generation, see the
+For reusable BOSZ/Coelho/TLUSTY generation, see the
 [recipe-based preparation script](../scripts/specfit/README.md). It shares
 instrument wavelength CSVs between libraries, stores a common NPZ with recipe
 and input hashes, and keeps generated data outside the repository. The small
 multi-region examples use explicit equal pixel counts with log sampling.
 
-BOSZ and Coelho check all input paths before reading spectra. Use
+BOSZ, Coelho and TLUSTY OB2025 check all input paths before reading spectra. Use
 `check_spectral_inputs(library, data_dir, axes=axes)` to inspect the plan without
 loading spectra. Missing files are errors by default. For BOSZ,
 `missing_nodes="logg"` explicitly enables averaging the native logg +/- 0.5
 spectra at fixed Teff/composition/vmic. At the requested upper logg edge only,
 an absent upper neighbour permits copying the immediate lower neighbour.
+For Coelho, `missing_nodes="teff"` averages the native Teff +/- 250 K spectra
+at fixed logg/FeH/alpha, after resampling the selected normalized or
+unnormalized flux row onto the output wavelengths. Both neighbours must exist;
+there is no one-sided copy or recursive filling. The GAOES Coelho recipe
+enables this policy. Neighbours may lie outside the requested atmosphere axes.
 Other unresolved nodes fail together before any spectra are read. The script
 prints the plan in English and retains replacement methods, source coordinates
 and weights in its manifest. See its guide for the numerical procedure and
 the resulting flat logg dependence at copied upper-edge nodes.
+
+`prepare_tlusty` also recognizes the OB2025 `BSTAR_z*v2`/`OSTAR_z*v2`
+directories (or select `source_format="ob2025"` explicitly). Synthesis vt is
+fixed to 2 km/s; the axes remain `teff/logg/logZ`. BSTAR supplies Teff below
+30000 K, OSTAR supplies 30000 K and above. The OSTAR atmosphere still uses
+vt=10, recorded separately in `spectra.provenance`, the common NPZ and saved
+fit metadata. OB2025 supports vacuum or converted air wavelengths, matched
+continuum normalization, and preflight of every spectrum/continuum pair.
+With `missing_nodes="lowest_logg"`, missing nodes below the native lower-logg
+boundary copy the lowest available logg at fixed Teff/Z/family/vt. Existing
+nodes retain their own spectra, and partial pairs, interior holes and upper
+gaps still fail. The recipe enables this policy for logg=3.0--4.75; omitting
+it retains strict mode. Replacement provenance is saved in the NPZ and manifest.
+See the [OB2025 recipe and boundary-copy policy](../scripts/specfit/README.md#tlusty-ob2025).
+Legacy TLUSTY inputs retain their previous family selection and wavelength
+declaration behavior.
 
 Use `save_spectral_grid(path, spectra)` to persist a prepared result.
 `load_spectral_grid(path)` then needs only that artifact. The jaxspec NPZ loaders

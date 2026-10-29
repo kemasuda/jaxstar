@@ -1,0 +1,14 @@
+{
+  "description": "TLUSTY OB2025 optical example for R~2500-3000 data, with synthesis vt=2 km/s throughout. Missing lower-logg nodes copy the lowest available logg at fixed Teff and Z; edit bounds and medium for your observations.",
+  "library": "tlusty",
+  "missing_nodes": "lowest_logg",
+  "axes": {
+    "teff": [15000, 16000, 17000, 18000, 19000, 20000, 21000, 22000, 23000, 24000, 25000, 26000, 27000, 28000, 29000, 30000, 32500, 35000, 37500, 40000, 42500, 45000, 47500, 50000, 52500, 55000],
+    "logg": {"min": 3.0, "max": 4.75, "step": 0.25},
+    "logZ": [-1.0, -0.6989700043360187, -0.3010299956639812, 0.0, 0.3010299956639812]
+  },
+  "wavelength_ranges_file": "../wavelength_ranges/optical_3600_7400.csv",
+  "wav_margin": 10.0,
+  "sampling": {"velocity_step": 10.0},
+  "normalized": true
+}

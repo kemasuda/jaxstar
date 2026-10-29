@@ -106,6 +106,7 @@ def _grid_record(specmodel):
         **schema, "grid_sha256": digest.hexdigest(),
         "sources": [str(Path(path).expanduser().resolve()) for path in spectra.sources],
         "library": spectra.library, "regions": list(spectra.regions),
+        "provenance": spectra.provenance,
         "wavelength_medium": spectra.wavelength_medium,
         "wavelength_unit": spectra.wavelength_unit, "flux_kind": spectra.flux_kind,
         "axes": {name: _describe(grid.axis(name)) for name in grid.axis_names},

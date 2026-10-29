@@ -1,6 +1,7 @@
 """Private association of numerical flux grids with their wavelength payload."""
 
 from dataclasses import dataclass
+import json
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +17,8 @@ class _SpectralLibrary:
 
     ``wavelength`` is in Angstrom, once per (region, pixel), never per atmosphere
     node. Region identifiers may repeat (e.g. two segments of the same order).
+    ``provenance`` returns a copy of optional producer settings, stored as
+    canonical JSON so the static PyTree metadata remains immutable/hashable.
     This type stays private until a downstream consumer establishes its API.
     """
 
@@ -27,6 +30,7 @@ class _SpectralLibrary:
     flux_kind: str = "as_stored"
     sources: tuple[str, ...] = ()
     wavelength_unit: str = "angstrom"
+    provenance_json: str = "{}"
 
     def __post_init__(self):
         if not isinstance(self.grid, RectilinearGrid):
@@ -56,27 +60,39 @@ class _SpectralLibrary:
             raise ValueError("wavelength_medium must be 'unknown', 'air' or 'vacuum'")
         if self.flux_kind not in {"as_stored", "normalized", "unnormalized", "median_scaled"}:
             raise ValueError("unsupported flux_kind")
+        provenance = json.loads(self.provenance_json)
+        if not isinstance(provenance, dict):
+            raise ValueError("spectral provenance must be a JSON object")
+        # Keep static PyTree metadata immutable and hashable, including nested
+        # producer-specific settings. The property returns a fresh copy.
+        object.__setattr__(self, "provenance_json",
+                           json.dumps(provenance, sort_keys=True, allow_nan=False))
         object.__setattr__(self, "wavelength", wavelength)
         object.__setattr__(self, "regions", regions)
         object.__setattr__(self, "sources", tuple(str(source) for source in self.sources))
 
+    @property
+    def provenance(self):
+        return json.loads(self.provenance_json)
+
     def tree_flatten(self):
         children = (self.grid, self.wavelength)
         metadata = (self.regions, self.library, self.wavelength_medium,
-                    self.flux_kind, self.sources, self.wavelength_unit)
+                    self.flux_kind, self.sources, self.wavelength_unit, self.provenance_json)
         return children, metadata
 
     @classmethod
     def tree_unflatten(cls, metadata, children):
         # JAX may supply tracers or abstract placeholders; validation is only
         # performed by loaders, before entering compiled numerical code.
-        regions, library, medium, flux_kind, sources, unit = metadata
+        regions, library, medium, flux_kind, sources, unit, provenance = metadata
         grid, wavelength = children
         result = object.__new__(cls)
         for name, value in (
             ("grid", grid), ("wavelength", wavelength), ("regions", regions),
             ("library", library), ("wavelength_medium", medium),
             ("flux_kind", flux_kind), ("sources", sources), ("wavelength_unit", unit),
+            ("provenance_json", provenance),
         ):
             object.__setattr__(result, name, value)
         return result

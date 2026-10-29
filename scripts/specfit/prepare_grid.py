@@ -1,4 +1,4 @@
-"""Build a reusable spectral NPZ from BOSZ/Coelho files or optional Korg synthesis."""
+"""Build a spectral NPZ from BOSZ/Coelho/TLUSTY files or optional Korg synthesis."""
 
 import argparse
 import csv
@@ -18,6 +18,7 @@ AXES = {
     "bosz": ("teff", "logg", "mh", "alpha", "carbon", "vmic"),
     "coelho": ("teff", "logg", "feh", "alpha"),
     "korg": ("teff", "logg", "feh", "alpha"),
+    "tlusty": ("teff", "logg", "logZ"),
 }
 REQUIRED = {"library", "axes", "wavelength_ranges_file", "wav_margin",
             "sampling", "normalized"}
@@ -55,12 +56,16 @@ def read_recipe(path):
         raise ValueError(f"unknown recipe keys: {sorted(recipe.keys() - REQUIRED - OPTIONAL)}")
     library = recipe["library"]
     if library not in AXES:
-        raise ValueError("library must be 'bosz', 'coelho' or 'korg'")
+        raise ValueError("library must be 'bosz', 'coelho', 'tlusty' or 'korg'")
     missing_nodes = recipe.get("missing_nodes", "error")
-    if missing_nodes not in ("error", "logg"):
-        raise ValueError("missing_nodes must be 'error' or 'logg'")
-    if library != "bosz" and missing_nodes != "error":
+    if missing_nodes not in ("error", "logg", "teff", "lowest_logg"):
+        raise ValueError("missing_nodes must be 'error', 'logg', 'teff' or 'lowest_logg'")
+    if library != "bosz" and missing_nodes == "logg":
         raise ValueError("missing_nodes='logg' is supported only for BOSZ")
+    if library != "coelho" and missing_nodes == "teff":
+        raise ValueError("missing_nodes='teff' is supported only for Coelho")
+    if library != "tlusty" and missing_nodes == "lowest_logg":
+        raise ValueError("missing_nodes='lowest_logg' is supported only for TLUSTY OB2025")
     axes = recipe["axes"]
     if not isinstance(axes, dict) or set(axes) != set(AXES[library]):
         raise ValueError(f"{library} axes must contain exactly {AXES[library]}")
@@ -126,10 +131,14 @@ def read_recipe(path):
     kwargs = dict(axes=axes, wavelength_ranges=bounds, regions=regions,
                   wavelength_medium=medium, normalized=recipe["normalized"],
                   sampling="log", **sampling)
-    if library == "bosz" and "missing_nodes" in recipe:
+    if library in {"bosz", "coelho", "tlusty"} and "missing_nodes" in recipe:
         kwargs["missing_nodes"] = missing_nodes
     if library == "korg":
         kwargs.update(korg_options)
+    if library == "tlusty":
+        kwargs.pop("normalized")
+        kwargs.update(source_format="ob2025",
+                      flux_kind="normalized" if recipe["normalized"] else "unnormalized")
     return recipe, csv_path, kwargs
 
 
@@ -156,12 +165,22 @@ def check_inputs(library, data_dir, kwargs, *, stream=None):
                                    missing_nodes=kwargs.get("missing_nodes", "error"))
     for entry in report["replacements"]:
         gravities = [source["node"]["logg"] for source in entry["sources"]]
-        if entry["method"] == "linear_logg":
+        if entry["method"] == "linear_teff":
+            temperatures = [source["node"]["teff"] for source in entry["sources"]]
+            action = (f"will interpolate linearly in Teff from {temperatures[0]:g} K "
+                      f"and {temperatures[1]:g} K at fixed logg, FeH and alpha")
+        elif entry["method"] == "linear_logg":
             action = f"will interpolate linearly in logg from {gravities[0]:g} and {gravities[1]:g}"
+        elif entry["method"] == "copy_lowest_logg":
+            action = (f"will use lowest available logg={gravities[0]:g} "
+                      f"at fixed Teff={entry['node']['teff']:g} K and logZ={entry['node']['logZ']:g}")
         else:
             action = (f"upper logg neighbor is also missing; will use logg={gravities[0]:g} "
                       "at the requested upper edge")
         print(f"Missing {entry['missing_path']}: {action}.", file=stream, flush=True)
+        if entry["method"] == "linear_teff":
+            for source in entry["sources"]:
+                print(f"  Source: {source['path']} (weight {source['weight']:g})", file=stream, flush=True)
     if not report["ready"]:
         details = []
         for entry in report["unresolved"]:
@@ -188,18 +207,19 @@ def build(recipe_path, data_dir, output_dir, *, cache_dir=None):
     if cache_dir is not None:
         raise ValueError("--cache-dir is currently supported only for Korg")
     if data_dir is None:
-        raise ValueError("--data-dir is required for BOSZ/Coelho")
+        raise ValueError("--data-dir is required for BOSZ/Coelho/TLUSTY")
     if not data_dir.is_dir():
         raise NotADirectoryError(data_dir)
 
     import jax
     import jaxstar
     from jaxstar.grid import RectilinearGrid
-    from jaxstar.specfit import prepare_bosz, prepare_coelho, save_spectral_grid
+    from jaxstar.specfit import prepare_bosz, prepare_coelho, prepare_tlusty, save_spectral_grid
 
     source_plan = check_inputs(recipe["library"], data_dir, kwargs)
     jax.config.update("jax_enable_x64", True)
-    prepare = {"bosz": prepare_bosz, "coelho": prepare_coelho}[recipe["library"]]
+    prepare = {"bosz": prepare_bosz, "coelho": prepare_coelho,
+               "tlusty": prepare_tlusty}[recipe["library"]]
     print(f"Preparing {recipe['library']}: {len(kwargs['regions'])} regions, "
           f"{np.prod([len(a) for a in kwargs['axes'].values()]):d} atmosphere nodes", flush=True)
     spectra = prepare(data_dir, **kwargs)
@@ -221,6 +241,9 @@ def build(recipe_path, data_dir, output_dir, *, cache_dir=None):
                            "storage.py": Path(inspect.getfile(save_spectral_grid)),
                            "grid/core.py": Path(inspect.getfile(RectilinearGrid))}
         implementations["sampling.py"] = implementations["libraries.py"].with_name("sampling.py")
+        implementations["_data.py"] = implementations["libraries.py"].with_name("_data.py")
+        if recipe["library"] == "tlusty":
+            implementations["_tlusty.py"] = implementations["libraries.py"].with_name("_tlusty.py")
         write_json(stage / "manifest.json", dict(
             created_utc=datetime.now(timezone.utc).isoformat(),
             library=recipe["library"], data_dir=str(data_dir),
@@ -228,6 +251,7 @@ def build(recipe_path, data_dir, output_dir, *, cache_dir=None):
             implementations={name: file_record(path) for name, path in implementations.items()},
             input_recipe=file_record(recipe_path), input_wavelength_ranges=file_record(csv_path),
             resolved_preparation=kwargs, sources=sources, source_plan=source_plan,
+            provenance=spectra.provenance,
             flux_shape=list(spectra.grid.field("flux").values.shape),
             actual_wavelength_ranges=wave[:, [0, -1]].tolist(),
             actual_velocity_step_kms=(299792.458 * np.log(wave[:, -1] / wave[:, 0]) / (wave.shape[1]-1)).tolist(),
@@ -295,7 +319,7 @@ def _build_korg(recipe_path, recipe, csv_path, kwargs, output_dir, cache_dir):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("recipe", type=Path, help="JSON recipe; CSV paths are relative to this file")
-    parser.add_argument("--data-dir", type=Path, help="local BOSZ rorig/ or Coelho FITS directory")
+    parser.add_argument("--data-dir", type=Path, help="local BOSZ rorig/, Coelho FITS or TLUSTY OB2025 directory")
     parser.add_argument("--output-dir", type=Path, help="new directory for grid.npz and provenance")
     parser.add_argument("--cache-dir", type=Path, help="Korg node cache; default: OUTPUT_DIR.cache")
     parser.add_argument("--dry-run", action="store_true", help="resolve settings; also check input paths if --data-dir is supplied; do not read spectra or write files")

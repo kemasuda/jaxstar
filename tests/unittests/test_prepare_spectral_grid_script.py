@@ -181,6 +181,63 @@ def test_input_check_reports_all_missing_files_without_preparing(tmp_path):
     assert not output.exists()
 
 
+@pytest.mark.parametrize("normalized", [True, False])
+def test_teff_replacement_preview_build_and_manifest(tmp_path, x64_context, normalized):
+    raw, recipe_path, recipe = inputs(tmp_path, "coelho", normalized)
+    recipe["missing_nodes"] = "teff"
+    recipe_path.write_text(json.dumps(recipe))
+    # Missing 6250 K is the requested upper edge; 6500 K lies outside the axes.
+    with fits.open(raw / "6250_40_p00p00.ms.fits") as hdus:
+        hdus[0].data += np.array([.05, .10])[:, None]
+        hdus.writeto(raw / "6500_40_p00p00.ms.fits")
+    (raw / "6250_40_p00p00.ms.fits").unlink()
+    output = tmp_path / "prepared"
+    dry = run_cli(tmp_path, recipe_path, "--data-dir", raw, "--dry-run")
+    assert dry.returncode == 0, dry.stderr
+    assert not output.exists()
+    assert "will interpolate linearly in Teff from 6000 K and 6500 K" in dry.stderr
+    assert "6500_40_p00p00.ms.fits (weight 0.5)" in dry.stderr
+    preview = json.loads(dry.stdout)["input_check"]
+    assert preview["ready"] and preview["source_file_count"] == 2
+    result = run_cli(tmp_path, recipe_path, "--data-dir", raw, "--output-dir", output)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.index("will interpolate") < result.stdout.index("Preparing coelho")
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["source_plan"]["replacements"] == preview["replacements"]
+    assert [r["method"] for r in preview["replacements"]] == ["linear_teff"]
+    assert [s["weight"] for s in preview["replacements"][0]["sources"]] == [.5, .5]
+    assert manifest["resolved_preparation"]["missing_nodes"] == "teff"
+    assert builder.read_recipe(output / "recipe.json")[2] == manifest["resolved_preparation"]
+    assert set(manifest["sources"]) == {"6000_40_p00p00.ms.fits", "6500_40_p00p00.ms.fits"}
+    for name, record in manifest["sources"].items():
+        assert hashlib.sha256((raw / name).read_bytes()).hexdigest() == record["sha256"]
+    with x64_context():
+        spectra = load_spectral_grid(output / "grid.npz")
+        expected = .75 + .02*(np.asarray(spectra.wavelength)-5000.)
+        if not normalized:
+            expected *= 2
+        actual = spectra.grid.interpolate(dict(teff=6250, logg=4, feh=0, alpha=0))["flux"]
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+        assert set(spectra.sources) == set(manifest["source_plan"]["sources"])
+
+    # A missing upper neighbour must fail before preparation, with no publication.
+    (raw / "6500_40_p00p00.ms.fits").unlink()
+    failed_output = tmp_path / "failed"
+    failed = run_cli(tmp_path, recipe_path, "--data-dir", raw, "--output-dir", failed_output)
+    assert failed.returncode != 0 and "6500_40_p00p00.ms.fits" in failed.stderr
+    assert "no spectra were read" in failed.stderr and "Preparing coelho" not in failed.stdout
+    assert not failed_output.exists()
+
+
+@pytest.mark.parametrize("library,policy", [("bosz", "teff"), ("coelho", "logg"), ("tlusty", "teff"), ("korg", "teff")])
+def test_recipe_missing_node_policy_is_library_specific(tmp_path, library, policy):
+    _, path, recipe = inputs(tmp_path, "coelho")
+    recipe.update(library=library, missing_nodes=policy)
+    path.write_text(json.dumps(recipe))
+    with pytest.raises(ValueError, match="supported only for"):
+        builder.read_recipe(path)
+
+
 @pytest.mark.parametrize("axis,values,expected", [
     ("teff", {"min": 4000, "max": 7000, "step": 250}, list(range(4000, 7001, 250))),
     ("mh", {"min": -0.3, "max": 0.3, "step": 0.1}, [-0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3]),
@@ -238,6 +295,8 @@ def test_shared_examples_and_unknown_medium(tmp_path):
         assert kwargs["wavelength_medium"] in {"air", "vacuum"}
         if recipe["library"] == "bosz":
             assert 1 in kwargs["axes"]["vmic"]
+        if path.name == "coelho_gaoes.json":
+            assert kwargs["missing_nodes"] == "teff"
     for path in sorted((root / "wavelength_ranges").glob("*.csv")):
         with path.open() as stream:
             rows = list(csv.DictReader(stream))
@@ -253,3 +312,67 @@ def test_shared_examples_and_unknown_medium(tmp_path):
     recipe["wavelength_medium"] = "vacuum"
     path.write_text(json.dumps(recipe))
     assert builder.read_recipe(path)[2]["wavelength_medium"] == "vacuum"
+
+
+@pytest.mark.parametrize("normalized", [True, False])
+def test_tlusty_ob2025_cli_preflight_build_and_portable_bundle(tmp_path, x64_context, normalized):
+    raw = tmp_path / "raw"
+    wave = np.linspace(4998., 5005., 701)
+    for family, t, value in (("BSTAR", 29000, .7), ("OSTAR", 30000, .9)):
+        directory = raw / f"{family}_z100v2"
+        directory.mkdir(parents=True)
+        for kind, flux in (("spec", 2*value), ("cont", 2.)):
+            with gzip.open(directory / f"z100t{t}g400v2.{kind}.gz", "wt") as stream:
+                np.savetxt(stream, np.column_stack((wave, np.full(wave.size, flux))))
+    table = tmp_path / "ranges.csv"
+    table.write_text("region,wavmin,wavmax,unit,medium\n0,5000,5003,angstrom,vacuum\n")
+    recipe = dict(library="tlusty", axes=dict(teff=[29000, 30000], logg=[3., 4.], logZ=[0.]),
+                  wavelength_ranges_file="ranges.csv", wav_margin=.1,
+                  sampling=dict(velocity_step=3.), normalized=normalized,
+                  missing_nodes="lowest_logg")
+    path = tmp_path / "recipe.json"
+    path.write_text(json.dumps(recipe))
+    output = tmp_path / "bundle"
+    dry = run_cli(tmp_path, path, "--data-dir", raw, "--dry-run")
+    assert dry.returncode == 0, dry.stderr
+    preview = json.loads(dry.stdout)
+    assert preview["input_check"]["source_file_count"] == 4
+    assert preview["input_check"]["requested_nodes"] == 4
+    assert len(preview["input_check"]["replacements"]) == 2
+    assert preview["preparation"]["missing_nodes"] == "lowest_logg"
+    assert "will use lowest available logg=4" in dry.stderr
+    assert preview["preparation"]["source_format"] == "ob2025"
+    assert "normalized" not in preview["preparation"]
+    assert not output.exists()
+    result = run_cli(tmp_path, path, "--data-dir", raw, "--output-dir", output)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.index("Input check passed") < result.stdout.index("Preparing tlusty")
+    assert result.stdout.index("will use lowest available logg=4") < result.stdout.index("Preparing tlusty")
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert len(manifest["sources"]) == 4
+    assert manifest["source_plan"]["replacements"] == preview["input_check"]["replacements"]
+    assert "_tlusty.py" in manifest["implementations"]
+    assert "_data.py" in manifest["implementations"]
+    assert builder.read_recipe(output / "recipe.json")[2] == manifest["resolved_preparation"]
+    with x64_context():
+        spectra = load_spectral_grid(output / "grid.npz")
+        assert spectra.provenance == manifest["provenance"]
+        assert spectra.provenance["replacements"] == manifest["source_plan"]["replacements"]
+        assert spectra.provenance["atmosphere_vmic_kms"]["OSTAR"] == 10.
+        assert spectra.grid.axis_names == ("teff", "logg", "logZ")
+        for i, value in enumerate((.7, .9)):
+            np.testing.assert_allclose(spectra.grid.field("flux").values[i],
+                                       value if normalized else 2*value)
+
+    # Missing both a continuum and another atmosphere: one preflight failure,
+    # no flux reads/build message and no partially published bundle.
+    (raw / "BSTAR_z100v2/z100t29000g400v2.cont.gz").unlink()
+    recipe["axes"]["teff"].append(32500)
+    path.write_text(json.dumps(recipe))
+    failed = run_cli(tmp_path, path, "--data-dir", raw, "--output-dir", tmp_path / "failed")
+    assert failed.returncode != 0
+    assert "z100t29000g400v2.cont.gz" in failed.stderr
+    assert "z100t32500g400v2.spec.gz" in failed.stderr
+    assert "no spectra were read" in failed.stderr
+    assert "Preparing tlusty" not in failed.stdout
+    assert not (tmp_path / "failed").exists()

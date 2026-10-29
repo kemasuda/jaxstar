@@ -1,7 +1,8 @@
 # Reusable spectral grids
 
-`prepare_grid.py` calls the public `prepare_bosz`, `prepare_coelho` or optional
-`prepare_korg` API and `save_spectral_grid`. BOSZ/Coelho read local raw spectra;
+`prepare_grid.py` calls the public `prepare_bosz`, `prepare_coelho`,
+`prepare_tlusty` or optional `prepare_korg` API and `save_spectral_grid`.
+BOSZ/Coelho/TLUSTY read local raw spectra;
 Korg synthesizes spectra through Python/JuliaCall and may download its model
 data on first use. The script does not fit observations. Run it from a checkout installed with
 `python -m pip install -e .`, or use `PYTHONPATH=src` from the repository root
@@ -20,6 +21,7 @@ scripts/specfit/
   recipes/coelho_ird_h.json
   recipes/korg_gaoes.json
   recipes/korg_gaoes_mini.json
+  recipes/tlusty_ob2025_optical.json
   wavelength_ranges/*.csv
 ```
 
@@ -58,11 +60,17 @@ to the working directory; the recipe's CSV path is relative to the recipe.
 The recipes specify reusable atmosphere domains; inspect their axes and region
 selection before a production build. `bosz_gaoes.json` uses all GAOES table
 regions, Teff 5000--8000 K, logg 3--5, `[C/M]=0` and native `vmic=[0, 1, 2]`.
-The other recipes illustrate smaller domains and explicit region selection.
-Every BOSZ/Coelho build checks all requested input paths before reading any spectra. Coelho
+`coelho_gaoes.json` extends the jaxspec Coelho example with FeH=+0.2: Teff
+3500--7000 K in 250 K steps, logg=1.0--5.0 in 0.5 dex steps,
+FeH=[-1,-0.5,0,0.2,0.5], alpha=[0,0.4], all 15 GAOES regions and 7500 pixels
+per region. Its 1350 atmosphere nodes use
+`missing_nodes="teff"` to fill missing files from native Teff neighbours while
+preserving logg/FeH/alpha; see [Missing Coelho nodes](#missing-coelho-nodes).
+The IRD recipes illustrate smaller domains and explicit region selection.
+Every BOSZ/Coelho/TLUSTY build checks all requested input paths before reading any spectra. Coelho
 and BOSZ with the default `missing_nodes="error"` require every Cartesian-product
-node. BOSZ can explicitly enable the logg replacement policy below; the GAOES
-BOSZ recipe enables it.
+node. BOSZ can explicitly enable the logg replacement policy below, and Coelho
+can enable Teff interpolation. Both GAOES recipes enable their respective policy.
 The BOSZ preparer averages flux at exactly repeated native wavelengths before
 resampling; the original-resolution ASCII files can contain repeated printed
 wavelengths. Distinct nearby wavelengths are retained.
@@ -89,8 +97,9 @@ directory without the original recipe location.
 The manifest's `source_plan` records every replacement's target coordinates,
 method, source coordinates, filenames and weights. `sources` hashes the actual
 native files used, including neighbours outside the requested axes. Keep the
-manifest alongside the NPZ to retain this replacement history; the NPZ itself
-records the actual source filenames but not the replacement map.
+manifest alongside the NPZ to retain this replacement history. BOSZ/Coelho
+NPZs record the actual source filenames; TLUSTY OB2025 additionally retains
+the replacement map in its NPZ provenance.
 
 An analysis needs only the NPZ. Create `obs` from the observation rows you want
 to fit, as in `examples/specfit/coelho.ipynb`, then pass the NPZ file to the same
@@ -177,7 +186,9 @@ to catch misspellings.
   the combination. Neither option sets instrumental resolving power.
 - `normalized`: `true` for fitting continuum-normalized spectra; `false` keeps
   the preparer's unnormalized flux convention.
-- `missing_nodes`: `"error"` (default), or `"logg"` for BOSZ as described below.
+- `missing_nodes`: `"error"` (default), `"logg"` for BOSZ, `"teff"` for Coelho,
+  or `"lowest_logg"` for TLUSTY OB2025,
+  as described below.
 
 For example, these entries can be used within `axes`:
 
@@ -202,6 +213,178 @@ Angstrom values and `unit` is explicitly `angstrom`. `medium` is `air`,
 explicit `wavelength_medium` declaration. Conflicts with a known CSV medium
 fail: changing that declaration does not convert wavelength bounds. The
 preparer converts *native spectra* into the selected output medium.
+
+## TLUSTY OB2025
+
+Use `recipes/tlusty_ob2025_optical.json` with the extracted
+[TLUSTY OB2025 library](https://stsci.app.box.com/v/tlustyOB2025).
+`--data-dir` is the parent of `BSTAR_z100v2`, `OSTAR_z100v2`, etc.; no
+download or extraction is performed by the script.
+
+```bash
+PYTHONPATH=src python scripts/specfit/prepare_grid.py \
+  scripts/specfit/recipes/tlusty_ob2025_optical.json \
+  --data-dir /path/to/TLUSTYOB_2025 --dry-run
+
+PYTHONPATH=src python scripts/specfit/prepare_grid.py \
+  scripts/specfit/recipes/tlusty_ob2025_optical.json \
+  --data-dir /path/to/TLUSTYOB_2025 \
+  --output-dir /path/to/prepared/tlusty_ob2025_vt2_optical
+```
+
+This is an optical example for observations with R approximately 2500--3000,
+not a GAOES recipe or an instrumental convolution. Its 3600--7400 Angstrom
+table uses **vacuum** wavelengths, with 10 Angstrom margins. Copy/edit the
+table to match the intervals and air/vacuum convention of your observations.
+Native spectra are vacuum; choosing air converts the native wavelength scale
+after continuum normalization. Air ranges, including margins, must lie above
+2000 Angstrom. The recipe uses 10 km/s logarithmic sampling; use 3 km/s to
+retain approximately the native sampling. Preparation uses point interpolation
+without pre-smoothing, so compare coarser sampling against a finer reference
+at the precision needed for your observations. The fitting model applies
+instrumental broadening separately.
+
+The example uses 26 Teff nodes from 15000 to 55000 K, logg=3.0--4.75 in 0.25
+steps, and Z/Z_sun=[0.1, 0.2, 0.5, 1, 2] (1040 requested atmosphere nodes).
+These axes match the old jaxspec example. The Teff list
+changes from 1000 K steps below 30000 to 2500 K above it. `logZ` must contain
+the logarithms of native metallicities, not arbitrary evenly spaced values.
+The complete native set is Z/Z_sun=[0.01, 0.02, 0.032, 0.1, 0.2, 0.5, 1, 2].
+The OSTAR `z0033` filename label is explicitly mapped to the nominal 0.032
+listed for both families in [Hubeny et al. (2025), Section 2](https://doi.org/10.3847/1538-3881/adb1bf);
+this mapping is recorded in provenance.
+
+The axes are **teff/logg/logZ**, with synthesis **vt=2 km/s fixed** throughout.
+BSTAR is used below 30000 K, OSTAR at and above 30000 K, following the paper's
+overlap recommendation. The underlying atmosphere uses vt=2 for BSTAR and
+vt=10 for OSTAR. These settings, the family boundary and source release are
+stored in both `grid.npz` and `manifest.json`. They remain available through
+`load_spectral_grid(path).provenance` and in saved fit-result metadata, without
+introducing a vmic fit parameter. Existing common-format files without this
+optional provenance field still load.
+
+Every input `.spec.gz`/`.cont.gz` pair used by the plan must exist and be
+nonempty before any spectrum is read. Only exact v2 filenames are used;
+v5/v10 and `v2old` files do not participate. This preflight checks paths and
+sizes, not compressed file contents.
+
+The recipe enables **`missing_nodes="lowest_logg"`** for the high-Teff,
+low-logg boundary, following the old grid's treatment of these lower gaps:
+
+1. Use each requested node whenever its pair exists.
+2. If both files are absent and the requested logg is below the lowest
+   available logg at the same Teff/Z/family/vt, copy that lowest-logg spectrum.
+   Search the raw directory, including logg values outside the requested axis.
+3. Do not replace interior holes, upper-edge gaps, partial pairs or empty files.
+   An incomplete lowest-logg source pair is an error; it is not skipped in favor
+   of the next higher logg. All unresolved inputs are reported before reading.
+
+For example, if the native lower boundary is logg=3.25, only a missing 3.0 node
+uses 3.25; existing 3.25, 3.5, etc. retain their own spectra. If the boundary is
+4.0, the requested 3.0--3.75 nodes all use 4.0. The boundary is determined
+separately for each Teff and metallicity. A missing download of an entire
+lower pair is indistinguishable from a native gap: download the intended raw
+models first.
+
+The CLI prints `will use lowest available logg=...` for every replacement
+before loading spectra. Target/source coordinates and both source paths are
+saved in the manifest and NPZ provenance. Copied nodes have **flat spectral
+dependence on logg below the native boundary**, rather than new atmosphere
+models or a physical extrapolation. Set `missing_nodes="error"` to require a
+complete native domain; e.g. 15000--55000 K with logg=4.0--4.75, or
+15000--30000 K with logg=3.0--4.75, at the example's five Zs.
+`missing_nodes="logg"` remains BOSZ-only.
+
+Normalized flux is the native H_lambda divided by its interpolated continuum.
+Continuum samples may differ between models. Exactly identical duplicate
+continuum rows are collapsed; duplicate wavelengths with conflicting fluxes
+fail instead of being averaged. Missing continuum coverage in a requested
+region also fails. `normalized=false` retains native H_lambda values (no
+4*pi factor, per-region scaling, or flux-density Jacobian conversion).
+Prepared flux is float32; the CLI enables JAX x64 for axes and wavelengths.
+
+Python users can call
+`prepare_tlusty(..., source_format="ob2025", missing_nodes="lowest_logg")` with the
+same axes, bounds and sampling, using `flux_kind="normalized"`. The default
+`source_format="auto"` recognizes either OB2025 or the old
+`Z*_vt2/Z*_ostar` layout and refuses ambiguous mixed roots. Explicit
+`source_format="legacy"` preserves the old wavelength declarations and
+BSTAR-at-30000 behavior. The recipe CLI always selects OB2025 for
+`library="tlusty"`.
+`check_spectral_inputs("tlusty", ..., axes=..., missing_nodes="lowest_logg")`
+previews the same OB2025 input plan. Both APIs default to strict `"error"`
+when the policy is omitted. Loading and fitting the resulting NPZ use the same
+`SpecFit.from_grid` example above.
+
+## Missing Coelho nodes
+
+Coelho preparation checks every requested FITS path before reading spectra.
+Missing files are errors by default. Set `"missing_nodes": "teff"` (enabled in
+`coelho_gaoes.json`) to fill a missing node from the native files at **Teff minus
+and plus 250 K**, keeping logg, FeH and alpha fixed:
+
+1. Use the requested native file whenever it exists.
+2. Otherwise, require both immediate temperature neighbours. They may lie
+   outside the requested axes, including at the requested temperature edges.
+3. Read each neighbour's selected flux row, resample onto the same output
+   wavelengths, then average with weights 0.5. Row 0 is normalized flux;
+   row 1 is unnormalized flux, with no additional normalization.
+4. If either neighbour is missing, report all unresolved nodes and stop before
+   reading any spectra. There is no one-sided copy, wider-neighbour search,
+   recursive filling or substitution across alpha. Existing corrupt files and
+   insufficient wavelength coverage remain errors during reading.
+
+The native temperature spacing is 250 K; this policy requires requested Teff
+values on that lattice. Interpolated nodes are approximations, not independent
+atmosphere calculations. File checks establish local availability, not spectral
+interpolation accuracy or the completeness of a download.
+
+An earlier native-file inventory check used the narrower logg=[3,4,5]
+selection (450 requested nodes) and found these five missing nodes:
+
+| Missing Teff / logg / FeH / alpha | Native Teff neighbours (same logg/FeH/alpha) |
+| --- | --- |
+| 4250 / 5.0 / +0.5 / 0.0 | 4000 and 4500 K |
+| 4750 / 3.0, 4.0, 5.0 / +0.5 / 0.4 | 4500 and 5000 K |
+| 5250 / 3.0 / +0.2 / 0.0 | 5000 and 5500 K |
+
+All required neighbours were present in that inventory. This does not
+establish completeness of the current 1350-node recipe, which adds lower and
+half-integer gravities. Run `--dry-run --data-dir ...` to check the actual local
+files for the requested axes. For the narrower selection above, the script
+prints English messages such as these before reading spectra:
+
+```text
+Missing .../4250_50_p05p00.ms.fits: will interpolate linearly in Teff from 4000 K and 4500 K at fixed logg, FeH and alpha.
+  Source: .../4000_50_p05p00.ms.fits (weight 0.5)
+  Source: .../4500_50_p05p00.ms.fits (weight 0.5)
+Input check passed: 450 requested nodes, 445 source files, 5 replacements.
+```
+
+The manifest retains the full source plan, weights and hashes. Python callers
+can inspect the plan using
+`check_spectral_inputs("coelho", data_dir, axes=axes, missing_nodes="teff")`,
+then call `prepare_coelho(..., missing_nodes="teff")`; preparation repeats the
+check before reading. Omitting the policy retains strict mode.
+
+The old `jaxspec.modelgrid.compute_grid_coelho` instead used these alpha substitutions:
+
+| Requested Teff / logg / FeH / alpha | Alpha in the file actually used by jaxspec |
+| --- | --- |
+| 4250 / 5.0 / +0.5 / 0.0 | 0.4 |
+| 4750 / any / +0.5 / 0.4 | 0.0 |
+| 5250 / 3.0 / +0.2 / 0.0 | 0.4 |
+
+These copies made the two alpha nodes identical at the affected
+Teff/logg/FeH; the new Teff policy keeps
+the requested composition instead. File naming and FITS flux-row selection
+otherwise follow jaxspec.
+
+The Python `prepare_coelho(..., source_overrides={...})` API can explicitly
+select substitute files in strict mode, but cannot be combined with
+`missing_nodes="teff"`. Recipe JSON does not currently expose `source_overrides`.
+Existing legacy NPZs retain their stored flux values, including any previous
+substitutions.
 
 ## Missing BOSZ nodes
 
