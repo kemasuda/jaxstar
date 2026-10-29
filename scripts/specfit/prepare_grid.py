@@ -58,10 +58,12 @@ def read_recipe(path):
     if library not in AXES:
         raise ValueError("library must be 'bosz', 'coelho', 'tlusty' or 'korg'")
     missing_nodes = recipe.get("missing_nodes", "error")
-    if missing_nodes not in ("error", "logg", "lowest_logg"):
-        raise ValueError("missing_nodes must be 'error', 'logg' or 'lowest_logg'")
+    if missing_nodes not in ("error", "logg", "teff", "lowest_logg"):
+        raise ValueError("missing_nodes must be 'error', 'logg', 'teff' or 'lowest_logg'")
     if library != "bosz" and missing_nodes == "logg":
         raise ValueError("missing_nodes='logg' is supported only for BOSZ")
+    if library != "coelho" and missing_nodes == "teff":
+        raise ValueError("missing_nodes='teff' is supported only for Coelho")
     if library != "tlusty" and missing_nodes == "lowest_logg":
         raise ValueError("missing_nodes='lowest_logg' is supported only for TLUSTY OB2025")
     axes = recipe["axes"]
@@ -129,7 +131,7 @@ def read_recipe(path):
     kwargs = dict(axes=axes, wavelength_ranges=bounds, regions=regions,
                   wavelength_medium=medium, normalized=recipe["normalized"],
                   sampling="log", **sampling)
-    if library in {"bosz", "tlusty"} and "missing_nodes" in recipe:
+    if library in {"bosz", "coelho", "tlusty"} and "missing_nodes" in recipe:
         kwargs["missing_nodes"] = missing_nodes
     if library == "korg":
         kwargs.update(korg_options)
@@ -163,7 +165,11 @@ def check_inputs(library, data_dir, kwargs, *, stream=None):
                                    missing_nodes=kwargs.get("missing_nodes", "error"))
     for entry in report["replacements"]:
         gravities = [source["node"]["logg"] for source in entry["sources"]]
-        if entry["method"] == "linear_logg":
+        if entry["method"] == "linear_teff":
+            temperatures = [source["node"]["teff"] for source in entry["sources"]]
+            action = (f"will interpolate linearly in Teff from {temperatures[0]:g} K "
+                      f"and {temperatures[1]:g} K at fixed logg, FeH and alpha")
+        elif entry["method"] == "linear_logg":
             action = f"will interpolate linearly in logg from {gravities[0]:g} and {gravities[1]:g}"
         elif entry["method"] == "copy_lowest_logg":
             action = (f"will use lowest available logg={gravities[0]:g} "
@@ -172,6 +178,9 @@ def check_inputs(library, data_dir, kwargs, *, stream=None):
             action = (f"upper logg neighbor is also missing; will use logg={gravities[0]:g} "
                       "at the requested upper edge")
         print(f"Missing {entry['missing_path']}: {action}.", file=stream, flush=True)
+        if entry["method"] == "linear_teff":
+            for source in entry["sources"]:
+                print(f"  Source: {source['path']} (weight {source['weight']:g})", file=stream, flush=True)
     if not report["ready"]:
         details = []
         for entry in report["unresolved"]:

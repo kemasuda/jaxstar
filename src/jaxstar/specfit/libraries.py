@@ -206,7 +206,8 @@ def prepare_korg(*, axes, wavelength_ranges, wavelength_medium, pixels=None,
 
 def prepare_coelho(data_dir, *, axes, wavelength_ranges, pixels=None,
                    regions=None, wavelength_medium="vacuum", normalized=True,
-                   source_overrides=None, sampling=None, velocity_step=None):
+                   source_overrides=None, sampling=None, velocity_step=None,
+                   missing_nodes="error"):
     """Prepare Coelho FITS nodes directly into a common spectral library.
 
     ``axes`` maps teff/logg/feh/alpha to increasing coordinate arrays.
@@ -228,16 +229,24 @@ def prepare_coelho(data_dir, *, axes, wavelength_ranges, pixels=None,
     Omitted sampling retains M2 behavior; explicit 'native'/'linear' are allowed.
 
     Row 0 is normalized flux; row 1 is unnormalized flux. Raw output is float32,
-    matching frozen preparation. ``source_overrides`` maps atmosphere tuples
-    to explicit FITS paths for known missing-model replacements/naming aliases;
-    no replacement is applied silently. All input paths are checked before
-    opening any spectra. Paths are recorded in .sources.
+    matching frozen preparation. All input paths are checked before opening
+    any spectra. Missing files fail by default. With ``missing_nodes='teff'``,
+    missing nodes use the two native neighbours at Teff +/- 250 K, holding
+    logg, FeH and alpha fixed. Each source's selected flux row is resampled
+    onto the output wavelengths before averaging with weights 0.5. Both
+    neighbours must exist, even at requested axis edges; they may lie outside
+    the requested axes. There is no wider-neighbour search, recursive filling
+    or copying across alpha. Corrupt files and insufficient coverage still fail.
+    Use check_spectral_inputs to inspect and retain the replacement report;
+    .sources lists the actual files used. ``source_overrides`` maps atmosphere
+    tuples to explicit FITS paths in strict mode only.
     Returns an in-memory private spectral carrier; persist it once with
     save_spectral_grid and use load_spectral_grid in subsequent processes.
     """
     axes = _preparation_axes("coelho", axes)
     _sampling_mode(sampling, pixels, velocity_step)
-    paths, _, report = _spectral_source_plan("coelho", data_dir, axes, "error", source_overrides)
+    paths, node_sources, report = _spectral_source_plan(
+        "coelho", data_dir, axes, missing_nodes, source_overrides)
     _require_source_plan(report)
     kind = "normalized" if normalized else "unnormalized"
     _output_medium(wavelength_medium)
@@ -259,8 +268,9 @@ def prepare_coelho(data_dir, *, axes, wavelength_ranges, pixels=None,
         return wav, flux
 
     return _prepare_nodes("coelho", axes, reader, wavelength_ranges, pixels,
-                          regions, wavelength_medium, kind, tuple(paths.values()),
-                          sampling=sampling, velocity_step=velocity_step)
+                          regions, wavelength_medium, kind, tuple(report["sources"]),
+                          sampling=sampling, velocity_step=velocity_step,
+                          node_sources=node_sources)
 
 
 def prepare_bosz(data_dir, *, axes, wavelength_ranges, pixels=None,
@@ -343,7 +353,8 @@ def check_spectral_inputs(library, data_dir, *, axes, missing_nodes="error", sou
     Preparation repeats this check before reading spectra.
 
     ``missing_nodes='logg'`` is BOSZ-only; see prepare_bosz for its interpolation
-    and upper-edge copy rules. The default is strict for all libraries.
+    and upper-edge copy rules. ``missing_nodes='teff'`` is Coelho-only and
+    requires both native Teff +/- 250 K neighbours at fixed logg/FeH/alpha.
     TLUSTY checks OB2025 vt=2 spectrum/continuum pairs, using OSTAR at Teff
     >= 30000 K. Its optional ``missing_nodes='lowest_logg'`` copies the lowest
     available logg at fixed Teff/Z for missing nodes below that native boundary.
@@ -373,15 +384,20 @@ def _native_spectral_path(library, root, node):
 
 
 def _spectral_source_plan(library, data_dir, axes, missing_nodes, source_overrides):
-    if missing_nodes not in ("error", "logg"):
-        raise ValueError("missing_nodes must be 'error' or 'logg'")
+    if missing_nodes not in ("error", "logg", "teff"):
+        raise ValueError("missing_nodes must be 'error', 'logg' or 'teff'")
     if missing_nodes == "logg":
         if library != "bosz":
             raise ValueError("missing_nodes='logg' is supported only for BOSZ")
-        if source_overrides:
-            raise ValueError("missing_nodes='logg' cannot be combined with source_overrides")
         for g in axes["logg"]:
             _integer(g * 2)
+    if missing_nodes == "teff":
+        if library != "coelho":
+            raise ValueError("missing_nodes='teff' is supported only for Coelho")
+        for t in axes["teff"]:
+            _integer(t / 250)
+    if missing_nodes != "error" and source_overrides:
+        raise ValueError(f"missing_nodes={missing_nodes!r} cannot be combined with source_overrides")
     root = Path(data_dir).expanduser()
     nodes = tuple(product(*axes.values()))
     paths = {node: _native_spectral_path(library, root, node) for node in nodes}
@@ -401,18 +417,24 @@ def _spectral_source_plan(library, data_dir, axes, missing_nodes, source_overrid
             unresolved.append({**entry, "reason": "input file is missing"})
             continue
         t, g, *rest = node
-        lower, upper = (t, g - .5, *rest), (t, g + .5, *rest)
+        if missing_nodes == "teff":
+            lower, upper = (t - 250, g, *rest), (t + 250, g, *rest)
+        else:
+            lower, upper = (t, g - .5, *rest), (t, g + .5, *rest)
         for neighbor in (lower, upper):
             paths[neighbor] = _native_spectral_path(library, root, neighbor)
         has_lower, has_upper = paths[lower].is_file(), paths[upper].is_file()
         if has_lower and has_upper:
-            method, contributors = "linear_logg", ((lower, .5), (upper, .5))
-        elif has_lower and not has_upper and g == axes["logg"][-1]:
+            method, contributors = f"linear_{missing_nodes}", ((lower, .5), (upper, .5))
+        elif missing_nodes == "logg" and has_lower and not has_upper and g == axes["logg"][-1]:
             method, contributors = "copy_lower_logg", ((lower, 1.),)
         else:
             absent = [str(paths[n]) for n in (lower, upper) if not paths[n].is_file()]
+            reason = ("both adjacent native Teff +/- 250 K files at fixed logg/FeH/alpha are required"
+                      if missing_nodes == "teff" else
+                      "adjacent native logg files are required; lower-only copying is allowed only at the requested upper edge")
             unresolved.append({**entry, "missing_neighbors": absent,
-                               "reason": "adjacent native logg files are required; lower-only copying is allowed only at the requested upper edge"})
+                               "reason": reason})
             continue
         node_sources[node] = contributors
         replacements.append({**entry, "method": method, "sources": [

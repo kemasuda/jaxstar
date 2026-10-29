@@ -181,6 +181,63 @@ def test_input_check_reports_all_missing_files_without_preparing(tmp_path):
     assert not output.exists()
 
 
+@pytest.mark.parametrize("normalized", [True, False])
+def test_teff_replacement_preview_build_and_manifest(tmp_path, x64_context, normalized):
+    raw, recipe_path, recipe = inputs(tmp_path, "coelho", normalized)
+    recipe["missing_nodes"] = "teff"
+    recipe_path.write_text(json.dumps(recipe))
+    # Missing 6250 K is the requested upper edge; 6500 K lies outside the axes.
+    with fits.open(raw / "6250_40_p00p00.ms.fits") as hdus:
+        hdus[0].data += np.array([.05, .10])[:, None]
+        hdus.writeto(raw / "6500_40_p00p00.ms.fits")
+    (raw / "6250_40_p00p00.ms.fits").unlink()
+    output = tmp_path / "prepared"
+    dry = run_cli(tmp_path, recipe_path, "--data-dir", raw, "--dry-run")
+    assert dry.returncode == 0, dry.stderr
+    assert not output.exists()
+    assert "will interpolate linearly in Teff from 6000 K and 6500 K" in dry.stderr
+    assert "6500_40_p00p00.ms.fits (weight 0.5)" in dry.stderr
+    preview = json.loads(dry.stdout)["input_check"]
+    assert preview["ready"] and preview["source_file_count"] == 2
+    result = run_cli(tmp_path, recipe_path, "--data-dir", raw, "--output-dir", output)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.index("will interpolate") < result.stdout.index("Preparing coelho")
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["source_plan"]["replacements"] == preview["replacements"]
+    assert [r["method"] for r in preview["replacements"]] == ["linear_teff"]
+    assert [s["weight"] for s in preview["replacements"][0]["sources"]] == [.5, .5]
+    assert manifest["resolved_preparation"]["missing_nodes"] == "teff"
+    assert builder.read_recipe(output / "recipe.json")[2] == manifest["resolved_preparation"]
+    assert set(manifest["sources"]) == {"6000_40_p00p00.ms.fits", "6500_40_p00p00.ms.fits"}
+    for name, record in manifest["sources"].items():
+        assert hashlib.sha256((raw / name).read_bytes()).hexdigest() == record["sha256"]
+    with x64_context():
+        spectra = load_spectral_grid(output / "grid.npz")
+        expected = .75 + .02*(np.asarray(spectra.wavelength)-5000.)
+        if not normalized:
+            expected *= 2
+        actual = spectra.grid.interpolate(dict(teff=6250, logg=4, feh=0, alpha=0))["flux"]
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+        assert set(spectra.sources) == set(manifest["source_plan"]["sources"])
+
+    # A missing upper neighbour must fail before preparation, with no publication.
+    (raw / "6500_40_p00p00.ms.fits").unlink()
+    failed_output = tmp_path / "failed"
+    failed = run_cli(tmp_path, recipe_path, "--data-dir", raw, "--output-dir", failed_output)
+    assert failed.returncode != 0 and "6500_40_p00p00.ms.fits" in failed.stderr
+    assert "no spectra were read" in failed.stderr and "Preparing coelho" not in failed.stdout
+    assert not failed_output.exists()
+
+
+@pytest.mark.parametrize("library,policy", [("bosz", "teff"), ("coelho", "logg"), ("tlusty", "teff"), ("korg", "teff")])
+def test_recipe_missing_node_policy_is_library_specific(tmp_path, library, policy):
+    _, path, recipe = inputs(tmp_path, "coelho")
+    recipe.update(library=library, missing_nodes=policy)
+    path.write_text(json.dumps(recipe))
+    with pytest.raises(ValueError, match="supported only for"):
+        builder.read_recipe(path)
+
+
 @pytest.mark.parametrize("axis,values,expected", [
     ("teff", {"min": 4000, "max": 7000, "step": 250}, list(range(4000, 7001, 250))),
     ("mh", {"min": -0.3, "max": 0.3, "step": 0.1}, [-0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3]),
@@ -238,6 +295,8 @@ def test_shared_examples_and_unknown_medium(tmp_path):
         assert kwargs["wavelength_medium"] in {"air", "vacuum"}
         if recipe["library"] == "bosz":
             assert 1 in kwargs["axes"]["vmic"]
+        if path.name == "coelho_gaoes.json":
+            assert kwargs["missing_nodes"] == "teff"
     for path in sorted((root / "wavelength_ranges").glob("*.csv")):
         with path.open() as stream:
             rows = list(csv.DictReader(stream))

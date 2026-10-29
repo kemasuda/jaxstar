@@ -280,6 +280,11 @@ loading spectra. Missing files are errors by default. For BOSZ,
 `missing_nodes="logg"` explicitly enables averaging the native logg +/- 0.5
 spectra at fixed Teff/composition/vmic. At the requested upper logg edge only,
 an absent upper neighbour permits copying the immediate lower neighbour.
+For Coelho, `missing_nodes="teff"` averages the native Teff +/- 250 K spectra
+at fixed logg/FeH/alpha, after resampling the selected normalized or
+unnormalized flux row onto the output wavelengths. Both neighbours must exist;
+there is no one-sided copy or recursive filling. The GAOES Coelho recipe
+enables this policy. Neighbours may lie outside the requested atmosphere axes.
 Other unresolved nodes fail together before any spectra are read. The script
 prints the plan in English and retains replacement methods, source coordinates
 and weights in its manifest. See its guide for the numerical procedure and
