@@ -332,7 +332,7 @@ def prepare_bosz(data_dir, *, axes, wavelength_ranges, pixels=None,
 
 
 def check_spectral_inputs(library, data_dir, *, axes, missing_nodes="error", source_overrides=None):
-    """Check local BOSZ/Coelho paths without opening spectra or allocating a grid.
+    """Check BOSZ/Coelho/TLUSTY OB2025 paths without reading spectra.
 
     Return a JSON-serializable report with ready, requested_nodes, sources,
     replacements and unresolved entries. Replacement entries identify target
@@ -343,11 +343,19 @@ def check_spectral_inputs(library, data_dir, *, axes, missing_nodes="error", sou
     Preparation repeats this check before reading spectra.
 
     ``missing_nodes='logg'`` is BOSZ-only; see prepare_bosz for its interpolation
-    and upper-edge copy rules. The default is strict for both libraries.
+    and upper-edge copy rules. The default is strict for all libraries.
+    TLUSTY checks OB2025 vt=2 spectrum/continuum pairs, using OSTAR at Teff
+    >= 30000 K. Its optional ``missing_nodes='lowest_logg'`` copies the lowest
+    available logg at fixed Teff/Z for missing nodes below that native boundary.
     """
-    if library not in {"bosz", "coelho"}:
-        raise ValueError("input checking supports only 'bosz' and 'coelho'")
+    if library not in {"bosz", "coelho", "tlusty"}:
+        raise ValueError("input checking supports only 'bosz', 'coelho' and 'tlusty'")
     axes = _preparation_axes(library, axes)
+    if library == "tlusty":
+        from ._tlusty import source_plan
+        if source_overrides:
+            raise ValueError("TLUSTY OB2025 does not support source_overrides")
+        return source_plan(data_dir, axes, missing_nodes=missing_nodes)[1]
     return _spectral_source_plan(library, data_dir, axes, missing_nodes, source_overrides)[2]
 
 
@@ -430,10 +438,28 @@ def _require_source_plan(report):
 
 def prepare_tlusty(data_dir, *, wavelength_ranges, axes=None, pixels=None,
                    regions=None, flux_kind="normalized", wavelength_medium="unknown",
-                   source_overrides=None, sampling=None, velocity_step=None):
-    """Prepare matched TLUSTY .7.gz spectra and .17.gz continua.
+                   source_overrides=None, sampling=None, velocity_step=None,
+                   source_format="auto", missing_nodes="error"):
+    """Prepare TLUSTY OB2025 vt=2 spectra or legacy .7.gz/.17.gz pairs.
 
-    Discover Z*_vt2/Z*_ostar directories, logZ=log10(Z/Z_sun), and teff/logg
+    ``source_format='auto'`` detects OB2025 BSTAR_z*v2/OSTAR_z*v2 directories
+    or legacy Z*_vt2/Z*_ostar directories; mixed roots require an explicit
+    'ob2025' or 'legacy' choice. OB2025 uses BSTAR below 30000 K and OSTAR
+    at/above it. Synthesis vt=2 is fixed, with no vmic axis. OSTAR atmospheric
+    structure still uses vt=10; this distinction is saved in provenance.
+    OB2025 wavelengths are vacuum by default; 'air' converts native wavelengths
+    for requested ranges above 2000 Angstrom. Flux normalization is performed
+    in native vacuum wavelengths first. All spectrum/continuum paths are
+    checked before reading. Missing nodes fail by default. With
+    ``missing_nodes='lowest_logg'``, an absent node below the available logg
+    range copies the lowest available logg at the same Teff/Z/family/vt. Sources
+    may lie outside the requested logg axis. Existing nodes are unchanged;
+    partial pairs, empty files, interior holes and upper-edge gaps still fail.
+    Replacements are recorded in provenance; this creates a flat spectrum
+    dependence below the native logg boundary. Identical continuum duplicates
+    are collapsed; different flux values at the same wavelength fail.
+
+    Legacy behavior: discover Z*_vt2/Z*_ostar, logZ=log10(Z/Z_sun), and teff/logg
     from filenames. Default axes retain logg > 2.9 and skip OSTAR teff <= 30000,
     as frozen preparation does. Explicit axes select a complete subgrid.
     Missing nodes fail rather than silently copying the nearest logg. Optional
@@ -441,8 +467,8 @@ def prepare_tlusty(data_dir, *, wavelength_ranges, axes=None, pixels=None,
 
     flux_kind is normalized (continuum division), median_scaled (the legacy
     'absolute' option, scaled per selected region), or unnormalized (native H).
-    No wavelength-medium conversion is performed; callers may declare a known
-    medium. For fitting use ``sampling='log', velocity_step=dv`` in km/s:
+    Legacy files undergo no wavelength-medium conversion; callers may declare
+    a known medium. For fitting use ``sampling='log', velocity_step=dv`` in km/s:
     dlnlambda = dv / 299792.458. Supply dv explicitly as numerical model sampling,
     independent of instrumental resolving power and detector pixels. ``pixels``
     is a mutually exclusive alternative for compatibility/tests/special-purpose
@@ -452,6 +478,24 @@ def prepare_tlusty(data_dir, *, wavelength_ranges, axes=None, pixels=None,
     if flux_kind not in {"normalized", "median_scaled", "unnormalized"}:
         raise ValueError("unsupported TLUSTY flux_kind")
     root = Path(data_dir).expanduser()
+    if source_format not in {"auto", "ob2025", "legacy"}:
+        raise ValueError("source_format must be 'auto', 'ob2025' or 'legacy'")
+    if source_format == "auto":
+        new = any(root.glob("BSTAR_z*v2")) or any(root.glob("OSTAR_z*v2"))
+        old = any(root.glob("Z*_vt2")) or any(root.glob("Z*_ostar"))
+        if new and old:
+            raise ValueError("mixed TLUSTY formats; choose source_format='ob2025' or 'legacy'")
+        source_format = "ob2025" if new else "legacy"
+    if source_format == "ob2025":
+        from ._tlusty import prepare_ob2025
+        if source_overrides:
+            raise ValueError("source_overrides are supported only for legacy TLUSTY")
+        return prepare_ob2025(
+            root, axes=axes, wavelength_ranges=wavelength_ranges, pixels=pixels,
+            regions=regions, flux_kind=flux_kind, wavelength_medium=wavelength_medium,
+            sampling=sampling, velocity_step=velocity_step, missing_nodes=missing_nodes)
+    if missing_nodes != "error":
+        raise ValueError("missing_nodes replacement policies require source_format='ob2025'")
     discovered = {}
     for directory in sorted((*root.glob("Z*_vt2"), *root.glob("Z*_ostar"))):
         z = np.log10(float(directory.name.split("_")[0][1:]))
@@ -483,6 +527,9 @@ def prepare_tlusty(data_dir, *, wavelength_ranges, axes=None, pixels=None,
     missing = set(nodes) - set(paths)
     if missing:
         raise ValueError(f"missing TLUSTY atmosphere nodes: {sorted(missing)}")
+    absent = [str(path) for pair in paths.values() for path in pair if not path.is_file()]
+    if absent:
+        raise FileNotFoundError("Input check failed; no spectra were read.\n" + "\n".join(absent))
 
     def reader(node, bounds_only=False):
         spectrum, continuum = paths[node]
