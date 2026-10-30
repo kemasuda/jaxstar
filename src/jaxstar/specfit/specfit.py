@@ -587,7 +587,7 @@ class SpecFit:
     def mask_outliers(self, *, point, model, sigma_threshold=5.,
                       extend_outlier_mask=True, extension_factor=1., mask_v=None,
                       plot=False, save_path=None, method="gaussian_mixture", p_outlier=.5,
-                      mask_velocity=10.):
+                      mask_velocity="auto"):
         """Replace the fit mask; default to Gaussian-mixture classification.
 
         ``method="gaussian_mixture"`` uses prediction['mismatch_probability']
@@ -600,21 +600,33 @@ class SpecFit:
         from the fitted normal model. Pixels with probability > p_outlier (default .5) are
         flagged, then extended. sigma_threshold and mask_v
         apply only to sigma_clip. The inference likelihood is never changed.
-        For mixture masking, mask_velocity (default 10.) sets a fixed half-width
-        in km/s around each original flagged pixel instead of extension_factor,
-        using c * abs(log(wavelength / flagged_wavelength)) <= mask_velocity
-        within each region. Zero adds no neighbors; None keeps the usual rule.
-        extend_outlier_mask=False disables either kind of extension.
+        For mixture masking, mask_velocity="auto" (default) uses half the largest
+        broadening-kernel FWHM across components and regions with nonzero stellar
+        light. It reads prediction['params'], prints the adopted value in km/s,
+        and uses this one shared additional half-width around every original
+        flagged pixel. Numeric mask_velocity overrides it directly, using
+        c * abs(log(wavelength / flagged_wavelength)) <= mask_velocity within
+        each region. extension_factor does not scale either velocity width.
+        Zero adds no neighbors; None uses the legacy run-length extension with
+        extension_factor. extend_outlier_mask=False disables extension and skips
+        FWHM calculation. Custom predictions without physical params or operators
+        without measurable kernels require an explicit mask_velocity for extension.
         After a mixture call, ``outlier_diagnostics`` contains
         mismatch_probability (NaN on fixed masks), mismatch_fraction,
         mismatch_scale, and normal_residual_variance from that masking pass.
         probability_source is 'model' or 'residual_fit'. Model probabilities
         retain the prediction's mixture parameters (None if a custom model
         omits them); no residual-fit parameters are substituted.
+        Diagnostics also record the actual mask_velocity in km/s (None for
+        run-length extension, 0 when disabled), mask_velocity_source ('auto',
+        'explicit', 'run_length' or 'disabled'), and max_kernel_fwhm (only for
+        auto; otherwise None). The automatic factor is fixed at 0.5.
         These diagnostics are a snapshot, not recomputed when the mask changes.
         Mixture plots use the same layout, with physical residuals in the middle,
         probabilities and their threshold at the bottom, and a histogram of
         residual/sqrt(V) on the right, stacking retained and masked counts.
+        Each region's title shows the recorded mask padding in km/s and its
+        auto/explicit source, or identifies run-length/disabled extension.
         Smooth overlays show the weighted normal and outlier densities and
         their sum, accounting for each pixel's V. Densities are scaled by the
         before-clipping pixel count and bin width. They use all pixels outside
@@ -654,6 +666,7 @@ class SpecFit:
             from numpyro import handlers
             from ._outliers import (
                 _normal_residual_variance, _fit_gaussian_mixture, _plot_mixture_outliers,
+                _max_broadening_fwhm,
             )
 
             threshold = np.asarray(p_outlier)
@@ -661,9 +674,14 @@ class SpecFit:
                 raise ValueError("p_outlier must be finite in [0, 1]")
             factor = _positive(
                 extension_factor, "extension_factor", allow_zero=True)
-            if mask_velocity is not None:
-                mask_velocity = _positive(
-                    mask_velocity, "mask_velocity", allow_zero=True)
+            automatic_velocity = isinstance(mask_velocity, str) and mask_velocity == "auto"
+            if mask_velocity is not None and not automatic_velocity:
+                try:
+                    mask_velocity = _positive(
+                        mask_velocity, "mask_velocity", allow_zero=True)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("mask_velocity must be 'auto', None, or a finite "
+                                     "nonnegative scalar in km/s") from exc
             # Capture the already-replayed fitted noise sites; no new samples.
             with handlers.trace() as trace:
                 prediction = self.predict(point=point, model=model)
@@ -704,7 +722,17 @@ class SpecFit:
                         self.observation.flux[~fixed] - baseline[~fixed], variance[~fixed])
                 source = "residual_fit"
             flags = probability > float(threshold)
+            max_kernel_fwhm = None
             if extend_outlier_mask:
+                if automatic_velocity:
+                    if "params" not in prediction:
+                        raise ValueError("automatic mask_velocity requires physical params in "
+                                         "model prediction; supply an explicit mask_velocity")
+                    max_kernel_fwhm = _max_broadening_fwhm(self.specmodel, prediction["params"])
+                    mask_velocity = .5 * max_kernel_fwhm
+                    velocity_source = "auto"
+                else:
+                    velocity_source = "run_length" if mask_velocity is None else "explicit"
                 if mask_velocity is None:
                     flags = np.stack([_extend_mask(row, factor)
                                      for row in _rows(flags)]).reshape(fixed.shape)
@@ -720,12 +748,19 @@ class SpecFit:
                         for start, end in zip(left, right):
                             row[start:end] = True
                 flags &= ~fixed
+            else:
+                mask_velocity, velocity_source = 0., "disabled"
             diagnostics = dict(fitted, method=method, probability_source=source,
                                p_outlier=float(threshold),
                                mismatch_probability=probability,
-                               normal_residual_variance=variance)
+                               normal_residual_variance=variance,
+                               mask_velocity=mask_velocity, mask_velocity_source=velocity_source,
+                               max_kernel_fwhm=max_kernel_fwhm)
             self.set_fit_mask(flags)
             self.outlier_diagnostics = diagnostics
+            if velocity_source == "auto":
+                print(f"mask_velocity = {mask_velocity:.6g} km/s "
+                      f"(auto: 0.5 × max kernel FWHM {max_kernel_fwhm:.6g} km/s)")
             if plot or save_path is not None:
                 _plot_mixture_outliers(self.observation, baseline, self.fit_mask,
                                        self.regions, diagnostics, save_path=save_path, keep_open=plot)

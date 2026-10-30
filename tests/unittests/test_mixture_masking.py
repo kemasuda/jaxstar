@@ -104,7 +104,9 @@ def test_mixture_prediction_reused_without_refitting_and_old_flags_reconsidered(
         old[..., [20, 50]] = True  # A good and a bad pixel, both previously excluded.
         fit.set_fit_mask(old)
         fixed = fit.observation.mask.copy()
-        predicted = np.asarray(fit.predict(point=point, model=model)["mismatch_probability"])
+        prediction = fit.predict(point=point, model=model)
+        predicted = np.asarray(prediction["mismatch_probability"])
+        velocity = .5 * float(np.max(fit.specmodel.broadening_fwhm(prediction["params"])))
         assert np.all(predicted[..., 50] > .99) and np.all(predicted[..., 20] < .5)
 
         def no_refit(*args, **kwargs):
@@ -116,7 +118,7 @@ def test_mixture_prediction_reused_without_refitting_and_old_flags_reconsidered(
         for wavelengths, q, row in zip(np.atleast_2d(fit.observation.wavelength),
                                        np.atleast_2d(predicted), np.atleast_2d(expected)):
             distances = _C_KMS * np.abs(np.log(wavelengths[:, None] / wavelengths[q > .5]))
-            row[:] = np.any(distances <= (10. if extend else 0.), axis=1)
+            row[:] = np.any(distances <= (velocity if extend else 0.), axis=1)
         np.testing.assert_array_equal(flags, expected & ~fixed)
         assert flags[..., 50].all() and not flags[..., 20].any()
         diagnostics = fit.outlier_diagnostics
@@ -293,9 +295,8 @@ def test_velocity_extension_on_nonuniform_wavelengths(single, velocity, extend, 
                         lambda *args: ({}, q[~fixed]))
     model = SimpleNamespace(predict=lambda *args: {
         "model_flux": np.ones(q.shape), "normal_residual_variance": np.ones(q.shape)})
-    options = {} if velocity == 10. else {"mask_velocity": velocity}
     flags = fit.mask_outliers(point={}, model=model, method="gaussian_mixture",
-                              extension_factor=100., extend_outlier_mask=extend, **options)
+                              extension_factor=100., extend_outlier_mask=extend, mask_velocity=velocity)
     expected = []
     for wavelengths, probabilities in zip(wave, np.atleast_2d(q)):
         distance = _C_KMS * np.abs(np.log(wavelengths[:, None] / wavelengths[probabilities > .5]))
@@ -308,7 +309,7 @@ def test_velocity_extension_on_nonuniform_wavelengths(single, velocity, extend, 
     assert fit.outlier_diagnostics["p_outlier"] == .5
 
 
-@pytest.mark.parametrize("value", [-1., np.nan, np.inf, [10.]])
+@pytest.mark.parametrize("value", [-1., np.nan, np.inf, [10.], "automatic", "10"])
 def test_invalid_mask_velocity_preserves_mask(value):
     fit, point, model, calls = custom_case()
     before = fit.fit_mask.copy()
@@ -334,9 +335,9 @@ def test_mixture_fit_null_case_and_flux_rescaling():
 
 def test_default_is_gaussian_mixture():
     fit, point, model, _ = custom_case()
-    expected = fit.mask_outliers(point=point, model=model, method="gaussian_mixture").copy()
+    expected = fit.mask_outliers(point=point, model=model, method="gaussian_mixture", mask_velocity=10.).copy()
     fit.reset_fit_mask()
-    actual = fit.mask_outliers(point=point, model=model)
+    actual = fit.mask_outliers(point=point, model=model, mask_velocity=10.)
     np.testing.assert_array_equal(actual, expected)
     assert fit.outlier_diagnostics["method"] == "gaussian_mixture"
 
@@ -367,7 +368,7 @@ def test_probabilities_plot_and_fully_masked(tmp_path):
 
     fit, point, model, _ = custom_case()
     before = set(plt.get_fignums())
-    fit.mask_outliers(point=point, model=model, method="gaussian_mixture", plot=True)
+    fit.mask_outliers(point=point, model=model, method="gaussian_mixture", mask_velocity=10., plot=True)
     figure = plt.gcf()
     assert len(figure.axes) == 4
     upper, middle, lower, histogram = figure.axes
@@ -385,11 +386,11 @@ def test_probabilities_plot_and_fully_masked(tmp_path):
     assert middle.get_shared_x_axes().joined(upper, lower)
     plt.close(figure)
     fit.mask_outliers(point=point, model=model, method="gaussian_mixture",
-                      save_path=tmp_path / "mask.png")
+                      mask_velocity=10., save_path=tmp_path / "mask.png")
     assert (tmp_path / "mask_region8.png").is_file()
     assert set(plt.get_fignums()) == before
     fit.observation = replace(fit.observation, mask=np.ones(fit.observation.shape, bool))
     fit.mask_outliers(point=point, model=model, method="gaussian_mixture",
-                      save_path=tmp_path / "all_masked.png")
+                      mask_velocity=10., save_path=tmp_path / "all_masked.png")
     assert not fit.fit_mask.any()
     assert np.isnan(fit.outlier_diagnostics["mismatch_probability"]).all()

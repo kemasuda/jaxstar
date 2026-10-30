@@ -3,6 +3,32 @@
 import numpy as np
 
 
+def _max_broadening_fwhm(specmodel, params):
+    """Largest kernel FWHM over component/region pairs with nonzero light."""
+    try:
+        components = specmodel._components(params)
+        weights, _, _, _ = specmodel._fractions(
+            params, len(components), specmodel.spectra.wavelength.dtype)
+        active = np.asarray(weights) > 0
+        # Entirely dark components need not even have measurable kernels.
+        selected = np.any(active, axis=1)
+        kernel_params = {
+            "components": tuple(c for c, keep in zip(components, selected) if keep),
+            "instrument": params.get("instrument", {}),
+        }
+        widths = np.asarray(specmodel.broadening_fwhm(kernel_params))
+        active = active[selected]
+        if widths.shape != active.shape:
+            raise ValueError("kernel FWHM must have shape (component, region)")
+        widths = widths[active]
+        if widths.size == 0 or not np.all(np.isfinite(widths) & (widths >= 0)):
+            raise ValueError("contributing kernel FWHMs must be finite and nonnegative")
+        return float(np.max(widths))
+    except (KeyError, TypeError, ValueError, NotImplementedError) as exc:
+        raise ValueError(f"cannot determine automatic mask_velocity: {exc}; "
+                         "supply an explicit mask_velocity") from exc
+
+
 def _normal_residual_variance(observation, prediction, model, trace):
     """Read the fitted normal covariance only when mixture masking is requested."""
     from .continuum import _region_jitter
@@ -122,6 +148,14 @@ def _plot_mixture_outliers(observation, baseline, fit_mask, regions, diagnostics
     import matplotlib.pyplot as plt
 
     output = Path(save_path) if save_path is not None else None
+    velocity_source = diagnostics["mask_velocity_source"]
+    if velocity_source in ("auto", "explicit"):
+        padding_label = (f"mask padding: ±{diagnostics['mask_velocity']:.2g} km/s "
+                         f"({velocity_source})")
+    elif velocity_source == "run_length":
+        padding_label = "mask padding: run-length extension"
+    else:
+        padding_label = "mask padding: disabled"
     arrays = [np.atleast_2d(value) for value in (
         observation.wavelength, observation.flux, observation.mask, baseline,
         fit_mask, diagnostics["normal_residual_variance"], diagnostics["mismatch_probability"])]
@@ -144,7 +178,8 @@ def _plot_mixture_outliers(observation, baseline, fit_mask, regions, diagnostics
             ax.plot(wave[flags], values[flags], "o", color="salmon", ms=3, label="fit mask")
         upper.plot(wave, model_flux, color="C0", lw=1,
                     label="physical spectrum × continuum")
-        upper.set(title=f"Region {region}: Gaussian-mixture outlier check", ylabel="Flux")
+        upper.set(title=f"Region {region}: Gaussian-mixture outlier check\n{padding_label}",
+                  ylabel="Flux")
         upper.legend(fontsize=8)
         middle.axhline(0., color="C0", lw=.5)
         normal_band = middle.fill_between(wave, -scale, scale, color="C0", alpha=.15,

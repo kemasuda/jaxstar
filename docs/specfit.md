@@ -635,11 +635,12 @@ alone do not guarantee that the kernel tails fit inside its support. Custom
 For a completed fitted point, obtain physical parameters with
 `params = sf.specmodel.make_params(p_fit)`, then call
 `sf.specmodel.broadening_fwhm(params)`. Neither conversion nor width calculation
-needs a spectrum prediction. Choosing the dilation factor is separate: for a single
-component and region, `mask_velocity=0.5 * float(fwhm_kms[0, 0])` adds one HWHM
-on each side of the detected pixels. `mask_outliers` currently takes a scalar
-`mask_velocity`; using multiple widths requires explicitly choosing a shared
-value. This method does not update the fit mask.
+needs a spectrum prediction. Calling `broadening_fwhm` does not update the fit
+mask. Mixture `mask_outliers` defaults to `mask_velocity="auto"`: it uses half
+the largest kernel FWHM over component/region pairs with nonzero stellar light
+as one shared additional half-width. A numeric `mask_velocity` overrides this
+value in km/s. For example, `mask_velocity=0.5 * float(fwhm_kms[0, 0])` explicitly
+uses half the first component/region's FWHM.
 
 ### Fixed two-Gaussian instrumental profile
 
@@ -1016,8 +1017,9 @@ sf.plot_models(model=prefit_model, point=prefit_point, show_mismatch=True)
 # This separate call changes the fit mask using the prefit probabilities.
 sf.mask_outliers(
     model=prefit_model, point=prefit_point, method="gaussian_mixture",
-    p_outlier=.5, mask_velocity=10.,
+    p_outlier=.5,  # Default: auto half-FWHM extension; prints the adopted km/s.
 )
+mask_velocity_used = sf.outlier_diagnostics["mask_velocity"]
 ```
 
 `model_kwargs` forwards factory settings, including physical priors, fixed
@@ -1064,8 +1066,9 @@ transition, a final SVI and NUTS run.
 ### Outlier plots
 
 `mask_outliers` defaults to `method="gaussian_mixture"`, with `p_outlier=0.5`
-and `mask_velocity=10.` km/s. Calls that omit `method` now use mixture masking
-and can produce different masks than earlier versions. To retain the legacy
+and `mask_velocity="auto"` (half the maximum contributing kernel FWHM).
+To retain the previous fixed velocity padding, specify `mask_velocity=10.`.
+Calls that omit `method` use mixture masking. To retain the legacy
 median-filter/MAD method, select `method="sigma_clip"` explicitly.
 
 For a legacy sigma-clipping quicklook, enable plotting when updating the fit mask:
@@ -1140,7 +1143,7 @@ after SVI with `likelihood="gaussian_mixture"`:
 
 ```python
 sf.mask_outliers(point=p_fit, model=model, method="gaussian_mixture",
-                 p_outlier=0.5, mask_velocity=10., plot=True)
+                 p_outlier=0.5, plot=True)
 ```
 
 This only applies the probability threshold and mask extension. It preserves
@@ -1152,18 +1155,51 @@ residual fit. `method="sigma_clip"` ignores these probabilities and retains its
 existing behavior.
 
 Pixels with `q > p_outlier` are flagged. For mixture masking, the default
-`mask_velocity=10.` extends each original flagged pixel by ±10 km/s within its
-region, using log-wavelength distances. Overlapping windows are combined
-without recursive extension.
-`mask_velocity=None` uses the legacy `extension_factor`; zero adds no neighbors,
-and `extend_outlier_mask=False` disables extension. `mask_velocity` applies only
-to the mixture method and is separate from the sigma-clipping filter's `mask_v`.
+`mask_velocity="auto"` computes kernel FWHMs from the existing prediction's
+physical `params`, using the model's actual broadening and fixed IP when present.
+It takes **half the maximum FWHM** across components and regions with nonzero
+stellar light, and applies that single velocity to every region. Entirely dark
+components are skipped; individual zero-weight component/region pairs do not
+contribute to the maximum. RV separation and intrinsic line widths are not part
+of this kernel width. This is a padding heuristic, not a bound on line extent.
+
+Auto prints the adopted additional half-width once, for example:
+
+```text
+mask_velocity = 8.4 km/s (auto: 0.5 × max kernel FWHM 16.8 km/s)
+```
+
+Each region's plot also shows the recorded padding, for example
+`mask padding: ±8.4 km/s (auto)` or `(explicit)` for a numeric override.
+Run-length extension and disabled extension are labeled accordingly.
+
+No extra prediction is needed. Auto requires physical `params` in the prediction
+and measurable kernels. If unavailable (for example, a custom broadening
+operator), the call requests an explicit `mask_velocity` and leaves the mask
+unchanged; it does not fall back to an arbitrary velocity.
+
+A numeric override such as `mask_velocity=10.` extends each original flagged
+pixel by ±10 km/s within its region, using log-wavelength distances. Overlapping
+windows are combined without recursive extension. The width is **additional**:
+a detected interval of width L gains about twice the specified velocity width.
+`extension_factor` does not scale auto or explicit velocity padding. Its default
+remains 1.0 and it still controls legacy run-length extension when
+`mask_velocity=None`, and sigma-clipping extension. Zero adds no neighbors.
+`extend_outlier_mask=False` disables extension and skips FWHM calculation.
+`mask_velocity` applies only to the mixture method and is separate from the
+sigma-clipping filter's `mask_v`.
 As with sigma clipping, fixed masked pixels are excluded and previous fit-mask
 pixels are reconsidered. Probabilities are NaN on fixed
 masks. `outlier_diagnostics` also records `mismatch_fraction`, `mismatch_scale`,
 and `normal_residual_variance` from that call. `probability_source` is `"model"`
 when probabilities are supplied by the prediction, or `"residual_fit"` when a
-mixture is fitted to the residuals. The diagnostics are a snapshot of the
+mixture is fitted to the residuals. The actual additional half-width in km/s is
+`outlier_diagnostics["mask_velocity"]`: a scalar for velocity padding, `None`
+for run-length extension, and 0 when extension is disabled. `mask_velocity_source`
+is respectively `"auto"`, `"explicit"`, `"run_length"` or `"disabled"`.
+`max_kernel_fwhm` records the maximum used by auto and is otherwise `None`.
+The stored full-precision velocity can be passed explicitly to reproduce the
+padding. The diagnostics are a snapshot of the
 probabilities and parameters actually used for that pass. These are conditional
 classification probabilities treating pixels independently, not a replacement
 for the correlated GP fit. `sigma_threshold` and `mask_v` apply only to sigma
