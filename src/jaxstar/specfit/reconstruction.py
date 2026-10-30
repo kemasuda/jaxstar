@@ -9,8 +9,8 @@ from .continuum import _region_jitter, chebyshev_basis, continuum_posterior, eva
 from .likelihood import gp_continuum_posterior, gp_conditional_mean, gaussian_mixture_responsibility
 
 
-def _mean_prediction(predict, samples, *, max_draws):
-    """Average curves and summarize continuum/GP means across draws on the host."""
+def _posterior_draws(samples, *, max_draws):
+    """Validate flattened samples and select evenly spaced draw indices."""
     if not isinstance(samples, Mapping) or not samples:
         raise ValueError("samples must be a nonempty dict with a leading draw axis")
     samples = {name: np.asarray(value) for name, value in samples.items()}
@@ -25,6 +25,12 @@ def _mean_prediction(predict, samples, *, max_draws):
             raise ValueError("max_draws must be a positive integer or None")
         count = min(count, max_draws)
     indices = np.linspace(0, len(next(iter(samples.values()))) - 1, count, dtype=int)
+    return samples, indices
+
+
+def _mean_prediction(predict, samples, *, max_draws):
+    """Average curves and summarize continuum/GP means across draws on the host."""
+    samples, indices = _posterior_draws(samples, max_draws=max_draws)
     curve_names = ("physical_flux", "continuum", "model_flux", "mean_flux", "gp_mean",
                    "mismatch_probability")
     means = {}

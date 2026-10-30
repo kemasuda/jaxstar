@@ -1031,6 +1031,64 @@ class SpecFit:
             plots.append((fig, axes))
         return plots
 
+    def ccf_diagnostics(self, *, point=None, samples=None, model, max_draws=50,
+                        ccfvmax=100., velocity_step=1., weighting="uniform"):
+        """Compare observed and fitted CCFs using the same intrinsic template.
+
+        Supply exactly one of point or flattened samples, as for predict.
+        The paired reconstruction must return params (one stellar component,
+        including RV), continuum and model_flux. Divide both observed flux and
+        model_flux by the fitted positive continuum. The GP mean is neither
+        added to the model nor subtracted from the data. Thus this diagnoses
+        the physical spectral fit, including discrepancies absorbed by the GP.
+
+        At each trial RV, interpolate the intrinsic template onto the original
+        usable observation pixels with the relativistic Doppler shift. No data
+        interpolation bridges masked gaps. Both curves use the effective mask,
+        the same pixels at every lag and weighted mean subtraction. weighting
+        is 'uniform' or 'inverse_variance' (continuum-corrected observational
+        errors only, without jitter or GP covariance). Template coverage must
+        include every usable pixel at all trial shifts; otherwise reduce
+        ccfvmax or prepare wider regions.
+
+        Velocity offsets span +/- ccfvmax around the fitted component RV in
+        each region. Zero is included; spacing is at most velocity_step km/s.
+        Curves are not aligned to their individual peaks. For samples, use
+        predict's max_draws selection, compute each pair with that draw's
+        template, continuum and RV, then average before scaling. These are
+        mean diagnostic curves, not uncertainty bands or independent tests.
+
+        Return one dict per region: region, velocity, data_ccf, model_ccf,
+        residual (data minus model), normalization, n_pixels and draw_indices
+        (None for a point). Both CCFs share the positive model peak as their
+        normalization, retaining relative amplitudes. CCF widths include the
+        template width; these are not broadening kernels. This method leaves
+        masks and the initial-RV check_ccf diagnostics unchanged.
+        """
+        from ._ccf import ccf_diagnostics
+
+        return ccf_diagnostics(
+            self, point=point, samples=samples, model=model, max_draws=max_draws,
+            ccfvmax=_positive(ccfvmax, "ccfvmax"),
+            velocity_step=_positive(velocity_step, "velocity_step"), weighting=weighting)
+
+    def plot_ccf(self, *, point=None, samples=None, model, max_draws=50,
+                 ccfvmax=100., velocity_step=1., weighting="uniform", save_path=None):
+        """Plot paired post-fit CCFs above data-minus-model residuals.
+
+        Calls ccf_diagnostics; see it for normalization, masks, continuum,
+        velocity and posterior-draw conventions. Return [(fig, axes), ...]
+        in region order, with two shared-x axes per figure. save_path follows
+        plot_models: 'ccf.png' writes 'ccf_region8.png', etc., with URL-escaped
+        labels and Matplotlib's default format when no extension is supplied.
+        """
+        from ._ccf import plot_ccf
+
+        diagnostics = self.ccf_diagnostics(
+            point=point, samples=samples, model=model, max_draws=max_draws,
+            ccfvmax=ccfvmax, velocity_step=velocity_step, weighting=weighting)
+        return plot_ccf(diagnostics, save_path=save_path)
+
     def plot_mcmc_diagnostics(self, result, **kwargs):
         """Plot all sampled sites by default; return trace and corner Figures.
 

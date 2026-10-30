@@ -1260,6 +1260,61 @@ both pixels usable, without bridging masked gaps. The return fields remain
 `region`, `n_usable`, `rms`, `mad_scale`, `standardized_rms`, `n_gt_3sigma`,
 `n_gt_5sigma`, `n_adjacent_pairs` and `lag1_correlation`.
 
+### Post-fit CCF comparison
+
+Compare the observed and fitted line profiles using the same intrinsic-spectrum
+template, without fitting a new broadening kernel:
+
+```python
+plots = sf.plot_ccf(point=p_fit, model=model, ccfvmax=100.)
+# Or average paired CCFs over up to 50 posterior draws:
+plots = sf.plot_ccf(samples=mcmc.get_samples(), model=model, max_draws=50,
+                    save_path="ccf.png")
+# Numerical curves without making figures:
+diagnostics = sf.ccf_diagnostics(point=p_fit, model=model)
+```
+
+Each region has two panels: observed/model CCFs above, data minus model below.
+`plot_ccf` returns `[(fig, axes), ...]`, as does `plot_models`; `save_path` writes
+`ccf_region8.png`, etc., with URL-escaped region labels and the default Matplotlib
+format when the extension is omitted. The velocity axis is an offset from the
+fitted RV in each region, spanning `+/- ccfvmax` km/s with zero included and a
+spacing no greater than `velocity_step` (default 1 km/s). Neither curve is
+recentered on its own peak, so RV discrepancies remain visible. Masks, blends
+and an asymmetric instrumental profile can put the model peak away from zero.
+
+Both observed flux and `model_flux` are divided by the same fitted continuum.
+The intrinsic template at the fitted atmosphere is shifted onto the original
+usable observation pixels; data are not interpolated across masked gaps.
+Fixed and fit masks are both respected. All lags use the same pixels and weights,
+with weighted means subtracted from each spectrum and shifted template before
+taking their cross product. The default `weighting="uniform"` gives equal weight
+to usable pixels; `weighting="inverse_variance"` uses continuum-corrected
+observational errors, excluding jitter and GP covariance. Template coverage must
+include every usable pixel at every trial RV; otherwise reduce `ccfvmax` or
+prepare wider spectral regions. This definition is separate from the historical
+`check_ccf` used for initial RV/width estimates, which is unchanged.
+
+Both curves are divided by the **same model CCF peak**, retaining relative
+amplitude as well as shape differences. The GP conditional mean is neither
+added to the model nor removed from the observations, so mismatches absorbed by
+the GP remain visible. CCF widths include the template's intrinsic line widths;
+these curves are not measurements of the broadening kernel. The residual panel
+is a visual diagnostic, not a chi-squared statistic or an independent fit test.
+
+For samples, each pair uses that draw's template, continuum and fitted RV;
+the cross products are averaged before applying the shared normalization.
+`max_draws` selects evenly spaced draws as in `predict`, and `None` uses all
+draws. No uncertainty bands or fresh observational noise are computed.
+`ccf_diagnostics` returns one dictionary per region, with `region`, `velocity`,
+`data_ccf`, `model_ccf`, `residual`, `normalization` (the unscaled model peak),
+`n_pixels`, and `draw_indices` (`None` for a point).
+
+The reconstruction callback must return `params` with one stellar component and
+its scalar/per-region `rv`, a positive `continuum`, and `model_flux`. Built-in
+single-star models supply these, including when `SpecModel` uses `fixed_ip`.
+The helpers leave masks and the stored initial-RV diagnostics `sf.ccf` unchanged.
+
 ### Predictions and plots
 
 `predict` accepts exactly one of `point` or `samples`, together with `model`.
