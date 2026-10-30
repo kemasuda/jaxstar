@@ -121,6 +121,16 @@ def combined_kernel(varr, vmacro, vsini, u1, u2, beta, Nt=500, *, ip_fourier=Non
     return kernel / jnp.sum(kernel)
 
 
+def _default_kernels(*, broadening, resolving_power, velocity_grid, ip_fourier=None):
+    """Build the same region kernels for convolution and width diagnostics."""
+    return jax.vmap(
+        lambda velocity, vmacro, vsini, u1, u2, resolution, ip: combined_kernel(
+            velocity, vmacro, vsini, u1, u2, gaussian_sigma(resolution), ip_fourier=ip),
+        in_axes=(0, 0, 0, 0, 0, 0, None if ip_fourier is None else 0),
+    )(velocity_grid, broadening["vmacro"], broadening["vsini"], broadening["u1"],
+      broadening["u2"], resolving_power, ip_fourier)
+
+
 def default_broadening(wavelength, flux, *, broadening, resolving_power, velocity_grid,
                        ip_fourier=None):
     """Apply the combined kernel once per region, returning valid (wave, flux).
@@ -133,13 +143,8 @@ def default_broadening(wavelength, flux, *, broadening, resolving_power, velocit
     The built-in operator alone also accepts precomputed ip_fourier with shape
     (region, kernel_pixel), which replaces the resolving_power Gaussian.
     """
-    def one(row, vsini, vmacro, u1, u2, resolution, velocity, ip):
-        kernel = combined_kernel(velocity, vmacro, vsini, u1, u2, gaussian_sigma(resolution),
-                                 ip_fourier=ip)
-        return jnp.convolve(row, kernel, mode="valid")
-
-    values = jax.vmap(one, in_axes=(0, 0, 0, 0, 0, 0, 0, None if ip_fourier is None else 0))(
-        flux, broadening["vsini"], broadening["vmacro"], broadening["u1"], broadening["u2"],
-        resolving_power, velocity_grid, ip_fourier)
+    kernels = _default_kernels(broadening=broadening, resolving_power=resolving_power,
+                               velocity_grid=velocity_grid, ip_fourier=ip_fourier)
+    values = jax.vmap(lambda row, kernel: jnp.convolve(row, kernel, mode="valid"))(flux, kernels)
     half = velocity_grid.shape[-1] // 2
     return wavelength[:, half:-half], values

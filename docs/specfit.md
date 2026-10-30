@@ -483,7 +483,8 @@ data are external inputs.
 ### Predict a physical spectrum
 
 `SpecModel` interpolates the atmosphere, applies rotation, radial-tangential
-macroturbulence and Gaussian instrumental broadening, then shifts by the
+macroturbulence and instrumental broadening (resolving-power Gaussian or
+`fixed_ip` with the built-in operator), then shifts by the
 relativistic RV and samples the requested wavelengths:
 
 ```python
@@ -514,6 +515,35 @@ For multiple stars, supply a tuple of `components` plus nonnegative
 `specmodel.decompose` returns the individual and weighted spectra. The
 [SpecModel tutorial](tutorials/specfit/specmodel.ipynb) includes SB2/SB3
 examples. Use a custom NumPyro model to fit multiple stellar components.
+
+#### Broadening kernel FWHM
+
+Get the combined broadening width directly from the physical parameter dict:
+
+```python
+fwhm_kms = specmodel.broadening_fwhm(params)  # shape (n_component, n_region)
+```
+
+This uses the same rotation/macroturbulence/instrumental kernels as the spectrum,
+on the model's velocity grid. It automatically uses `fixed_ip` when configured;
+no resolving power or Gaussian approximation is needed in that mode. The
+returned JAX array retains both axes even for one star or one region. JIT is
+supported. Only each component's `broadening` and the configured instrument
+parameters are needed; atmosphere, RV, flux weights and dilution are ignored.
+These are per-component kernel widths, excluding intrinsic line widths and
+separation between stars' radial velocities.
+
+FWHM is measured by linear interpolation of the two half-maximum crossings.
+Asymmetric profiles are supported when the part at or above half maximum is
+one connected interval. Disconnected intervals and crossings outside the
+velocity grid raise errors instead of assigning an ambiguous width. Exactly
+disabled broadening returns zero. Resolve nonzero widths with fine enough
+model velocity sampling, and check convergence with `vmax`; bracketed crossings
+alone do not guarantee that the kernel tails fit inside its support. Custom
+`broadening_operator` callables do not expose kernels, so this method raises
+`NotImplementedError` for them.
+
+Calling `broadening_fwhm` does not update the fit mask.
 
 ### Fixed two-Gaussian instrumental profile
 

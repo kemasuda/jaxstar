@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._data import _SpectralLibrary
-from .broadening import default_broadening, double_gaussian_fourier
+from .broadening import _default_kernels, default_broadening, double_gaussian_fourier
 from .ip_calibration import _IP_PARAMETERS, _fixed_ip_values
 from .sampling import _C_KMS, is_log_uniform
 
@@ -41,6 +41,32 @@ def _region_parameter(value, name, count):
     if value.shape != (count,):
         raise ValueError(f"{name} must be scalar or shape ({count},), got {value.shape}")
     return value
+
+
+def _kernel_fwhm(velocity, kernel):
+    """Measure one bounded half-maximum interval per region, without a fit."""
+    peak = jnp.max(kernel, axis=-1, keepdims=True)
+    _require(jnp.all(jnp.isfinite(kernel)) & jnp.all(peak > 0),
+             "kernel FWHM requires finite kernels with positive peaks")
+    half = peak / 2
+    above = kernel >= half
+    _require(jnp.all(~above[:, 0] & ~above[:, -1]),
+             "kernel half-maximum crossings are outside the velocity grid; "
+             "increase SpecModel vmax and check support convergence")
+    rising = ~above[:, :-1] & above[:, 1:]
+    falling = above[:, :-1] & ~above[:, 1:]
+    _require(jnp.all(jnp.sum(rising, axis=-1) == 1)
+             & jnp.all(jnp.sum(falling, axis=-1) == 1),
+             "kernel FWHM is ambiguous: multiple intervals at half maximum")
+    rows = jnp.arange(kernel.shape[0])
+
+    def crossing(transitions):
+        index = jnp.argmax(transitions, axis=-1)
+        y0, y1 = kernel[rows, index], kernel[rows, index + 1]
+        x0, x1 = velocity[rows, index], velocity[rows, index + 1]
+        return x0 + (half[:, 0] - y0) * (x1 - x0) / (y1 - y0)
+
+    return crossing(falling) - crossing(rising)
 
 
 def _doppler_factor(rv):
@@ -305,17 +331,17 @@ class SpecModel:
                  "requested wavelengths must be positive finite and strictly increasing per region")
         return wavelength, single
 
-    def _broaden(self, component, params, flux):
+    def _broadening_parameters(self, component, params):
         count = self.spectra.wavelength.shape[0]
-        if not isinstance(component.get("broadening"), Mapping):
-            raise ValueError("broadened/full require component.broadening with vsini/vmacro/u1/u2")
+        if not isinstance(component, Mapping) or not isinstance(component.get("broadening"), Mapping):
+            raise ValueError("broadening requires component.broadening with vsini/vmacro/u1/u2")
         names = ("vsini", "vmacro", "u1", "u2")
         if set(component["broadening"]) != set(names):
             raise ValueError("broadening must supply exactly vsini, vmacro, u1, u2")
         broad = {name: _region_parameter(component["broadening"][name], name, count) for name in names}
         if self._fixed_ip is None:
             if not isinstance(params.get("instrument"), Mapping) or "resolving_power" not in params["instrument"]:
-                raise ValueError("broadened/full require instrument.resolving_power")
+                raise ValueError("broadening requires instrument.resolving_power")
             resolution = _region_parameter(params["instrument"]["resolving_power"], "resolving_power", count)
         else:
             instrument = params.get("instrument", {})
@@ -331,6 +357,11 @@ class SpecModel:
         if self.broadening_operator is default_broadening:
             _require(jnp.all(broad["vsini"] <= self.velocity_grid[:, -1]),
                      "vsini exceeds broadening support; increase SpecModel vmax")
+        return broad, resolution
+
+    def _broaden(self, component, params, flux):
+        count = self.spectra.wavelength.shape[0]
+        broad, resolution = self._broadening_parameters(component, params)
         ip_options = {} if self._fixed_ip is None else {"ip_fourier": self._ip_fourier}
         wave, values = self.broadening_operator(self.spectra.wavelength, flux,
             broadening=broad, resolving_power=resolution, velocity_grid=self.velocity_grid, **ip_options)
@@ -401,8 +432,44 @@ class SpecModel:
         return self._evaluate(params, wavelength, "intrinsic")
 
     def broadened(self, params, wavelength):
-        """Compose combined stellar/Gaussian-broadened spectra; no RV."""
+        """Compose combined stellar/instrument-broadened spectra; no RV."""
         return self._evaluate(params, wavelength, "broadened")
+
+    def broadening_fwhm(self, params):
+        """Return combined-kernel FWHM in km/s, shape (component, region).
+
+        Use the model's velocity grid and the same kernels as spectral
+        broadening, including rotation, radial-tangential macroturbulence and
+        either the resolving-power IP or fixed_ip. No Gaussian fit or
+        Gaussian-equivalent width is used. Only component.broadening and,
+        without fixed_ip, instrument.resolving_power are required. Atmosphere,
+        RV, flux weights and dilution do not enter these per-component widths.
+
+        Half-maximum crossings are linearly interpolated on the sampled
+        kernels. Exactly disabled broadening returns zero. For nonzero widths,
+        resolve the kernel with sufficiently fine model velocity sampling and
+        check convergence with vmax; broadening of intrinsic lines is excluded.
+        Disconnected intervals at half maximum or unbracketed crossings raise
+        an error. Asymmetric kernels with one half-maximum interval are valid.
+        Custom broadening operators do not expose kernels and are unsupported.
+        The method supports JIT and retains both output axes for a single star
+        or region. It does not change any fit mask or choose a dilation factor.
+        """
+        if self.broadening_operator is not default_broadening:
+            raise NotImplementedError(
+                "broadening_fwhm requires the built-in broadening operator; "
+                "custom broadening operators do not expose kernels")
+        widths = []
+        for component in self._components(params):
+            broad, resolution = self._broadening_parameters(component, params)
+            kernel = _default_kernels(broadening=broad, resolving_power=resolution,
+                                      velocity_grid=self.velocity_grid, ip_fourier=self._ip_fourier)
+            width = _kernel_fwhm(self.velocity_grid, kernel)
+            if self._fixed_ip is None:
+                disabled = (broad["vsini"] == 0) & (broad["vmacro"] == 0) & jnp.isinf(resolution)
+                width = jnp.where(disabled, 0., width)
+            widths.append(width)
+        return jnp.stack(widths)
 
     def full(self, params, wavelength):
         """Compose combined-broadened, relativistic-RV-shifted spectra."""
