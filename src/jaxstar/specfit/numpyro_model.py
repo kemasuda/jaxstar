@@ -18,7 +18,7 @@ from .likelihood import (
     gp_marginalized_continuum_log_likelihood,
     marginalized_continuum_log_likelihood, prepare_gp_observation,
 )
-from .model import SpecModel, _require
+from .model import SpecModel, _limb_darkening_from_q, _require
 from .observation import Observation
 from .sampling import _C_KMS
 
@@ -174,12 +174,7 @@ def single_star_params(atmosphere, *, vsini, vmacro, q1, q2, rv, resolving_power
     Atmosphere coordinates are scalar; other values may be scalar or per region.
     Omit resolving_power when the SpecModel has a fixed_ip calibration.
     """
-    q1, q2 = jnp.asarray(q1), jnp.asarray(q2)
-    _require(jnp.all(jnp.isfinite(q1) & (q1 >= 0) & (q1 <= 1))
-             & jnp.all(jnp.isfinite(q2) & (q2 >= 0) & (q2 <= 1)),
-             "q1 and q2 must be finite in [0, 1]")
-    u1 = 2 * jnp.sqrt(q1) * q2
-    u2 = jnp.sqrt(q1) - u1
+    u1, u2 = _limb_darkening_from_q(q1, q2)
     return {"components": ({"atmosphere": dict(atmosphere),
                             "broadening": {"vsini": vsini, "vmacro": vmacro, "u1": u1, "u2": u2},
                             "rv": rv},), "instrument": (

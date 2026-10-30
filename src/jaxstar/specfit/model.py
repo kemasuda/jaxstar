@@ -15,6 +15,16 @@ from .ip_calibration import _IP_PARAMETERS, _fixed_ip_values
 from .sampling import _C_KMS, is_log_uniform
 
 
+_STELLAR_KEYS = frozenset(("vsini", "vmacro", "q1", "q2", "u1", "u2", "rv"))
+_SHARED_KEYS = frozenset(("resolving_power", "flux_weights", "dilution"))
+# Native sites from the built-in single-star model that do not enter the
+# physical spectrum. Keep this explicit so misspelled physical keys fail.
+_INFERENCE_KEYS = frozenset((
+    "sigma_constant", "sigma_continuum", "jitter", "gp_amplitude", "gp_scale",
+    "mismatch_fraction", "mismatch_scale", "continuum_coefficients", "model_flux",
+))
+
+
 def _require(condition, message):
     """Fail clearly for concrete inputs and for data-dependent compiled checks."""
     if not isinstance(condition, jax.core.Tracer):
@@ -32,6 +42,37 @@ def _require(condition, message):
         return jnp.int32(0)
 
     jax.lax.cond(condition, lambda _: jnp.int32(0), fail, operand=condition)
+
+
+def _limb_darkening_from_q(q1, q2):
+    """Shared physical conversion, independent of NumPyro and fit state."""
+    q1, q2 = jnp.asarray(q1), jnp.asarray(q2)
+    _require(jnp.all(jnp.isfinite(q1) & (q1 >= 0) & (q1 <= 1))
+             & jnp.all(jnp.isfinite(q2) & (q2 >= 0) & (q2 <= 1)),
+             "q1 and q2 must be finite in [0, 1]")
+    u1 = 2 * jnp.sqrt(q1) * q2
+    return u1, jnp.sqrt(q1) - u1
+
+
+def _parameter_array(value, name, shapes):
+    """Check the numerical input shape without requiring a physical stage."""
+    try:
+        array = jnp.asarray(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a real numeric value") from exc
+    if array.dtype.kind not in "fiu":
+        raise ValueError(f"{name} must be a real numeric value")
+    if array.shape not in shapes:
+        raise ValueError(f"{name} must have shape in {shapes}, got {array.shape}")
+    return array
+
+
+def _check_parameter_keys(values, allowed, context):
+    if not isinstance(values, Mapping):
+        raise TypeError(f"{context} must be a mapping")
+    unknown = values.keys() - allowed
+    if unknown:
+        raise ValueError(f"unexpected keys in {context}: {sorted(unknown, key=repr)}")
 
 
 def _region_parameter(value, name, count):
@@ -289,6 +330,109 @@ class SpecModel:
         cannot invalidate the precomputed Fourier factor. Rebuild to change IP.
         """
         return None if self._fixed_ip is None else dict(zip(_IP_PARAMETERS, self._fixed_ip))
+
+    def make_params(self, values):
+        """Convert flat physical values or a completed point to nested params.
+
+        For one star, pass a flat mapping of the grid's atmosphere coordinates,
+        vsini/vmacro, q1/q2 or u1/u2, rv, and resolving_power. For SB-N, pass
+        {"components": (star1, star2, ...), ...} with flat stellar mappings;
+        resolving_power, flux_weights and dilution belong only in the outer
+        mapping. All stars use this model's atmosphere grid. The result is the
+        existing component/instrument dict accepted by every physical method.
+
+        Atmosphere coordinates are scalar per star. Broadening, RV, resolving
+        power and dilution are scalar or (n_region,). Weights are (N,) or
+        (N, n_region); a tuple/list may mix scalar and per-region entries.
+        Omit resolving_power with fixed_ip. A single star defaults to weight
+        one and dilution zero at evaluation; composing multiple stars requires
+        explicit weights. No epoch or posterior-draw axis is inferred.
+
+        Both limb-darkening pairs must be complete when present. If both are
+        supplied, u1/u2 must match the q1/q2 conversion (rtol=1e-6, atol=1e-7);
+        the converted values are used. Remove the redundant pair before editing
+        limb darkening in a completed point.
+
+        The built-in inference sites sigma_constant, sigma_continuum, jitter,
+        gp_amplitude, gp_scale, mismatch_fraction, mismatch_scale,
+        continuum_coefficients and model_flux are ignored. Other unknown keys
+        raise. Custom site names must be mapped explicitly to physical names.
+
+        This checks keys, numeric shapes, limb-darkening consistency and IP
+        mode, but does not fill missing values or run interpolation, broadening,
+        a likelihood or a probabilistic model. Partial inputs are allowed:
+        each physical method checks the values it needs, so kernel FWHM needs
+        no atmosphere or RV. Physical range/coverage checks also remain in
+        those methods. Values are copied into new dicts with JAX-array leaves;
+        inputs are not mutated and JIT/autodiff are supported.
+        """
+        axes = self.spectra.grid.axis_names
+        reserved = _STELLAR_KEYS | _SHARED_KEYS | _INFERENCE_KEYS | {"components"}
+        if set(axes) & reserved:
+            raise ValueError("make_params requires atmosphere axis names distinct "
+                             "from stellar, shared and inference parameter names")
+        if not isinstance(values, Mapping):
+            raise TypeError("values must be a mapping")
+        if "components" in values:
+            _check_parameter_keys(values, _SHARED_KEYS | _INFERENCE_KEYS | {"components"},
+                                  "outer parameters")
+            stars = values["components"]
+            if not isinstance(stars, (tuple, list)) or not stars:
+                raise ValueError("components must be a nonempty tuple/list of flat mappings")
+        else:
+            _check_parameter_keys(values, set(axes) | _STELLAR_KEYS | _SHARED_KEYS | _INFERENCE_KEYS,
+                                  "single-star parameters")
+            stars = ({name: value for name, value in values.items() if name not in _SHARED_KEYS},)
+        components = tuple(self._make_component(star) for star in stars)
+        shapes = ((), (len(self.spectra.regions),))
+        instrument = {}
+        if "resolving_power" in values:
+            if self._fixed_ip is not None:
+                raise ValueError("omit resolving_power when SpecModel has fixed_ip")
+            instrument["resolving_power"] = _parameter_array(
+                values["resolving_power"], "resolving_power", shapes)
+        params = {"components": components, "instrument": instrument}
+        if "dilution" in values:
+            params["dilution"] = _parameter_array(values["dilution"], "dilution", shapes)
+        if "flux_weights" in values:
+            weights, count = values["flux_weights"], len(components)
+            if isinstance(weights, (tuple, list)):
+                if len(weights) != count:
+                    raise ValueError(f"flux_weights must have one entry per component ({count})")
+                weights = tuple(_parameter_array(value, "flux_weights entry", shapes) for value in weights)
+            else:
+                weights = _parameter_array(weights, "flux_weights", ((count,), (count, shapes[1][0])))
+            params["flux_weights"] = weights
+        return params
+
+    def _make_component(self, values):
+        axes = self.spectra.grid.axis_names
+        _check_parameter_keys(values, set(axes) | _STELLAR_KEYS | _INFERENCE_KEYS,
+                              "flat component")
+        atmosphere = {name: _parameter_array(values[name], name, ((),))
+                      for name in axes if name in values}
+        shapes = ((), (len(self.spectra.regions),))
+        stellar = {name: _parameter_array(values[name], name, shapes)
+                   for name in sorted(_STELLAR_KEYS) if name in values}
+        for pair in (("q1", "q2"), ("u1", "u2")):
+            if any(name in stellar for name in pair) and not all(name in stellar for name in pair):
+                raise ValueError(f"supply both {pair[0]} and {pair[1]}")
+        if "q1" in stellar:
+            u1, u2 = _limb_darkening_from_q(stellar["q1"], stellar["q2"])
+            if "u1" in stellar:
+                _require(jnp.allclose(stellar["u1"], u1, rtol=1e-6, atol=1e-7)
+                         & jnp.allclose(stellar["u2"], u2, rtol=1e-6, atol=1e-7),
+                         "u1/u2 are inconsistent with q1/q2; supply one pair or matching values")
+            stellar.update(u1=u1, u2=u2)
+        broadening = {name: stellar[name] for name in ("vsini", "vmacro", "u1", "u2") if name in stellar}
+        component = {}
+        if atmosphere:
+            component["atmosphere"] = atmosphere
+        if broadening:
+            component["broadening"] = broadening
+        if "rv" in stellar:
+            component["rv"] = stellar["rv"]
+        return component
 
     def _components(self, params):
         if not isinstance(params, Mapping) or "components" not in params:

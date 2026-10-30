@@ -488,19 +488,26 @@ macroturbulence and instrumental broadening (resolving-power Gaussian or
 relativistic RV and samples the requested wavelengths:
 
 ```python
-from jaxstar.specfit import single_star_params
-
-params = single_star_params(
-    {"teff": 5700., "logg": 4.4, "feh": 0., "alpha": 0.},
-    vsini=3., vmacro=3., q1=.36, q2=.3, rv=0., resolving_power=70000.,
-)
+point = {
+    "teff": 5700., "logg": 4.4, "feh": 0., "alpha": 0.,
+    "vsini": 3., "vmacro": 3., "q1": .36, "q2": .3,
+    "rv": 0., "resolving_power": 70000.,
+}
+params = specmodel.make_params(point)
 flux = specmodel(params, wav_obs)
 ```
 
-`single_star_params` builds the nested component/instrument dictionary and
-converts `q1`, `q2` to quadratic limb-darkening coefficients. Velocity parameters
-are in km/s. `specmodel.intrinsic`, `specmodel.broadened` and `specmodel.full`
+`make_params` uses the prepared grid's axis names to identify atmosphere
+coordinates and builds the existing nested component/instrument dictionary.
+It also converts `q1`, `q2` to quadratic limb-darkening coefficients `u1`, `u2`.
+Velocity parameters are in km/s. `specmodel.intrinsic`, `specmodel.broadened` and `specmodel.full`
 expose the successive physical stages; calling `specmodel` is equivalent to `full`.
+These methods, `decompose` and `broadening_fwhm` all accept the returned `params`;
+they do not yet accept a flat dict directly.
+
+The existing `single_star_params(atmosphere, *, vsini, vmacro, q1, q2, rv,
+resolving_power=None)` remains available with the same signature and output.
+It is a model-independent constructor with explicit atmosphere coordinates.
 
 Wavelength arrays have shape `(region, pixel)`; one region may use a 1D array.
 Atmosphere parameters are scalar for each star. Broadening, RV and resolving
@@ -515,6 +522,88 @@ For multiple stars, supply a tuple of `components` plus nonnegative
 `specmodel.decompose` returns the individual and weighted spectra. The
 [SpecModel tutorial](tutorials/specfit/specmodel.ipynb) includes SB2/SB3
 examples. Use a custom NumPyro model to fit multiple stellar components.
+
+#### Flat dictionaries and completed fit points
+
+A completed built-in prefit/SVI point can be converted without prediction or
+replaying a probabilistic model:
+
+```python
+params = sf.specmodel.make_params(prefit_point)
+physical_flux = sf.specmodel(params, sf.observation.wavelength)
+fwhm_kms = sf.specmodel.broadening_fwhm(params)
+```
+
+Keep `prefit_point` for prediction, masking and inference initialization; it
+also contains continuum and noise parameters that the physical model does not
+use. Conversion requires no `prefit_model` and does not mutate the input.
+It never reconstructs missing fixed or derived values. Incomplete latent-only
+samples or custom site names must first be explicitly mapped to physical values.
+
+For SB-N, pass **one outer dict**, containing one flat mapping per star:
+
+```python
+primary = {
+    "teff": 5700., "logg": 4.4, "feh": 0., "alpha": 0.,
+    "vsini": 3., "vmacro": 3., "q1": .36, "q2": .3, "rv": 20.,
+}
+secondary = {
+    "teff": 5300., "logg": 4.5, "feh": 0., "alpha": 0.,
+    "vsini": 5., "vmacro": 2., "u1": .4, "u2": .1, "rv": -30.,
+}
+params = specmodel.make_params({
+    "components": (primary, secondary),
+    "resolving_power": 70000.,
+    "flux_weights": (1., .25),
+    "dilution": .1,
+})
+flux = specmodel(params, wav_obs)
+parts = specmodel.decompose(params, wav_obs)
+```
+
+With `components` present, stellar parameters belong only in each component;
+`resolving_power`, `flux_weights` and `dilution` belong only in the outer dict.
+Existing nested dictionaries from the tutorial or `single_star_params` go
+directly to the physical methods and do not need `make_params`.
+
+| Flat input | Accepted shape / convention |
+| --- | --- |
+| Atmosphere coordinates | Exactly named by `specmodel.spectra.grid.axis_names`; scalar per star |
+| `vsini`, `vmacro`, `rv` | Scalar or `(n_region,)`, in km/s |
+| `q1`, `q2` or `u1`, `u2` | Complete pair; each scalar or `(n_region,)` |
+| `resolving_power` | Scalar or `(n_region,)`; omit with fixed IP |
+| `flux_weights` | `(N,)` or `(N, n_region)`; a tuple/list may mix scalar and region entries |
+| `dilution` | Scalar or `(n_region,)` |
+
+Scalars are shared across regions; arrays follow the prepared row order.
+No component, epoch or posterior-draw axis is inferred from a stellar value.
+The component count comes from the tuple/list length. A flat dict without
+`components` represents one star. Physical values must be real numbers or numeric
+arrays, not prior distributions. Atmosphere axis names must not collide with
+the reserved stellar, shared or inference keys.
+
+`q1` and `q2` must be finite and lie in `[0, 1]`.
+Both limb-darkening parameterizations may coexist in a completed point. When
+both are present, `u1/u2` must agree with the `q1/q2` conversion within
+`rtol=1e-6, atol=1e-7`; the converted values are used. Remove the redundant
+pair before changing limb darkening, rather than leaving stale derived values.
+
+The following built-in inference keys are explicitly accepted and discarded:
+`sigma_constant`, `sigma_continuum`, `jitter`, `gp_amplitude`, `gp_scale`,
+`mismatch_fraction`, `mismatch_scale`, `continuum_coefficients`, `model_flux`.
+Other unknown keys raise an error, including misspelled physical names.
+Supplying `resolving_power` on a fixed-IP model also raises an error.
+
+`make_params` checks input keys, numeric shapes and limb-darkening consistency;
+it does not evaluate a spectrum or a likelihood. It supports JIT and autodiff.
+Partial physical inputs are allowed, without inserting missing values. Each
+physical method checks its required fields and their physical ranges, as
+before: `intrinsic` needs atmosphere coordinates, `broadened` additionally
+needs broadening/instrument values, and `full` additionally needs RV. Kernel
+FWHM needs only broadening/instrument values. For spectrum composition, a
+single star defaults to weight one, multiple stars need explicit weights,
+and dilution defaults to zero. Thus missing values needed only by another
+stage do not prevent parameter construction.
 
 #### Broadening kernel FWHM
 
@@ -543,7 +632,14 @@ alone do not guarantee that the kernel tails fit inside its support. Custom
 `broadening_operator` callables do not expose kernels, so this method raises
 `NotImplementedError` for them.
 
-Calling `broadening_fwhm` does not update the fit mask.
+For a completed fitted point, obtain physical parameters with
+`params = sf.specmodel.make_params(p_fit)`, then call
+`sf.specmodel.broadening_fwhm(params)`. Neither conversion nor width calculation
+needs a spectrum prediction. Choosing the dilation factor is separate: for a single
+component and region, `mask_velocity=0.5 * float(fwhm_kms[0, 0])` adds one HWHM
+on each side of the detected pixels. `mask_outliers` currently takes a scalar
+`mask_velocity`; using multiple widths requires explicitly choosing a shared
+value. This method does not update the fit mask.
 
 ### Fixed two-Gaussian instrumental profile
 
@@ -612,7 +708,7 @@ the instrumental Fourier factor is precomputed. The same IP is applied to all
 stellar components in each region. `SpecModel.from_grid` and `SpecFit.from_grid`
 also accept `fixed_ip` in the selected region order.
 
-With fixed IP, omit `resolving_power` in `single_star_params`, `model_single`,
+With fixed IP, omit `resolving_power` in `make_params`, `single_star_params`, `model_single`,
 and `make_model_single`; physical params can omit `instrument` or supply `{}`.
 Specifying both modes raises an error, as does combining `fixed_ip` with a
 custom `broadening_operator`. No IP sample sites or priors are added. Omitting
