@@ -201,12 +201,14 @@ def test_exclusive_ip_modes():
         model(parameters(), observations(library))
 
 
-def test_inference_reconstruction_and_saved_fixed_ip(tmp_path):
+@pytest.mark.parametrize("macro_model", ["rt", "gaussian"])
+def test_inference_reconstruction_and_saved_fixed_ip(tmp_path, macro_model):
     from test_specfit import case
     original, config, point = case()
     write_calibration(tmp_path)
     calibration = read_ip_calibration(tmp_path, orders=[105, 104])
-    physical = SpecModel(original.specmodel.spectra, vmax=30., fixed_ip=calibration.median)
+    physical = SpecModel(original.specmodel.spectra, vmax=30., fixed_ip=calibration.median,
+                         macro_model=macro_model)
     fit = SpecFit(original.observation, physical)
     config.pop("resolving_power")
     trace = handlers.trace(handlers.substitute(model_single, data=point)).get_trace(
@@ -230,11 +232,13 @@ def test_inference_reconstruction_and_saved_fixed_ip(tmp_path):
         make_model_single(original, fixed=fixed, use_gp=False)
     output = save_fit_result(tmp_path / "result", sf=fit, model=model, point=point)
     result = load_fit_result(output)
+    assert result.metadata["grid"]["macro_model"] == macro_model
     recorded = result.metadata["grid"]["fixed_ip"]
     restored_ip = {name: np.array(item["values"], dtype=item["dtype"])
                    for name, item in recorded.items()}
     restored = SpecFit(result.observation,
-        SpecModel(physical.spectra, vmax=result.metadata["grid"]["vmax"], fixed_ip=restored_ip))
+        SpecModel(physical.spectra, vmax=result.metadata["grid"]["vmax"], fixed_ip=restored_ip,
+                  macro_model=result.metadata["grid"]["macro_model"]))
     restored_model = make_model_single(restored, fixed=fixed, use_gp=False, degree=2)
     np.testing.assert_array_equal(
         restored_model.predict(result.point, restored.observation, restored.specmodel)["mean_flux"],

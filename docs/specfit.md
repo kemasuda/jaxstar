@@ -509,6 +509,29 @@ The existing `single_star_params(atmosphere, *, vsini, vmacro, q1, q2, rv,
 resolving_power=None)` remains available with the same signature and output.
 It is a model-independent constructor with explicit atmosphere coordinates.
 
+Select the macroturbulence profile when constructing the physical model:
+
+```python
+specmodel = SpecModel(spectra, macro_model="gaussian")
+sf = SpecFit(obs, specmodel)
+# Or: SpecFit.from_grid(gridpath, obs, ..., macro_model="gaussian")
+```
+
+`macro_model="rt"` is the default radial-tangential profile. In `"gaussian"`
+mode, the same `vmacro` parameter is the Gaussian standard deviation in km/s;
+it can still be fitted, fixed, or supplied per component/region. The selection
+is a static setting shared by all components and regions. Both
+`SpecModel.from_grid` and `SpecFit.from_grid` accept it. The built-in inference
+functions keep the same `vmacro` site, bounds and explicitly selected prior.
+For a uniform prior, retain `use_empirical_vmacro=False`.
+
+Both modes combine with rotation and either the resolving-power Gaussian IP
+or `fixed_ip`. Gaussian macro convolves the entire fixed two-Gaussian IP,
+adding `vmacro**2` to each component's variance while retaining its mean and
+weight. The IP calibration itself stays fixed. `macro_model="gaussian"`
+requires the built-in broadening operator; custom operators keep their own
+macroturbulence implementation and existing callable signature.
+
 Wavelength arrays have shape `(region, pixel)`; one region may use a 1D array.
 Atmosphere parameters are scalar for each star. Broadening, RV and resolving
 power may be shared scalars or one value per region. The prepared grid must
@@ -614,7 +637,8 @@ fwhm_kms = specmodel.broadening_fwhm(params)  # shape (n_component, n_region)
 ```
 
 This uses the same rotation/macroturbulence/instrumental kernels as the spectrum,
-on the model's velocity grid. It automatically uses `fixed_ip` when configured;
+on the model's velocity grid, including its `macro_model` selection. It
+automatically uses `fixed_ip` when configured;
 no resolving power or Gaussian approximation is needed in that mode. The
 returned JAX array retains both axes even for one star or one region. JIT is
 supported. Only each component's `broadening` and the configured instrument
@@ -1519,7 +1543,10 @@ that cannot be described numerically are marked as not serialized.
 
 Grid provenance includes source paths, atmosphere axes, actual prepared
 wavelength/velocity sampling, broadening settings and a fingerprint of the
-in-memory grid. Fixed IP values are recorded under `metadata["grid"]["fixed_ip"]`
+in-memory grid. The macroturbulence selection is recorded under
+`metadata["grid"]["macro_model"]`; pass it as `macro_model` when recreating the
+`SpecModel`. Older bundles without this key use `"rt"`.
+Fixed IP values are recorded under `metadata["grid"]["fixed_ip"]`
 in spectral region order; they are model settings, not posterior sample sites.
 For reconstruction, extract each parameter's `"values"` and pass that mapping
 as `fixed_ip` when recreating the `SpecModel`. The large grid flux array and

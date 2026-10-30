@@ -212,7 +212,7 @@ class SpecFit:
     def from_grid(cls, gridpath, observation, *, library=None, pattern="*.npz",
                   wav_margin=3., pixels=None, velocity_step=None, vmax=50.,
                   wavelength_medium="unknown", flux_kind="as_stored",
-                  broadening_operator=None, fixed_ip=None):
+                  broadening_operator=None, fixed_ip=None, macro_model="rt"):
         """Select a common NPZ's regions or legacy files for an Observation.
 
         Delegates to ``SpecModel.from_grid`` using the observation's wavelengths
@@ -220,6 +220,7 @@ class SpecFit:
         meanings here. A common NPZ retains its saved sampling by default;
         a legacy directory requires exactly one of pixels or velocity_step.
         Arrays, fixed masks and labels in the supplied observation are preserved.
+        ``macro_model`` selects 'rt' (default) or 'gaussian' in SpecModel.
         """
         if not isinstance(observation, Observation):
             raise TypeError("SpecFit.from_grid requires an Observation")
@@ -228,7 +229,7 @@ class SpecFit:
             library=library, pattern=pattern, wav_margin=wav_margin,
             pixels=pixels, velocity_step=velocity_step, vmax=vmax,
             wavelength_medium=wavelength_medium, flux_kind=flux_kind,
-            broadening_operator=broadening_operator, fixed_ip=fixed_ip)
+            broadening_operator=broadening_operator, fixed_ip=fixed_ip, macro_model=macro_model)
         return cls(observation, model)
 
     def __init__(self, observation, specmodel):

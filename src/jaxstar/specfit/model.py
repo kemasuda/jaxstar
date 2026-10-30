@@ -176,6 +176,11 @@ class SpecModel:
     Gaussian IP resolving power. Post-atmosphere parameters are scalar or one
     per region. Stages only require the parameters they physically use.
 
+    ``macro_model='rt'`` (default) selects radial-tangential macroturbulence.
+    With ``macro_model='gaussian'``, vmacro is the Gaussian standard deviation
+    in km/s. This static setting applies to all components and regions, with
+    either IP mode. It requires the built-in broadening operator.
+
     Alternatively, ``fixed_ip`` is a mapping containing mu1_kms, mu2_kms,
     sigma1_kms, sigma2_kms and fraction2 (scalars or one value per region).
     It specifies (1-fraction2)*G(mu1, sigma1) + fraction2*G(mu2, sigma2), with
@@ -207,6 +212,7 @@ class SpecModel:
     velocity_grid: object
     vmax: float
     broadening_operator: object
+    macro_model: str
     _fixed_ip: object
     _ip_fourier: object
 
@@ -214,7 +220,7 @@ class SpecModel:
     def from_grid(cls, gridpath, wavelength, *, regions=None, library=None,
                   pattern="*.npz", wav_margin=3., pixels=None, velocity_step=None,
                   vmax=50., wavelength_medium="unknown", flux_kind="as_stored",
-                  broadening_operator=None, fixed_ip=None):
+                  broadening_operator=None, fixed_ip=None, macro_model="rt"):
         """Select spectral regions from a common NPZ or legacy NPZ directory.
 
         ``wavelength`` (Angstrom; 1D or region-by-pixel) is used only to select
@@ -240,6 +246,7 @@ class SpecModel:
         Neither wavelength conversion nor flux normalization is performed.
         Setup happens once, outside JIT; no raw files or downloads are used.
         ``fixed_ip`` is passed to SpecModel in the selected region row order.
+        ``macro_model`` selects 'rt' (default) or 'gaussian' macroturbulence.
         """
         from .libraries import select_grid_paths, load_coelho, load_bosz, load_tlusty
         from .observation import _identifiers
@@ -280,9 +287,11 @@ class SpecModel:
         if resample:
             spectra = resample_spectral_grid(spectra, sampling="log", pixels=pixels,
                                              velocity_step=velocity_step)
-        return cls(spectra, vmax=vmax, broadening_operator=broadening_operator, fixed_ip=fixed_ip)
+        return cls(spectra, vmax=vmax, broadening_operator=broadening_operator,
+                   fixed_ip=fixed_ip, macro_model=macro_model)
 
-    def __init__(self, spectra, *, vmax=50., broadening_operator=None, fixed_ip=None):
+    def __init__(self, spectra, *, vmax=50., broadening_operator=None, fixed_ip=None,
+                 macro_model="rt"):
         if not isinstance(spectra, _SpectralLibrary):
             raise TypeError("spectra must be a spectral-library loader/preparer result")
         if not is_log_uniform(spectra):
@@ -294,6 +303,10 @@ class SpecModel:
         operator = default_broadening if broadening_operator is None else broadening_operator
         if not callable(operator):
             raise TypeError("broadening_operator must be callable")
+        if not isinstance(macro_model, str) or macro_model not in ("rt", "gaussian"):
+            raise ValueError("macro_model must be 'rt' or 'gaussian'")
+        if macro_model != "rt" and operator is not default_broadening:
+            raise ValueError("macro_model='gaussian' requires the built-in broadening operator")
         if fixed_ip is not None and operator is not default_broadening:
             raise ValueError("fixed_ip cannot be combined with a custom broadening_operator")
         wave = np.asarray(spectra.wavelength, dtype=np.float64)
@@ -319,6 +332,7 @@ class SpecModel:
             ip_fourier = jax.vmap(double_gaussian_fourier)(velocity, *ip_values)
         for name, value in (("spectra", spectra), ("velocity_grid", velocity),
                             ("vmax", float(vmax)), ("broadening_operator", operator),
+                            ("macro_model", macro_model),
                             ("_fixed_ip", ip_values), ("_ip_fourier", ip_fourier)):
             object.__setattr__(self, name, value)
 
@@ -506,9 +520,11 @@ class SpecModel:
     def _broaden(self, component, params, flux):
         count = self.spectra.wavelength.shape[0]
         broad, resolution = self._broadening_parameters(component, params)
-        ip_options = {} if self._fixed_ip is None else {"ip_fourier": self._ip_fourier}
+        options = {}
+        if self.broadening_operator is default_broadening:
+            options = {"macro_model": self.macro_model, "ip_fourier": self._ip_fourier}
         wave, values = self.broadening_operator(self.spectra.wavelength, flux,
-            broadening=broad, resolving_power=resolution, velocity_grid=self.velocity_grid, **ip_options)
+            broadening=broad, resolving_power=resolution, velocity_grid=self.velocity_grid, **options)
         wave, values = jnp.asarray(wave), jnp.asarray(values)
         if wave.ndim != 2 or wave.shape != values.shape or wave.shape[0] != count or wave.shape[-1] < 2:
             raise ValueError("broadening operator must return matching (n_region, n_pixel>=2) wavelength/flux arrays")
@@ -583,7 +599,7 @@ class SpecModel:
         """Return combined-kernel FWHM in km/s, shape (component, region).
 
         Use the model's velocity grid and the same kernels as spectral
-        broadening, including rotation, radial-tangential macroturbulence and
+        broadening, including rotation, the selected macroturbulence model and
         either the resolving-power IP or fixed_ip. No Gaussian fit or
         Gaussian-equivalent width is used. Only component.broadening and,
         without fixed_ip, instrument.resolving_power are required. Atmosphere,
@@ -607,7 +623,8 @@ class SpecModel:
         for component in self._components(params):
             broad, resolution = self._broadening_parameters(component, params)
             kernel = _default_kernels(broadening=broad, resolving_power=resolution,
-                                      velocity_grid=self.velocity_grid, ip_fourier=self._ip_fourier)
+                                      velocity_grid=self.velocity_grid, ip_fourier=self._ip_fourier,
+                                      macro_model=self.macro_model)
             width = _kernel_fwhm(self.velocity_grid, kernel)
             if self._fixed_ip is None:
                 disabled = (broad["vsini"] == 0) & (broad["vmacro"] == 0) & jnp.isinf(resolution)
@@ -641,12 +658,13 @@ class SpecModel:
         return SpectralDecomposition(total, values, weights, stellar, light, dilution, weighted)
 
     def tree_flatten(self):
-        return (self.spectra, self.velocity_grid, self._fixed_ip, self._ip_fourier), (self.vmax, self.broadening_operator)
+        return ((self.spectra, self.velocity_grid, self._fixed_ip, self._ip_fourier),
+                (self.vmax, self.broadening_operator, self.macro_model))
 
     @classmethod
     def tree_unflatten(cls, metadata, children):
         result = object.__new__(cls)
         for name, value in zip(("spectra", "velocity_grid", "_fixed_ip", "_ip_fourier",
-                                "vmax", "broadening_operator"), (*children, *metadata)):
+                                "vmax", "broadening_operator", "macro_model"), (*children, *metadata)):
             object.__setattr__(result, name, value)
         return result

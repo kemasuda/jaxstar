@@ -112,15 +112,17 @@ def test_invalid_selection_requests(tmp_path, wave, options, message):
     ("coelho", load_coelho), ("bosz", load_bosz), ("tlusty", load_tlusty),
 ])
 @pytest.mark.parametrize("single", [False, True])
-def test_factories_match_manual_setup(tmp_path, library, loader, single):
+@pytest.mark.parametrize("macro_model", ["rt", "gaussian"])
+def test_factories_match_manual_setup(tmp_path, library, loader, single, macro_model):
     paths, wave = write_grids(tmp_path, library)
     paths, wave = (paths[:1], wave[0]) if single else (paths[::-1], wave[::-1])
     labels = (8,) if single else (9, 8)
     options = dict(library=library, pattern="*_normed.npz", wav_margin=3.,
-                   pixels=501, vmax=30., wavelength_medium="air", flux_kind="normalized")
+                   pixels=501, vmax=30., wavelength_medium="air", flux_kind="normalized",
+                   macro_model=macro_model)
     manual = SpecModel(resample_spectral_grid(
         loader(paths, regions=labels, wavelength_medium="air", flux_kind="normalized"),
-        pixels=501), vmax=30.)
+        pixels=501), vmax=30., macro_model=macro_model)
     model = SpecModel.from_grid(tmp_path, wave, regions=np.asarray(labels), **options)
     obs = observation(wave, labels)
     fit = SpecFit.from_grid(tmp_path, obs, **options)
@@ -129,6 +131,7 @@ def test_factories_match_manual_setup(tmp_path, library, loader, single):
     point = params(manual)
     expected = manual(point, wave)
     for result in (model, fit.specmodel):
+        assert result.macro_model == macro_model
         assert result.spectra.sources == tuple(str(path) for path in paths)
         assert result.spectra.regions == labels
         assert result.spectra.wavelength_medium == "air"
