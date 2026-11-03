@@ -646,6 +646,12 @@ parameters are needed; atmosphere, RV, flux weights and dilution are ignored.
 These are per-component kernel widths, excluding intrinsic line widths and
 separation between stars' radial velocities.
 
+For wavelength-dependent `fixed_ip`, the cached IP parameters at the middle
+model pixel of each region (`n_pixel // 2`, including prepared margins) define
+a representative local kernel. This gives a central width for automatic mask
+extension, rather than the largest width over wavelength. The spectrum itself
+continues to use the full wavelength-dependent IP.
+
 FWHM is measured by linear interpolation of the two half-maximum crossings.
 Asymmetric profiles are supported when the part at or above half maximum is
 one connected interval. Disconnected intervals and crossings outside the
@@ -752,6 +758,82 @@ assumptions, including atmosphere parameters and broadening. The current
 settings use S/N=200; change `SNR` to choose a different noise level.
 Outputs are saved under `results/ip_comparison/`, with a new `run_*` directory
 per execution.
+
+### Wavelength-dependent fixed IP
+
+Pass a function as `fixed_ip` to let the same two-Gaussian parameters vary
+within each region. The function receives a NumPy wavelength array of shape
+`(n_region, n_model_pixel)`, in Å and the prepared library's air/vacuum convention.
+These are **observer-frame** wavelengths, including the prepared margins.
+It returns a mapping with the same five names as a constant IP:
+
+```python
+import numpy as np
+from jaxstar.specfit import SpecModel
+
+def ip_at_wavelength(wavelength):
+    # Illustrative calibration only. Replace these functions with your own
+    # measured wavelength dependence, including the prepared margins.
+    x = (wavelength - 5500.) / 1000.
+    return {
+        "mu1_kms": -0.5 + 0.1 * x,
+        "mu2_kms": 1.0 + 0.2 * x,
+        "sigma1_kms": 1.5 * np.exp(0.1 * x),
+        "sigma2_kms": 2.5 * np.exp(0.1 * x),
+        "fraction2": 0.25,
+    }
+
+specmodel = SpecModel(spectra, vmax=50., fixed_ip=ip_at_wavelength)
+```
+
+Each returned value can be a scalar, a per-region vector `(n_region,)`, or an
+array broadcastable to the full wavelength shape. Use `(n_region, 1)` for
+explicit region constants. The callback defines any interpolation or polynomial
+it needs; no calibration-knot format is imposed. Sigmas must be positive and
+all values finite, with `fraction2` in `[0, 1]`. Region rows have the same order
+as `spectra.regions`. The callback is evaluated once during construction, need
+not use JAX, and is not retained or called during inference. Rebuild the model
+to change the calibration. `SpecModel.from_grid` and `SpecFit.from_grid` accept
+the same callable. Omit `resolving_power`, as for constant fixed IP.
+
+The forward order is:
+
+```text
+stellar spectrum → rotation + macroturbulence (beta=0)
+                 → RV shift onto the fixed model grid
+                 → wavelength-dependent IP → observed wavelengths
+```
+
+The IP is evaluated at each **input** wavelength, so changing stellar RV moves
+lines through the calibrated IP field. Its finite-support two-Gaussian kernels
+are sampled on the existing log-wavelength grid and normalized to unit discrete
+area. Local contributions are stored as a banded response, not a dense matrix.
+The output is divided by the response to a flat input spectrum, preserving a
+flat continuum and the existing normalized-spectrum/light-mixing convention.
+This is a point-sampled, continuum-preserving response in log wavelength; it
+does not implement detector-bin integration or exact conservation of summed
+flux samples when the IP varies. Smooth calibration functions and a grid fine
+enough to resolve the narrowest active Gaussian are appropriate for this model.
+
+IP support is chosen once from the largest active `abs(mu) + 5*sigma`, separately
+from the stellar kernel's `vmax`. Prepared margins must cover stellar broadening,
+RV and this IP support. The implementation checks that the requested interval
+has the needed coverage; it does not build new grids or extrapolate missing
+calibration. `SpecFit.rv_bounds` accounts for the extra IP support. A constant
+callback agrees with the existing constant-IP path up to finite-support and
+interpolation errors; the original mapping-based path is unchanged.
+
+`intrinsic` excludes all broadening as usual. `broadened` applies stellar
+broadening and the observer-frame IP with RV set to zero; `full` applies the
+component's RV before the IP. `decompose` follows those same stages, including
+for multiple stars. Both macroturbulence modes, JIT, vmap and stellar-parameter
+gradients work with this response. `broadening_fwhm` uses the cached IP at each
+region's middle model pixel to compute a representative combined stellar/IP
+width. Mixture outlier masking therefore supports the usual
+`mask_velocity="auto"`, using half the largest of these representative widths
+over component/region pairs with nonzero stellar light. A numeric
+`mask_velocity` in km/s still overrides this approximation. The central kernel
+must fit within `vmax`, as for constant fixed-IP FWHM calculations.
 
 ### Observations and continuum
 
@@ -1181,6 +1263,8 @@ existing behavior.
 Pixels with `q > p_outlier` are flagged. For mixture masking, the default
 `mask_velocity="auto"` computes kernel FWHMs from the existing prediction's
 physical `params`, using the model's actual broadening and fixed IP when present.
+For wavelength-dependent IP, each region uses its middle model pixel's IP as
+the representative calibration.
 It takes **half the maximum FWHM** across components and regions with nonzero
 stellar light, and applies that single velocity to every region. Entirely dark
 components are skipped; individual zero-weight component/region pairs do not
@@ -1548,8 +1632,16 @@ in-memory grid. The macroturbulence selection is recorded under
 `SpecModel`. Older bundles without this key use `"rt"`.
 Fixed IP values are recorded under `metadata["grid"]["fixed_ip"]`
 in spectral region order; they are model settings, not posterior sample sites.
-For reconstruction, extract each parameter's `"values"` and pass that mapping
-as `fixed_ip` when recreating the `SpecModel`. The large grid flux array and
+`metadata["grid"]["fixed_ip_mode"]` distinguishes `"constant"` from
+`"wavelength_dependent"`; older bundles use the constant mode. For constant IP,
+extract each parameter's `"values"` and pass that mapping as `fixed_ip` when
+recreating the `SpecModel`. For a callable IP, the saved values are arrays on
+the recorded `metadata["grid"]["wavelength"]`, not serialized function code.
+Using the same prepared grid, reconstruct with `fixed_ip=lambda wavelength:
+saved_ip_values`, where `saved_ip_values` is the decoded mapping of arrays.
+Check that the grid wavelengths match the saved wavelengths before doing this;
+a different grid requires the original calibration function.
+The large grid flux array and
 executable model code are not bundled; use `save_spectral_grid` separately if a
 portable grid artifact is needed. Loading results and plotting posterior
 traces/corners require no grid.
