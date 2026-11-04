@@ -336,6 +336,7 @@ def test_teff_dependent_modes_require_axes(stellar_case, option, missing, messag
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 @pytest.mark.parametrize("option", [True, "doyle2014", "lubin2026"])
+@pytest.mark.slow
 def test_combined_relations_joint_density_jit_and_gradients(stellar_case, dtype, x64_context, option):
     with x64_context(dtype == "float64"):
         obs, model, config, coordinates = stellar_case
@@ -355,6 +356,7 @@ def test_combined_relations_joint_density_jit_and_gradients(stellar_case, dtype,
                 if site["type"] == "sample" and not site["is_observed"]} == set(values)
 
 
+@pytest.mark.slow
 def test_hmc_initialization_and_conditional_support_transform(stellar_case):
     obs, model, config, coordinates = stellar_case
     config = derived_config(config, use_physical_logg_max=True, use_empirical_vmacro=True)

@@ -71,6 +71,7 @@ def test_initialization_matches_historical_rule(grid_path, parallax, linear_age,
         assert constrained['feh_init'] != -.15
 
 
+@pytest.mark.slow
 def test_explicit_initialization_allows_prior_run_without_parallax(grid_path):
     fit = make_fit(MistFit, grid_path, 'named')
     fit = MistFit(model=fit.physical_model, observations={})
@@ -87,6 +88,7 @@ def test_explicit_initialization_allows_prior_run_without_parallax(grid_path):
     assert np.all(np.isfinite(samples['rho']))
 
 
+@pytest.mark.slow
 def test_standalone_isochrone_nuts_accepts_observations_and_physical_model(grid_path):
     fit = make_fit(MistFit, grid_path, 'named')
     result = run_nuts(model_isochrone, jax.random.PRNGKey(7),

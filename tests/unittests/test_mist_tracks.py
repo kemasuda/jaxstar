@@ -330,6 +330,7 @@ def test_loader_x64_band_order_and_centered_error(track_path, tmp_path, x64_cont
     np.testing.assert_allclose(errors[0]/errors[1], 4., rtol=1e-10)
 
 
+@pytest.mark.slow
 def test_track_nuts_save_reload_and_metadata(track_path, tmp_path):
     fit = MistFit(model=MistModel.from_tracks(track_path), observations={'parallax': (6.7, .1)})
     options = {key: value for key, value in OPTIONS.items() if key != 'age_max'}

@@ -265,6 +265,7 @@ def test_degree_zero_strong_continuum_avoids_quadratic_cancellation(dtype):
 
 
 @pytest.mark.parametrize("jitter", [0., .005])
+@pytest.mark.slow
 def test_end_to_end_specmodel_eager_jit_physical_gradients(jitter):
     from test_specmodel import make_library, parameters
 

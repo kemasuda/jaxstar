@@ -155,6 +155,7 @@ def test_invalid_parameters(changes, message):
 
 
 @pytest.mark.parametrize("single", [False, True])
+@pytest.mark.slow
 def test_model_joint_and_reconstruction_use_sampled_continuum(single, tmp_path, x64_context):
     with x64_context():
         fit, settings, point = case(single)
@@ -203,6 +204,7 @@ def test_model_joint_and_reconstruction_use_sampled_continuum(single, tmp_path, 
 
 @pytest.mark.parametrize("single", [False, True])
 @pytest.mark.parametrize("show_masked", [False, True])
+@pytest.mark.slow
 def test_draw_probabilities_are_averaged_before_plotting_without_clipping(single, show_masked, tmp_path, x64_context):
     with x64_context():
         fit, settings, point = case(single)
@@ -314,6 +316,7 @@ def test_joint_jit_gradient_with_sampled_hyperparameters(x64_context):
         assert all(np.isfinite(g).all() for g in jax.tree.leaves(gradient))
 
 
+@pytest.mark.slow
 def test_factory_run_svi_optimizes_explicit_continuum_and_predicts_without_masking(x64_context):
     with x64_context():
         fit, _, _ = case(single=True)
@@ -346,6 +349,7 @@ def test_factory_run_svi_optimizes_explicit_continuum_and_predicts_without_maski
         np.testing.assert_array_equal(fit.effective_mask, mask_before)
 
 
+@pytest.mark.slow
 def test_small_svi_nuts_and_saved_posterior_without_discrete_sites(tmp_path, x64_context):
     with x64_context():
         fit, settings, _ = case(single=True)

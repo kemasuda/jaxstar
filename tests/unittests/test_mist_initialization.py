@@ -28,6 +28,7 @@ def fit_options(request, track_path, grid_path):
 
 @pytest.mark.parametrize('linear_age', [True, False])
 @pytest.mark.parametrize('nodata', [True, False])
+@pytest.mark.slow
 def test_best_start_matches_scalar_joint_density(fit_options, linear_age, nodata):
     fit, options = fit_options
     options.update(linear_age=linear_age, nodata=nodata, prot=15.,
@@ -70,6 +71,7 @@ def test_narrow_ranges_use_interior_midpoints(fit_options):
 
 
 @pytest.mark.parametrize('key', ['feh', 'feh_surface', 'feh_photosphere'])
+@pytest.mark.slow
 def test_observed_feh_default_and_explicit_override(fit_options, key):
     fit, options = fit_options
     fit = MistFit(model=fit.physical_model, observations={key: (-.2, .1), 'parallax': (8., .1)})
@@ -84,6 +86,7 @@ def test_observed_feh_default_and_explicit_override(fit_options, key):
 
 
 @pytest.mark.parametrize('linear_age', [True, False])
+@pytest.mark.slow
 def test_return_grid_retains_exact_search_target(fit_options, linear_age):
     fit, options = fit_options
     options.update(linear_age=linear_age)
@@ -105,6 +108,7 @@ def test_return_grid_retains_exact_search_target(fit_options, linear_age):
 
 
 @pytest.mark.parametrize('linear_age', [True, False])
+@pytest.mark.slow
 def test_feh_scan_profiles_scalar_density_and_selects_global_start(fit_options, linear_age):
     fit, options = fit_options
     options.update(linear_age=linear_age)
@@ -243,6 +247,7 @@ def test_wrapper_grid_search_and_explicit_precedence(fit_options, monkeypatch):
     assert len(searches) == 1
 
 
+@pytest.mark.slow
 def test_automatic_start_short_nuts_and_metadata(fit_options):
     fit, options = fit_options
     result = fit.run_nuts(jax.random.PRNGKey(4), model_kwargs=options,

@@ -132,6 +132,7 @@ def test_mask_submatrix_dense_parity(solver, masking):
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("regions", [None, 2])
+@pytest.mark.slow
 def test_solvers_jit_dynamic_data_dtype_and_all_gradients(dtype, regions, x64_context):
     with x64_context(dtype == np.float64):
         obs, flux = problem(regions, dtype)
@@ -429,6 +430,7 @@ def test_float32_x64_mixture_has_setup_guidance():
         gp_marginalized_continuum_log_likelihood(obs, flux, **OPTIONS)
 
 
+@pytest.mark.slow
 def test_masked_gp_nuts_smoke_without_changing_model_single():
     import numpyro
     import numpyro.distributions as dist
@@ -442,3 +444,8 @@ def test_masked_gp_nuts_smoke_without_changing_model_single():
     sampler = MCMC(NUTS(toy_model), num_warmup=8, num_samples=8, progress_bar=False)
     sampler.run(jax.random.PRNGKey(3))
     assert np.all(np.isfinite(sampler.get_samples()["offset"]))
+
+
+def test_gp_gradients_and_solver_agreement(x64_context):
+    # Keep one multi-region gradient check in the regular suite.
+    test_solvers_jit_dynamic_data_dtype_and_all_gradients(np.float64, 2, x64_context)

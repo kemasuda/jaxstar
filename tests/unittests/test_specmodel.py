@@ -57,6 +57,7 @@ def forward_tolerance(dtype, stage):
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.slow
 def test_stages_alias_jit_gradients_and_dynamic_arrays(dtype):
     spectra = make_library(dtype)
     model, params, wave = SpecModel(spectra), parameters(), observations(spectra)
@@ -256,6 +257,7 @@ def test_x64_disabled_forward_and_reverse_mode(x64_context):
         assert all(np.all(np.isfinite(x)) for x in jax.tree_util.tree_leaves(gradient))
 
 
+@pytest.mark.slow
 def test_outer_parameter_vmap_keeps_scalar_atmosphere_queries():
     library, params = make_library(), parameters()
     model, wave = SpecModel(library), observations(library)

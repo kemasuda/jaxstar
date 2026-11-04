@@ -432,6 +432,7 @@ def test_dtype_region_jitter_and_fixed_physical_point(dtype, x64_context):
 
 
 @pytest.mark.parametrize("gp", [False, True])
+@pytest.mark.slow
 def test_single_model_svi_and_nuts_use_effective_observation(gp):
     fit, config, _ = case(single=True)
     if gp:
@@ -896,6 +897,7 @@ def test_plot_limits_include_model_on_masked_pixels(masked_pixel):
 
 @pytest.mark.parametrize("show_gp", [False, True])
 @pytest.mark.parametrize("posterior", [False, True])
+@pytest.mark.slow
 def test_plot_uses_model_prediction_and_baseline_residuals(show_gp, posterior):
     import matplotlib
     matplotlib.use("Agg", force=True)

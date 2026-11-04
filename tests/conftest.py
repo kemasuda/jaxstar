@@ -1,9 +1,28 @@
-"""Precision context for spectral/payload tests across supported JAX versions."""
+"""Regular/extended test selection and shared compatibility fixtures."""
 
 from contextlib import contextmanager
 
 import jax
 import pytest
+
+
+def pytest_addoption(parser):
+    parser.addoption("--run-slow", action="store_true",
+                     help="Include slow inference, CLI and exhaustive model tests")
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-slow"):
+        return
+    selected, deferred = [], []
+    for item in items:
+        if item.get_closest_marker("slow"):
+            deferred.append(item)
+        else:
+            selected.append(item)
+    if deferred:
+        config.hook.pytest_deselected(items=deferred)
+        items[:] = selected
 
 
 @pytest.fixture(scope="session")

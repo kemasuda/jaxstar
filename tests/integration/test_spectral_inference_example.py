@@ -12,6 +12,9 @@ import pytest
 from jaxstar.specfit import model_single
 
 
+pytestmark = pytest.mark.slow
+
+
 def example(name):
     path = Path(__file__).resolve().parents[2] / "dev_notebooks/specfit" / f"{name}.py"
     spec = importlib.util.spec_from_file_location(name, path)

@@ -64,6 +64,7 @@ def inputs(tmp_path, library, normalized=True):
 
 @pytest.mark.parametrize("library", ["bosz", "coelho"])
 @pytest.mark.parametrize("normalized", [True, False])
+@pytest.mark.slow
 def test_cli_build_preserves_native_flux_regions_and_provenance(tmp_path, x64_context, library, normalized):
     raw, recipe_path, recipe = inputs(tmp_path, library, normalized)
     # Exercise both forms through the CLI, NPZ and portable recipe snapshot.
@@ -111,6 +112,7 @@ def test_cli_build_preserves_native_flux_regions_and_provenance(tmp_path, x64_co
     assert (output / "manifest.json").read_bytes() == original
 
 
+@pytest.mark.slow
 def test_dry_run_and_failed_build_do_not_publish(tmp_path):
     raw, recipe_path, recipe = inputs(tmp_path, "bosz")
     recipe["axes"]["teff"] = [6500]  # Missing native node, no fallback.
@@ -125,6 +127,7 @@ def test_dry_run_and_failed_build_do_not_publish(tmp_path):
     assert not output.exists()
 
 
+@pytest.mark.slow
 def test_logg_replacement_preview_build_and_manifest(tmp_path, x64_context):
     raw, recipe_path, recipe = inputs(tmp_path, "bosz")
     recipe["axes"].update(teff=[6000], logg=[3.5, 4., 4.5, 5.], vmic=[1])
@@ -167,6 +170,7 @@ def test_logg_replacement_preview_build_and_manifest(tmp_path, x64_context):
         assert set(spectra.sources) == set(manifest["source_plan"]["sources"])
 
 
+@pytest.mark.slow
 def test_input_check_reports_all_missing_files_without_preparing(tmp_path):
     raw, path, recipe = inputs(tmp_path, "bosz")
     recipe["axes"].update(teff=[6000, 6500, 6750], vmic=[1])
@@ -182,6 +186,7 @@ def test_input_check_reports_all_missing_files_without_preparing(tmp_path):
 
 
 @pytest.mark.parametrize("normalized", [True, False])
+@pytest.mark.slow
 def test_teff_replacement_preview_build_and_manifest(tmp_path, x64_context, normalized):
     raw, recipe_path, recipe = inputs(tmp_path, "coelho", normalized)
     recipe["missing_nodes"] = "teff"
@@ -315,6 +320,7 @@ def test_shared_examples_and_unknown_medium(tmp_path):
 
 
 @pytest.mark.parametrize("normalized", [True, False])
+@pytest.mark.slow
 def test_tlusty_ob2025_cli_preflight_build_and_portable_bundle(tmp_path, x64_context, normalized):
     raw = tmp_path / "raw"
     wave = np.linspace(4998., 5005., 701)

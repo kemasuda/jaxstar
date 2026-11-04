@@ -154,6 +154,7 @@ def test_reference_and_thresholds_exclude_weak_or_invalid_grid_regions():
 
 @pytest.mark.parametrize('linear_age', [True, False])
 @pytest.mark.parametrize('feh_step', [None, .1])
+@pytest.mark.slow
 def test_draw_scores_match_scalar_joint_density_and_chain_counts(fit_options, linear_age, feh_step):
     fit, options = fit_options
     options.update(linear_age=linear_age, prot=15., rho_obs=.8, rho_err=.2)
@@ -231,6 +232,7 @@ def test_recheck_reuses_scores_and_counts_without_model_evaluation(fit_options, 
 
 
 @pytest.mark.parametrize('linear_age', [True, False])
+@pytest.mark.slow
 def test_fit_coverage_recovers_target_and_scans_without_initializing(fit_options, linear_age, monkeypatch):
     import json
     from types import SimpleNamespace

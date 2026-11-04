@@ -137,6 +137,7 @@ def test_region_alignment_and_distinct_pixel_grid(case):
         trace_at(swapped, model, kwargs, point)
 
 
+@pytest.mark.slow
 def test_small_svi_and_nuts_same_model(case):
     obs, model, kwargs, point, _ = case
     guide = AutoLaplaceApproximation(model_single, init_loc_fn=init_to_value(values={"teff": 5600.}))
@@ -155,6 +156,7 @@ def test_small_svi_and_nuts_same_model(case):
     assert not {"norm", "slope", "coefficients"}.intersection(samples)
 
 
+@pytest.mark.slow
 def test_inferutils_smoke(case):
     import numpyro_inferutils as inferutils
     obs, model, kwargs, point, _ = case
@@ -242,6 +244,7 @@ def test_gp_fixed_factor_and_compact_trace(gp_case, solver):
 
 @pytest.mark.parametrize("solver", ["quasisep", "direct"])
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.slow
 def test_gp_sampled_sites_concrete_jit_and_joint_density(solver, dtype, x64_context):
     with x64_context(dtype == "float64"):
         obs, model, kwargs, point, physical = _case()
@@ -296,6 +299,7 @@ def test_gp_sampled_sites_concrete_jit_and_joint_density(solver, dtype, x64_cont
 
 
 @pytest.mark.parametrize("solver", ["quasisep", "direct"])
+@pytest.mark.slow
 def test_gp_svi_and_nuts_masked_sampled_hyperparameters(gp_case, solver):
     from numpyro.infer.autoguide import AutoNormal
     obs, model, config, point, _ = gp_case
@@ -366,6 +370,7 @@ def test_gp_dynamic_observation_is_intentionally_unsupported(gp_case):
         fn({"teff": point["teff"]}, obs, model)
 
 
+@pytest.mark.slow
 def test_iid_nuts_preserves_dynamic_model_arguments(case):
     from functools import partial
     obs, model, config, point, _ = case

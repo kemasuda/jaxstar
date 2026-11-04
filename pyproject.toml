@@ -74,6 +74,8 @@ include = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--durations=20"
 markers = [
     "full_grid: requires JAXSTAR_MISTGRID_PATH and checks the full MIST grid",
+    "slow: extended inference, CLI, cross-process and exhaustive model tests (enable with --run-slow)",
 ]
