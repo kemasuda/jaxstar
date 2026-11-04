@@ -85,6 +85,7 @@ def test_defaults_shapes_reproducibility_and_unchanged_masks(layout, monkeypatch
     np.testing.assert_array_equal(fit.effective_mask, before)
 
 
+@pytest.mark.slow
 def test_user_values_override_defaults_and_conditional_prior_draws(monkeypatch):
     fit = make_fit()
     capture_svi(monkeypatch, fit)
@@ -180,6 +181,7 @@ def test_options_must_be_mappings(argument):
         fit.run_mixture_prefit(rng_key=jax.random.PRNGKey(0), **{argument: []})
 
 
+@pytest.mark.slow
 def test_real_prefit_improves_fit_classifies_mismatch_and_respects_fit_mask(monkeypatch):
     fit, _, _ = case(single=True)
     flux = fit.observation.flux.copy()

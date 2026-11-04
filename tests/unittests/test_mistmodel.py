@@ -263,6 +263,7 @@ def make_fit(cls, grid_path, backend):
 
 @pytest.mark.parametrize("backend", ["legacy", "named"])
 @pytest.mark.parametrize("linear_age,nodata,flat", list(product((False, True), repeat=3)))
+@pytest.mark.slow
 def test_frozen_fit_sites_log_densities_and_gradients(grid_path, x64_context, backend, linear_age, nodata, flat):
     with x64_context():
         options = dict(OPTIONS, linear_age=linear_age, nodata=nodata, flat_age_marginal=flat,
@@ -342,6 +343,7 @@ def test_fit_key_changes_do_not_mutate_or_reuse_stale_physical_selection(grid_pa
 
 @pytest.mark.parametrize("backend", ["legacy", "named"])
 @pytest.mark.parametrize("linear_age", [False, True])
+@pytest.mark.slow
 def test_additional_outputs_preserve_sites_density_and_nuts_gradient(grid_path, x64_context, backend, linear_age):
     with x64_context():
         fit = make_fit(MistFit, grid_path, backend)
@@ -414,6 +416,7 @@ def test_invalid_additional_outputs_fail_without_changing_the_fit(grid_path, sel
 
 
 @pytest.mark.parametrize("linear_age", [False, True])
+@pytest.mark.slow
 def test_actual_nuts_potential_matches_reference_and_finite_differences(grid_path, x64_context, linear_age):
     with x64_context():
         options = dict(OPTIONS, linear_age=linear_age, flat_age_marginal=True,
@@ -440,6 +443,7 @@ def test_actual_nuts_potential_matches_reference_and_finite_differences(grid_pat
 
 
 @pytest.mark.parametrize("backend", ["legacy", "named"])
+@pytest.mark.slow
 def test_independent_four_chain_nuts_runs_on_tiny_grid(grid_path, backend):
     fit = make_fit(MistFit, grid_path, backend)
     options = dict(OPTIONS, nodata=True)
@@ -552,3 +556,9 @@ def test_full_grid_refactor_matches_frozen_fit(x64_context, x64):
                 np.testing.assert_allclose(old_trace[key]["value"], new_trace[key]["value"],
                                            rtol=2e-6 if not x64 else 2e-12, atol=2e-6 if not x64 else 2e-12)
     jax.clear_caches()
+
+
+def test_named_fit_density_and_gradients(grid_path, x64_context):
+    # The legacy/age/prior matrix remains available with --run-slow.
+    test_frozen_fit_sites_log_densities_and_gradients(
+        grid_path, x64_context, backend="named", linear_age=False, nodata=False, flat=False)

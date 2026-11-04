@@ -18,6 +18,7 @@ from test_specfit import case, configured, clipping_case, clipping_model
 
 @pytest.mark.parametrize("single", [False, True])
 @pytest.mark.parametrize("solver", [None, "direct", "quasisep", "vecchia1"])
+@pytest.mark.slow
 def test_fitted_covariance_and_physical_residual(single, solver, x64_context, monkeypatch):
     with x64_context():
         fit, settings, point = case(single=single)
@@ -138,6 +139,7 @@ def test_mixture_prediction_reused_without_refitting_and_old_flags_reconsidered(
 
 @pytest.mark.parametrize("metadata", [(), ("mismatch_fraction",), ("mismatch_scale",),
                                       ("mismatch_fraction", "mismatch_scale")])
+@pytest.mark.slow
 def test_custom_probabilities_snapshot_and_plot(metadata, tmp_path, monkeypatch):
     import matplotlib.pyplot as plt
 

@@ -113,6 +113,7 @@ def test_invalid_selection_requests(tmp_path, wave, options, message):
 ])
 @pytest.mark.parametrize("single", [False, True])
 @pytest.mark.parametrize("macro_model", ["rt", "gaussian"])
+@pytest.mark.slow
 def test_factories_match_manual_setup(tmp_path, library, loader, single, macro_model):
     paths, wave = write_grids(tmp_path, library)
     paths, wave = (paths[:1], wave[0]) if single else (paths[::-1], wave[::-1])
@@ -218,6 +219,7 @@ def test_empty_rv_interval_and_custom_broadening(tmp_path):
 ])
 @pytest.mark.parametrize("single", [False, True])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.slow
 def test_common_npz_factories_match_selected_legacy_models(tmp_path, library, loader, single, dtype):
     paths, wave = write_grids(tmp_path, library, dtype)
     spectra = resample_spectral_grid(loader(

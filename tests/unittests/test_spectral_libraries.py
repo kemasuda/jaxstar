@@ -96,6 +96,7 @@ def test_prepared_axes_payload_wavelength_and_exact_nodes(prepared):
     assert result.dtype == data[0]["flux"].dtype
 
 
+@pytest.mark.slow
 def test_prepared_interior_batch_jit_and_coordinate_gradients(prepared):
     name, axes, paths, data, gradients = prepared
     library = LOADERS[name](paths)
@@ -472,6 +473,7 @@ def test_legacy_prepared_files_can_be_migrated_once_to_common_storage(prepared, 
     ("bosz", "normalized"), ("bosz", "unnormalized"),
     ("tlusty", "normalized"), ("tlusty", "unnormalized"), ("tlusty", "median_scaled"),
 ])
+@pytest.mark.slow
 def test_raw_preparation_common_artifact_round_trip_in_a_fresh_process(tmp_path, name, kind):
     raw = tmp_path / "raw"
     raw.mkdir()
@@ -554,6 +556,7 @@ np.savez(sys.argv[2], metadata=json.dumps(metadata), result=np.asarray(result),
     ("tlusty", "normalized"), ("tlusty", "unnormalized"), ("tlusty", "median_scaled"),
 ])
 @pytest.mark.parametrize("control", ["pixels", "velocity_step"])
+@pytest.mark.slow
 def test_direct_raw_log_sampling_products_nodes_and_queries(tmp_path, name, kind, control):
     bounds = np.array([[5000.15, 5001.2], [5001.4, 5002.6]])
     options = dict(sampling="log", regions=(8, "red"))
@@ -661,6 +664,7 @@ def test_log_preparation_preserves_vacuum_conversion_and_requires_coverage(tmp_p
 
 
 @pytest.mark.parametrize("control", ["velocity_step", "pixels"])
+@pytest.mark.slow
 def test_legacy_conversion_and_fresh_process_loading(prepared, tmp_path, control):
     name, _, paths, _, _ = prepared
     # Unequal legacy log spans yield unequal counts at one dv. Convert one

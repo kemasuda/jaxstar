@@ -246,6 +246,11 @@ class SpecFit:
         if np.any(wave[:, 0] < source[:, 0]) or np.any(wave[:, -1] > source[:, -1]):
             raise ValueError(
                 "insufficient model wavelength coverage; prepare wider spectral regions")
+        if specmodel._ip_response is not None:
+            half = specmodel._ip_response.half
+            if np.any(wave[:, 0] < source[:, half]) or np.any(wave[:, -1] > source[:, -half-1]):
+                raise ValueError("insufficient model wavelength coverage for fixed_ip; "
+                                 "prepare wider spectral regions")
         self.observation = observation
         self.specmodel = specmodel
         self._rv_bounds = None
@@ -254,8 +259,10 @@ class SpecFit:
             safe = source[:, half:-half].astype(np.float64)
             # Positive RV redshifts the safe model interval. Invert its Doppler
             # factors at the observed red/blue endpoints to get lower/upper RV.
-            factors = np.column_stack((wave[:, -1] / safe[:, -1],
-                                       wave[:, 0] / safe[:, 0]))
+            padding = (1. if specmodel._ip_response is None else
+                       np.asarray(specmodel._ip_response.padding, dtype=np.float64))
+            factors = np.column_stack((wave[:, -1] * padding / safe[:, -1],
+                                       wave[:, 0] / padding / safe[:, 0]))
             bounds = _C_KMS * (factors - 1) * (factors + 1) / (factors**2 + 1)
             bounds.setflags(write=False)
             self._rv_bounds = bounds
@@ -269,7 +276,9 @@ class SpecFit:
         Computed once for the full observation wavelengths, including masked
         pixels, after discarding the default broadening kernel's half-support
         at both edges. Uses SpecModel's relativistic Doppler convention. Bounds
-        describe each component/region separately; a shared RV must satisfy all
+        with a callable fixed_ip also reserve its local support and a sampling
+        step for the final interpolation.
+        These describe each component/region separately; a shared RV must satisfy all
         rows. Lower > upper means no RV can cover that entire region. Endpoint
         roundoff can affect exact-boundary evaluation, especially in float32.
 
@@ -603,7 +612,9 @@ class SpecFit:
         apply only to sigma_clip. The inference likelihood is never changed.
         For mixture masking, mask_velocity="auto" (default) uses half the largest
         broadening-kernel FWHM across components and regions with nonzero stellar
-        light. It reads prediction['params'], prints the adopted value in km/s,
+        light. Wavelength-dependent IP uses the calibration at each region's
+        middle model pixel for a representative width.
+        It reads prediction['params'], prints the adopted value in km/s,
         and uses this one shared additional half-width around every original
         flagged pixel. Numeric mask_velocity overrides it directly, using
         c * abs(log(wavelength / flagged_wavelength)) <= mask_velocity within

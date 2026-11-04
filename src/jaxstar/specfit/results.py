@@ -116,6 +116,8 @@ def _grid_record(specmodel):
         "vmax": specmodel.vmax, "broadening_operator": _describe(specmodel.broadening_operator),
         "macro_model": specmodel.macro_model,
         "fixed_ip": _describe(specmodel.fixed_ip),
+        "fixed_ip_mode": (None if specmodel.fixed_ip is None else
+                          "wavelength_dependent" if specmodel._ip_response is not None else "constant"),
     }
 
 

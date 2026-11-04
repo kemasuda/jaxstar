@@ -33,6 +33,7 @@ def nuts_run(grid_path, x64_context):
     plt.close('all')
 
 
+@pytest.mark.slow
 def test_nuts_portable_roundtrip_and_grid_free_redraw(nuts_run, tmp_path, monkeypatch):
     fit, mcmc = nuts_run
     assert isinstance(mcmc, MCMC)
@@ -106,8 +107,11 @@ def test_summary_accepts_string_list_and_tuple_keys(sampler, arviz_from_dict):
     assert not any(key.startswith('eti') for key in actual.columns)
 
 
-def test_corrupt_bundle_is_rejected(nuts_run, tmp_path):
-    directory = save_result(nuts_run[1], tmp_path / 'star')
+def test_corrupt_bundle_is_rejected(tmp_path, arviz_from_dict):
+    # File integrity does not depend on running stellar inference first.
+    idata = arviz_from_dict(posterior={'mass': np.random.default_rng(41).normal(1., .1, (2, 32))})
+    idata.attrs['jaxstar_run_metadata'] = json.dumps({'sampler': 'nuts'})
+    directory = save_result(idata, tmp_path / 'star')
     path = directory / 'posterior.nc'
     with path.open('ab') as stream:
         stream.write(b'changed')

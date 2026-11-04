@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._data import _SpectralLibrary
+from ._variable_ip import _VariableIP
 from .broadening import _default_kernels, default_broadening, double_gaussian_fourier
 from .ip_calibration import _IP_PARAMETERS, _fixed_ip_values
 from .sampling import _C_KMS, is_log_uniform
@@ -125,7 +126,7 @@ def _sample(wavelength, source_wave, flux):
         wavelength, source_wave, flux)
 
 
-def _sample_with_rv(wavelength, source_wave, flux, rv):
+def _sample_with_rv(wavelength, source_wave, flux, rv, *, edge_fill=False):
     """Apply the relativistic shift in centered interpolation coordinates.
 
     Multiplying absolute float32 wavelengths by a factor close to one loses
@@ -137,8 +138,13 @@ def _sample_with_rv(wavelength, source_wave, flux, rv):
     factor = _doppler_factor(rv)
     delta = 2 * beta / ((1 - beta) * (factor + 1))
     reference = source_wave[:, source_wave.shape[-1] // 2:source_wave.shape[-1] // 2 + 1]
-    return _sample((wavelength - reference) - reference * delta[:, None],
-                   (source_wave - reference) * factor[:, None], flux)
+    target = (wavelength - reference) - reference * delta[:, None]
+    source = (source_wave - reference) * factor[:, None]
+    if edge_fill:
+        # The variable-IP caller checks coverage of the requested spectrum plus
+        # IP support. Finite placeholders outside that interval are discarded.
+        return jax.vmap(jnp.interp)(target, source, flux)
+    return _sample(target, source, flux)
 
 
 class SpectralDecomposition(NamedTuple):
@@ -191,6 +197,15 @@ class SpecModel:
     Each nonzero-weight Gaussian's abs(mu)+5*sigma must fit the velocity support;
     choose still wider support as needed for rotation/macroturbulence tails.
 
+    A callable ``fixed_ip(wavelength)`` instead returns those five parameters
+    on the fixed observer-frame model grid, shape (region, pixel), in Angstrom
+    and the library's air/vacuum convention. Scalars and per-region values
+    also work. The callable is evaluated once outside JIT and is not retained.
+    A local response is precomputed; stellar broadening uses beta=0, followed
+    by RV, the wavelength-dependent IP, and requested-wavelength sampling.
+    ``broadened`` uses the same path with RV=0. This mode preserves a flat
+    continuum and uses point samples, not detector-pixel integration.
+
     All components use the same library. ``flux_weights`` are finite nonnegative
     relative stellar continuum fluxes, shape (N,) or (N, region), with a positive
     sum in every region. A tuple/list may mix scalar and per-region entries.
@@ -215,6 +230,7 @@ class SpecModel:
     macro_model: str
     _fixed_ip: object
     _ip_fourier: object
+    _ip_response: object
 
     @classmethod
     def from_grid(cls, gridpath, wavelength, *, regions=None, library=None,
@@ -318,8 +334,17 @@ class SpecModel:
         if operator is default_broadening and wave.shape[-1] <= 2 * half + 1:
             raise ValueError("prepared wavelength coverage is too short for broadening support; prepare wider regions")
         velocity = jnp.asarray(dv[:, None] * np.arange(-half, half + 1), dtype=spectra.wavelength.dtype)
-        ip_values, ip_fourier = None, None
-        if fixed_ip is not None:
+        ip_values, ip_fourier, ip_response = None, None, None
+        if callable(fixed_ip):
+            calibration_wave = wave.copy()
+            calibration_wave.setflags(write=False)
+            values = _fixed_ip_values(fixed_ip(calibration_wave), len(wave), pixels=wave.shape[-1])
+            ip_values = tuple(jnp.asarray(values[name], dtype=velocity.dtype) for name in _IP_PARAMETERS)
+            # Build from the stored numerical calibration, including dtype
+            # rounding, so saved settings reproduce the same response.
+            sampled = {name: np.asarray(value) for name, value in zip(_IP_PARAMETERS, ip_values)}
+            ip_response = _VariableIP.prepare(sampled, dv, dtype=velocity.dtype)
+        elif fixed_ip is not None:
             values = _fixed_ip_values(fixed_ip, len(wave))
             # Guard against wrapping even the IP itself across the FFT boundary.
             # Stellar broadening can require still more support; see the docs.
@@ -333,7 +358,8 @@ class SpecModel:
         for name, value in (("spectra", spectra), ("velocity_grid", velocity),
                             ("vmax", float(vmax)), ("broadening_operator", operator),
                             ("macro_model", macro_model),
-                            ("_fixed_ip", ip_values), ("_ip_fourier", ip_fourier)):
+                            ("_fixed_ip", ip_values), ("_ip_fourier", ip_fourier),
+                            ("_ip_response", ip_response)):
             object.__setattr__(self, name, value)
 
     @property
@@ -341,7 +367,9 @@ class SpecModel:
         """Fixed IP values in region order, or None for resolving-power mode.
 
         Returns a fresh mapping of immutable JAX arrays so editing the mapping
-        cannot invalidate the precomputed Fourier factor. Rebuild to change IP.
+        cannot invalidate the precomputed response. Callable IPs return arrays
+        of shape (region, model pixel), evaluated on spectra.wavelength.
+        Rebuild the model to change the IP.
         """
         return None if self._fixed_ip is None else dict(zip(_IP_PARAMETERS, self._fixed_ip))
 
@@ -536,15 +564,32 @@ class SpecModel:
         """The common physical path, evaluated once per component."""
         flux = self._atmosphere(component)
         wave = self.spectra.wavelength
-        if stage != "intrinsic":
-            wave, flux = self._broaden(component, params, flux)
+        if stage == "intrinsic":
+            return _sample(wavelength, wave, flux)
+        wave, flux = self._broaden(component, params, flux)
+        rv = jnp.zeros(wave.shape[0], dtype=wave.dtype)
         if stage == "full":
             if "rv" not in component:
                 raise ValueError("full requires component.rv (effective line-of-sight km/s)")
             rv = _region_parameter(component["rv"], "rv", wave.shape[0])
             _require(jnp.all(jnp.isfinite(rv) & (jnp.abs(rv) < _C_KMS)), "rv must be finite with abs(rv) < c")
+        if self._ip_response is not None:
+            return self._observe_with_ip(wavelength, wave, flux, rv)
+        if stage == "full":
             return _sample_with_rv(wavelength, wave, flux, rv)
         return _sample(wavelength, wave, flux)
+
+    def _observe_with_ip(self, wavelength, stellar_wave, flux, rv):
+        """Shift onto a fixed grid, apply the calibrated IP, then sample."""
+        response = self._ip_response
+        factor = _doppler_factor(rv)
+        _require(jnp.all(wavelength[:, 0] / response.padding >= stellar_wave[:, 0] * factor)
+                 & jnp.all(wavelength[:, -1] * response.padding <= stellar_wave[:, -1] * factor),
+                 "insufficient model wavelength coverage for broadening/RV/fixed_ip; "
+                 "prepare wider spectral regions or reduce the requested range")
+        wave = self.spectra.wavelength
+        shifted = _sample_with_rv(wave, stellar_wave, flux, rv, edge_fill=True)
+        return _sample(wavelength, wave[:, response.half:-response.half], response.apply(shifted))
 
     def _fractions(self, params, count, dtype):
         regions = self.spectra.wavelength.shape[0]
@@ -612,6 +657,10 @@ class SpecModel:
         Disconnected intervals at half maximum or unbracketed crossings raise
         an error. Asymmetric kernels with one half-maximum interval are valid.
         Custom broadening operators do not expose kernels and are unsupported.
+        For callable fixed_ip, use the cached IP at each region's middle model
+        pixel (index n_pixel // 2) to return a representative local width. This
+        is the width used for automatic outlier-mask extension, not a maximum
+        over wavelength; the spectrum still uses the full varying response.
         The method supports JIT and retains both output axes for a single star
         or region. It does not change any fit mask or choose a dilation factor.
         """
@@ -619,11 +668,24 @@ class SpecModel:
             raise NotImplementedError(
                 "broadening_fwhm requires the built-in broadening operator; "
                 "custom broadening operators do not expose kernels")
+        ip_fourier = self._ip_fourier
+        if self._ip_response is not None:
+            middle = self.spectra.wavelength.shape[-1] // 2
+            values = tuple(value[:, middle] for value in self._fixed_ip)
+            mu1, mu2, sigma1, sigma2, fraction2 = values
+            # The varying response can have wider support than this diagnostic
+            # kernel. Apply the same FFT support check as for constant fixed IP.
+            for mu, sigma, active in ((mu1, sigma1, fraction2 < 1),
+                                      (mu2, sigma2, fraction2 > 0)):
+                _require(jnp.all(~active | (jnp.abs(mu) + 5 * sigma <= self.velocity_grid[:, -1])),
+                         "central fixed_ip requires abs(mu) + 5*sigma within broadening support; "
+                         "increase SpecModel vmax")
+            ip_fourier = jax.vmap(double_gaussian_fourier)(self.velocity_grid, *values)
         widths = []
         for component in self._components(params):
             broad, resolution = self._broadening_parameters(component, params)
             kernel = _default_kernels(broadening=broad, resolving_power=resolution,
-                                      velocity_grid=self.velocity_grid, ip_fourier=self._ip_fourier,
+                                      velocity_grid=self.velocity_grid, ip_fourier=ip_fourier,
                                       macro_model=self.macro_model)
             width = _kernel_fwhm(self.velocity_grid, kernel)
             if self._fixed_ip is None:
@@ -658,13 +720,13 @@ class SpecModel:
         return SpectralDecomposition(total, values, weights, stellar, light, dilution, weighted)
 
     def tree_flatten(self):
-        return ((self.spectra, self.velocity_grid, self._fixed_ip, self._ip_fourier),
+        return ((self.spectra, self.velocity_grid, self._fixed_ip, self._ip_fourier, self._ip_response),
                 (self.vmax, self.broadening_operator, self.macro_model))
 
     @classmethod
     def tree_unflatten(cls, metadata, children):
         result = object.__new__(cls)
-        for name, value in zip(("spectra", "velocity_grid", "_fixed_ip", "_ip_fourier",
+        for name, value in zip(("spectra", "velocity_grid", "_fixed_ip", "_ip_fourier", "_ip_response",
                                 "vmax", "broadening_operator", "macro_model"), (*children, *metadata)):
             object.__setattr__(result, name, value)
         return result

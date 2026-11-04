@@ -13,16 +13,24 @@ import numpy as np
 _IP_PARAMETERS = ("mu1_kms", "mu2_kms", "sigma1_kms", "sigma2_kms", "fraction2")
 
 
-def _fixed_ip_values(values, count):
+def _fixed_ip_values(values, count, *, pixels=None):
     """Copy, expand and validate concrete IP parameters outside JIT."""
     if not isinstance(values, Mapping) or set(values) != set(_IP_PARAMETERS):
         raise ValueError(f"fixed_ip must supply exactly {', '.join(_IP_PARAMETERS)}")
     result = {}
+    shape = (count,) if pixels is None else (count, pixels)
     for name in _IP_PARAMETERS:
         value = np.asarray(values[name])
-        if value.dtype.kind not in "fiu" or value.shape not in ((), (count,)):
-            raise ValueError(f"fixed_ip {name} must be numeric, scalar or shape ({count},)")
-        value = np.broadcast_to(value, (count,)).astype(np.float64, copy=True)
+        if value.dtype.kind not in "fiu":
+            raise ValueError(f"fixed_ip {name} must be numeric")
+        if pixels is None and value.shape not in ((), (count,)):
+            raise ValueError(f"fixed_ip {name} must be scalar or shape ({count},)")
+        if pixels is not None and value.shape == (count,):
+            value = value[:, None]
+        try:
+            value = np.broadcast_to(value, shape).astype(np.float64, copy=True)
+        except ValueError as exc:
+            raise ValueError(f"fixed_ip {name} must broadcast to shape {shape}") from exc
         if not np.all(np.isfinite(value)):
             raise ValueError(f"fixed_ip {name} must be finite")
         if name.startswith("sigma") and np.any(value <= 0):

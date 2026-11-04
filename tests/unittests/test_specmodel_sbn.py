@@ -38,6 +38,7 @@ def sbn_parameters(count=3, dtype=np.float64):
 @pytest.mark.parametrize("stage", ["intrinsic", "broadened", "full"])
 @pytest.mark.parametrize("count", [1, 2, 3])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.slow
 def test_stages_decomposition_and_jit(count, stage, dtype):
     library, params = make_library(dtype=dtype), sbn_parameters(count, dtype)
     model, wave = SpecModel(library), observations(library)
@@ -199,6 +200,7 @@ def test_single_region_decomposition_retains_region_axis():
 
 
 @pytest.mark.parametrize("count", [1, 2, 3])
+@pytest.mark.slow
 def test_autodiff_all_parameters_weight_dilution_finite_difference_and_scale_null(count):
     library, params = make_library(), sbn_parameters(count)
     model, wave = SpecModel(library), observations(library)
@@ -258,6 +260,7 @@ def test_arbitrary_component_count_and_independent_region_controls():
     assert not np.array_equal(original.components[1, 1], modified.components[1, 1])
 
 
+@pytest.mark.slow
 def test_per_region_composition_gradients():
     library, params = make_library(), sbn_parameters(3)
     params.update(flux_weights=jnp.array([[1., 2.], [.3, .7], [.1, .2]]), dilution=jnp.array([.1, .2]))
@@ -267,3 +270,8 @@ def test_per_region_composition_gradients():
     assert gradient["dilution"].shape == (2,)
     assert all(np.all(np.isfinite(x)) for x in jax.tree.leaves(gradient))
     np.testing.assert_allclose(jnp.sum(gradient["flux_weights"] * params["flux_weights"], axis=0), 0, atol=1e-14)
+
+
+def test_sb2_full_spectrum_and_decomposition_jit():
+    # Keep a representative binary model while deferring the full stage/dtype matrix.
+    test_stages_decomposition_and_jit(count=2, stage="full", dtype=np.float64)

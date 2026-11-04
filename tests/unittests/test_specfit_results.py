@@ -37,6 +37,7 @@ def sampled_fit(x64_context):
         yield fit, config, model, point, mcmc
 
 
+@pytest.mark.slow
 def test_mcmc_roundtrip_and_reconstruction(sampled_fit, tmp_path, monkeypatch):
     fit, config, model, point, mcmc = sampled_fit
     expected = fit.predict(point=point, model=model)
@@ -144,9 +145,17 @@ def test_supplied_idata_preserves_groups_and_coordinate_order(tmp_path, arviz_fr
     np.testing.assert_array_equal(result.samples["display_teff"], np.arange(6.) + 1000.)
 
 
-def test_overwrite_keeps_unrelated_files_and_removes_stale_posterior(sampled_fit, tmp_path):
-    fit, _, model, point, mcmc = sampled_fit
-    output = save_fit_result(tmp_path / "target", sf=fit, model=model, mcmc=mcmc)
+@pytest.fixture
+def stored_fit(arviz_from_dict):
+    """File handling needs posterior arrays, not a fresh stellar fit."""
+    fit, config, point = case()
+    idata = arviz_from_dict(posterior={"teff": np.array([[5700., 5800., 5900.]])})
+    return fit, configured(fit, config), point, idata
+
+
+def test_overwrite_keeps_unrelated_files_and_removes_stale_posterior(stored_fit, tmp_path):
+    fit, model, point, idata = stored_fit
+    output = save_fit_result(tmp_path / "target", sf=fit, model=model, idata=idata)
     (output / "notes.txt").write_text("keep this")
     with pytest.raises(FileExistsError, match="overwrite"):
         save_fit_result(output, sf=fit, model=model, point=point)
@@ -156,8 +165,8 @@ def test_overwrite_keeps_unrelated_files_and_removes_stale_posterior(sampled_fit
     assert (output / "notes.txt").read_text() == "keep this"
 
 
-def test_failed_save_does_not_replace_existing_result(sampled_fit, tmp_path, monkeypatch, arviz_data_type):
-    fit, _, model, point, mcmc = sampled_fit
+def test_failed_save_does_not_replace_existing_result(stored_fit, tmp_path, monkeypatch, arviz_data_type):
+    fit, model, point, idata = stored_fit
     output = save_fit_result(tmp_path / "target", sf=fit, model=model, point=point)
     before = {path.name: path.read_bytes() for path in output.iterdir()}
 
@@ -166,16 +175,16 @@ def test_failed_save_does_not_replace_existing_result(sampled_fit, tmp_path, mon
 
     monkeypatch.setattr(arviz_data_type, "to_netcdf", fail)
     with pytest.raises(OSError, match="simulated"):
-        save_fit_result(output, sf=fit, model=model, mcmc=mcmc, overwrite=True)
+        save_fit_result(output, sf=fit, model=model, idata=idata, overwrite=True)
     assert {path.name: path.read_bytes() for path in output.iterdir()} == before
     assert not list(tmp_path.glob(".specfit-*"))
     np.testing.assert_array_equal(load_fit_result(output).point["teff"], point["teff"])
 
 
 @pytest.mark.parametrize("filename", ["arrays.npz", "posterior.nc"])
-def test_corruption_is_rejected(sampled_fit, tmp_path, filename):
-    fit, _, model, _, mcmc = sampled_fit
-    output = save_fit_result(tmp_path / "target", sf=fit, model=model, mcmc=mcmc)
+def test_corruption_is_rejected(stored_fit, tmp_path, filename):
+    fit, model, _, idata = stored_fit
+    output = save_fit_result(tmp_path / "target", sf=fit, model=model, idata=idata)
     with (output / filename).open("ab") as stream:
         stream.write(b"changed")
     with pytest.raises(ValueError, match="does not match"):
@@ -198,6 +207,7 @@ def test_wrong_format_and_unsafe_manifest_are_rejected(tmp_path):
         load_fit_result(output)
 
 
+@pytest.mark.slow
 def test_mcmc_mask_and_model_mismatch_rejected(sampled_fit, tmp_path):
     fit, config, model, point, mcmc = sampled_fit
     original = fit.fit_mask.copy()
