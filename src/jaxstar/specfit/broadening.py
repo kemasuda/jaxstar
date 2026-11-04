@@ -20,6 +20,12 @@ def gaussian_sigma(resolving_power):
 
 RP = tuple([-4.79443220978201773821E9, 1.95617491946556577543E12, -2.49248344360967716204E14, 9.70862251047306323952E15])
 RQ = tuple([1., 4.99563147152651017219E2, 1.73785401676374683123E5, 4.84409658339962045305E7, 1.11855537045356834862E10, 2.11277520115489217587E12, 3.10518229857422583814E14, 3.18121955943204943306E16, 1.71086294081043136091E18])
+# The common power-of-two scale leaves the rational approximation unchanged,
+# while keeping its denominator O(1). Otherwise reverse-mode terms involving
+# its reciprocal squared can underflow in float32, especially for small
+# cotangents. Scale Python floats before casting, retaining x64 precision.
+_RP_SCALED = tuple(coefficient * 2.**-60 for coefficient in RP)
+_RQ_SCALED = tuple(coefficient * 2.**-60 for coefficient in RQ)
 DR1 =  5.78318596294678452118E0
 DR2 = 3.04712623436620863991E1
 PP = tuple([7.96936729297347051624E-4, 8.28352392107440799803E-2, 1.23953371646414299388E0, 5.44725003058768775090E0, 8.74716500199817011941E0, 5.30324038235394892183E0, 9.99999999999999997821E-1])
@@ -34,11 +40,15 @@ SQ2OPI = 0.79788456080286535588
 def _j0(x):
     x = jnp.where(x > 0., x, -x)
 
-    z = x * x
+    # This polynomial is only used for |x| <= 5. Evaluating it at large x
+    # overflows in float32 and can poison reverse-mode even in a where branch
+    # whose result is not selected.
+    x_small = jnp.where(x <= 5., x, 0.)
+    z = x_small * x_small
     ret = 1. - z / 4.
 
     p = (z - DR1) * (z - DR2)
-    p = p * jnp.polyval(jnp.asarray(RP, dtype=x.dtype), z) / jnp.polyval(jnp.asarray(RQ, dtype=x.dtype), z)
+    p = p * jnp.polyval(jnp.asarray(_RP_SCALED, dtype=x.dtype), z) / jnp.polyval(jnp.asarray(_RQ_SCALED, dtype=x.dtype), z)
     ret = jnp.where(x < 1e-5, ret, p)
 
     # Avoid a singular unselected branch when reverse-mode sees x=0.
