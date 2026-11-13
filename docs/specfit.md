@@ -546,6 +546,15 @@ For multiple stars, supply a tuple of `components` plus nonnegative
 [SpecModel tutorial](tutorials/specfit/specmodel.ipynb) includes SB2/SB3
 examples. Use a custom NumPyro model to fit multiple stellar components.
 
+For single-star inference, `make_model_single(sf, dilution=dist.Uniform(0., 1.), ...)`
+fits a featureless continuum fraction with the same definition. A scalar prior
+shares one fraction across regions; a region-shaped prior fits one per region.
+A numeric value fixes the fraction, and the default `None` preserves the
+undiluted model without creating a dilution site. Values must satisfy
+`0 <= dilution < 1`. Both Gaussian and Gaussian-mixture likelihoods apply
+dilution before the fitted continuum; prediction and saved model settings
+retain it. Here `dist` is `numpyro.distributions`.
+
 #### Flat dictionaries and completed fit points
 
 A completed built-in prefit/SVI point can be converted without prediction or

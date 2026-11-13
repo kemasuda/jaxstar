@@ -166,19 +166,24 @@ def _resolve_empirical_vmacro(option, sigma):
     return helper, dependencies, sigma
 
 
-def single_star_params(atmosphere, *, vsini, vmacro, q1, q2, rv, resolving_power=None):
+def single_star_params(atmosphere, *, vsini, vmacro, q1, q2, rv, resolving_power=None,
+                       dilution=None):
     """Build one-component physical params, retaining frozen q1/q2 convention.
 
     This pure JAX helper is also useful in custom NumPyro models and outside
     inference when reconstructing spectra from a sample-site dictionary.
     Atmosphere coordinates are scalar; other values may be scalar or per region.
     Omit resolving_power when the SpecModel has a fixed_ip calibration.
+    Optional dilution is the featureless fraction of total continuum light.
     """
     u1, u2 = _limb_darkening_from_q(q1, q2)
-    return {"components": ({"atmosphere": dict(atmosphere),
+    params = {"components": ({"atmosphere": dict(atmosphere),
                             "broadening": {"vsini": vsini, "vmacro": vmacro, "u1": u1, "u2": u2},
                             "rv": rv},), "instrument": (
                                 {} if resolving_power is None else {"resolving_power": resolving_power})}
+    if dilution is not None:
+        params["dilution"] = dilution
+    return params
 
 
 def _draw(name, prior_or_value, *, regions=None, infer=None):
@@ -244,7 +249,7 @@ def _validate_single_config(observation, specmodel, atmosphere, broadening, *,
             raise ValueError("logg must be scalar")
 
     names = ("vsini", "vmacro", "q1", "q2")
-    reserved = (*names, "rv", "resolving_power", "sigma_constant", "sigma_continuum",
+    reserved = (*names, "rv", "resolving_power", "dilution", "sigma_constant", "sigma_continuum",
                 "jitter", "u1", "u2", "spectrum", "model_flux",
                 "mismatch_fraction", "mismatch_scale", "continuum_coefficients")
     if set(axes).intersection(reserved):
@@ -293,7 +298,7 @@ def _validate_likelihood(likelihood, gp_enabled, mismatch_fraction, mismatch_sca
         raise ValueError("mismatch parameters require likelihood='gaussian_mixture'")
 
 
-def model_single(observation, specmodel, *, resolving_power=None,
+def model_single(observation, specmodel, *, resolving_power=None, dilution=None,
                  atmosphere_bounds=None, rv_bounds=None, vsini_max=None,
                  vmacro_bounds=(0., 10.), fixed=None,
                  sigma_constant=0.1, sigma_continuum=0.05,
@@ -316,6 +321,11 @@ def model_single(observation, specmodel, *, resolving_power=None,
     fixed values. Resolving power and continuum scales may also be supplied as
     numeric values or NumPyro distributions. With SpecModel(fixed_ip=...), omit
     resolving_power; no instrumental parameter sites are created.
+
+    Optional dilution is a fixed value or a prior supported on 0 <= d < 1,
+    shared across regions or per region. It changes the physical spectrum to
+    d + (1 - d) * stellar_flux before the continuum and likelihood. None
+    preserves the undiluted path without adding a parameter site.
 
     The explicit ``atmosphere``, ``broadening``, ``rv``, ``jitter`` and GP
     arguments remain available for low-level distribution overrides. Explicit
@@ -498,6 +508,11 @@ def model_single(observation, specmodel, *, resolving_power=None,
         resolving_power = _draw(
             "resolving_power", resolving_power, regions=n_regions)
 
+    if dilution is not None:
+        dilution = _draw("dilution", dilution, regions=n_regions)
+        _require(jnp.all(jnp.isfinite(dilution) & (dilution >= 0) & (dilution < 1)),
+                 "dilution must be finite with 0 <= dilution < 1")
+
     # Continuum prior scales and additive noise.
     sigma_constant = _draw("sigma_constant", sigma_constant, regions=n_regions)
     sigma_continuum = _draw(
@@ -525,7 +540,7 @@ def model_single(observation, specmodel, *, resolving_power=None,
     # Convert limb darkening and evaluate the physical spectrum.
     params = single_star_params(
         coordinates, vsini=vsini, vmacro=vmacro, q1=q1, q2=q2,
-        rv=rv, resolving_power=resolving_power)
+        rv=rv, resolving_power=resolving_power, dilution=dilution)
     for name in ("u1", "u2"):
         numpyro.deterministic(
             name, params["components"][0]["broadening"][name])
@@ -581,7 +596,7 @@ def _bound_pair(value, name, *, shape=(), positive=False, singleton=False):
     return (float(low), float(high)) if not shape else (low, high)
 
 
-def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bounds=None,
+def make_model_single(sf, *, resolving_power=None, dilution=None, atmosphere_bounds=None, rv_bounds=None,
                       vsini_max=None, vmacro_bounds=(1., 15.), fixed=None,
                       degree=4, basis=None, use_gp=True, gp_solver="auto",
                       likelihood="gaussian", mismatch_fraction=None, mismatch_scale=None, mask_guard=None,
@@ -605,6 +620,10 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     Resolving power is required, as a positive scalar/region value or a NumPyro
     distribution. Infinity disables the Gaussian instrumental profile. With a
     fixed_ip SpecModel, omit resolving_power; its fixed mixture is used instead.
+
+    dilution accepts a fixed fraction or a NumPyro prior on 0 <= d < 1,
+    scalar (shared) or per region. For example, dilution=dist.Uniform(0., 1.)
+    fits one featureless continuum fraction. None adds no dilution site.
 
     ``likelihood="gaussian_mixture"`` requires ``use_gp=False`` and explicit
     ``mismatch_fraction``/``mismatch_scale`` numbers or scalar distributions.
@@ -803,7 +822,7 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     settings = dict(
         atmosphere_bounds=bounds, rv_bounds=rv_bounds, vsini_max=vsini_max,
         vmacro_bounds=vmacro_bounds, fixed=fixed,
-        resolving_power=resolving_power, degree=degree, basis=basis,
+        resolving_power=resolving_power, dilution=dilution, degree=degree, basis=basis,
         use_gp=use_gp, gp_solver=gp_solver, sigma_constant=sigma_constant,
         likelihood=likelihood, mismatch_fraction=mismatch_fraction, mismatch_scale=mismatch_scale,
         mask_guard=mask_guard,
