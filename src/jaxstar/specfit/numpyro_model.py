@@ -14,7 +14,7 @@ import numpyro.distributions as dist
 from .broadening import default_broadening
 from .continuum import _basis, _degree, chebyshev_basis, continuum_prior, apply_continuum
 from .likelihood import (
-    _validate_gp_solver, _mixture_parameters, gaussian_mixture_log_likelihood,
+    _validate_gp_solver, _mixture_parameters, _mask_guard, gaussian_mixture_log_likelihood,
     gp_marginalized_continuum_log_likelihood,
     marginalized_continuum_log_likelihood, prepare_gp_observation,
 )
@@ -301,7 +301,7 @@ def model_single(observation, specmodel, *, resolving_power=None,
                  gp_amplitude_bounds=(1e-3, 0.05),
                  gp_scale_bounds=(np.exp(-5.), np.exp(2.)),
                  use_gp=None, gp_solver="auto", use_physical_logg_max=False,
-                 likelihood="gaussian", mismatch_fraction=None, mismatch_scale=None,
+                 likelihood="gaussian", mismatch_fraction=None, mismatch_scale=None, mask_guard=None,
                  use_empirical_vmic=None, use_empirical_vmacro=False,
                  vmacro_empirical_sigma=None, degree=4, basis=None,
                  prior_only=False, save_model_flux=False,
@@ -346,6 +346,10 @@ def model_single(observation, specmodel, *, resolving_power=None,
     numbers or scalar NumPyro distributions. Component variances are
     uncertainty**2+jitter**2 and uncertainty**2+jitter**2+mismatch_scale**2.
     Mixture mode does not support GP parameters; use_gp must be False or None.
+    mask_guard is an optional fixed boolean array with observation.shape.
+    True pixels always use the narrow Gaussian and are protected by
+    SpecFit.mask_outliers, including after mask padding. Only mixture mode
+    accepts this setting; originally invalid pixels remain excluded.
 
     The optional Gaussian residual GP is Matérn-3/2, shared across independent
     regions. GP masks must be concrete when tracing. GP amplitude/jitter are in
@@ -365,6 +369,10 @@ def model_single(observation, specmodel, *, resolving_power=None,
         likelihood, use_gp is True or gp_amplitude is not None or gp_scale is not None
         or bool({"gp_amplitude", "gp_scale"}.intersection(fixed or {})),
         mismatch_fraction, mismatch_scale)
+    if mask_guard is not None:
+        if likelihood != "gaussian_mixture":
+            raise ValueError("mask_guard requires likelihood='gaussian_mixture'")
+        mask_guard = _mask_guard(mask_guard, observation.shape)
     _check_ip_choice(specmodel, resolving_power)
     _validate_gp_solver(gp_solver)
     vmacro_helper, vmacro_dependencies, vmacro_empirical_sigma = _resolve_empirical_vmacro(
@@ -532,7 +540,8 @@ def model_single(observation, specmodel, *, resolving_power=None,
         usable_flux = jnp.where(observation.valid, flux, 0)
         log_likelihood = gaussian_mixture_log_likelihood(
             observation, apply_continuum(usable_flux, basis, coefficients),
-            mismatch_fraction=mismatch_fraction, mismatch_scale=mismatch_scale, jitter=jitter)
+            mismatch_fraction=mismatch_fraction, mismatch_scale=mismatch_scale, jitter=jitter,
+            mask_guard=mask_guard)
     elif not gp_enabled:
         log_likelihood = marginalized_continuum_log_likelihood(
             observation, flux, degree=degree, basis=basis,
@@ -575,7 +584,7 @@ def _bound_pair(value, name, *, shape=(), positive=False, singleton=False):
 def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bounds=None,
                       vsini_max=None, vmacro_bounds=(1., 15.), fixed=None,
                       degree=4, basis=None, use_gp=True, gp_solver="auto",
-                      likelihood="gaussian", mismatch_fraction=None, mismatch_scale=None,
+                      likelihood="gaussian", mismatch_fraction=None, mismatch_scale=None, mask_guard=None,
                       use_physical_logg_max=False, use_empirical_vmic=None,
                       use_empirical_vmacro=False, vmacro_empirical_sigma=None,
                       sigma_constant=0.1, sigma_continuum=0.05,
@@ -602,6 +611,10 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     Both are global; the latter is an absolute flux amplitude. Continuum
     coefficients are explicit inference sites, while pixel mixture indicators
     are summed out. Both run_svi and run_nuts accept this configured model.
+    Mixture models automatically snapshot sf.mask_guard, including the Mg preset
+    and custom selections. mask_guard remains a legacy model-only argument;
+    when the SpecFit also defines a guard they must agree on usable pixels.
+    Gaussian models do not receive the guard as a likelihood setting.
 
     CCF is required only when RV or vsini still needs a default. RV has one
     Uniform per region centered on median CCF RV, with half-width 5 km/s if
@@ -639,6 +652,16 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
     _validate_likelihood(
         likelihood, use_gp or bool({"gp_amplitude", "gp_scale"}.intersection(fixed or {})),
         mismatch_fraction, mismatch_scale)
+    if likelihood == "gaussian_mixture":
+        guard = sf.mask_guard
+        if mask_guard is not None:
+            mask_guard = _mask_guard(mask_guard, sf.observation.shape)
+            if guard is not None and not np.array_equal(
+                    np.asarray(mask_guard) & ~np.asarray(sf.observation.mask), guard):
+                raise ValueError("mask_guard conflicts with SpecFit guard; "
+                                 "configure custom_guard on SpecFit")
+        elif guard is not None:
+            mask_guard = guard
     degree = _degree(degree)
     _validate_gp_solver(gp_solver)
     if not isinstance(use_physical_logg_max, bool):
@@ -783,6 +806,7 @@ def make_model_single(sf, *, resolving_power=None, atmosphere_bounds=None, rv_bo
         resolving_power=resolving_power, degree=degree, basis=basis,
         use_gp=use_gp, gp_solver=gp_solver, sigma_constant=sigma_constant,
         likelihood=likelihood, mismatch_fraction=mismatch_fraction, mismatch_scale=mismatch_scale,
+        mask_guard=mask_guard,
         sigma_continuum=sigma_continuum,
         **noise_bounds,
         use_physical_logg_max=use_physical_logg_max, use_empirical_vmic=use_empirical_vmic,

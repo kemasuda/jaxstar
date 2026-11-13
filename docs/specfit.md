@@ -1128,6 +1128,57 @@ sf.mask_outliers(
 mask_velocity_used = sf.outlier_diagnostics["mask_velocity"]
 ```
 
+To keep trusted pixels in the narrow component throughout the prefit, configure
+the guard on `SpecFit`. The default is no guard. `mg_guard=True` enables Mg I b
+windows at **5167.322, 5172.684 and 5183.604 air Å, each ±1 Å**. The spectral
+library must declare `wavelength_medium="air"` or `"vacuum"`; for vacuum spectra
+the air-window boundaries are converted with the library's air-to-vacuum rule.
+Wavelengths with an unknown medium are rejected when enabling this preset.
+
+```python
+sf = SpecFit(obs, specmodel, mg_guard=True)
+# SpecFit.from_grid(..., mg_guard=True) accepts the same guard options.
+sf.check_ccf(template_atmosphere)
+prefit_model, prefit_point = sf.run_mixture_prefit(
+    rng_key=jax.random.PRNGKey(0), model_kwargs=model_kwargs,
+    p_initial={"teff": 5800.},
+)
+sf.mask_outliers(model=prefit_model, point=prefit_point)
+```
+
+The guard is resolved when first accessed, normally when creating the mixture
+model, using the initial median CCF RV and the relativistic Doppler convention.
+For a workflow without CCF, pass an explicit scalar `guard_rv` in km/s to the
+constructor. A missing RV raises an error instead of assuming zero. Once
+resolved, the guard and its RV stay fixed even if CCF is recalculated.
+
+For arbitrary trusted pixels, pass `custom_guard=guard_array` to either
+constructor. This must be a boolean array with the observation's exact shape;
+`True` means protected. It is copied and made read-only. With both options,
+the effective guard is the **OR** of custom and Mg selections. The original
+observation mask always wins. Read the effective selection with `sf.mask_guard`,
+the original custom selection with `sf.custom_guard`, and the resolved RV with
+`sf.guard_rv`. Create a new `SpecFit` to change guard configuration.
+
+`make_model_single(..., likelihood="gaussian_mixture")` automatically takes a
+snapshot of this guard. Protected pixels use only the normalized narrow Gaussian
+(variance `uncertainty**2 + jitter**2`) and have zero mismatch probability.
+`mask_outliers` obtains the guard from `SpecFit` and protects it before and after
+padding; sigma clipping also respects it. A mixture model configured with a
+different guard is rejected before inference or prediction. The final Gaussian
+model needs no guard argument; it uses the resulting fit mask as usual.
+
+The legacy `make_model_single(..., mask_guard=array)` API remains supported,
+including via `run_mixture_prefit(model_kwargs=...)`. If the `SpecFit` also has
+a guard, the two must agree on valid pixels. Low-level mixture likelihood
+functions still accept `mask_guard` explicitly. Custom model callables must
+implement their own narrow-only likelihood behavior; mask protection alone
+does not change a callable's likelihood.
+
+A guard does not clear an already installed fit mask; reset that mask first
+when starting a fresh prefit. Saving a final Gaussian result preserves the
+`SpecFit` guard independently of the model's likelihood settings.
+
 `model_kwargs` forwards factory settings, including physical priors, fixed
 parameters, continuum degree/scales and optional mixture priors. The wrapper
 sets `likelihood="gaussian_mixture"`, `use_gp=False` and rejects conflicts.
@@ -1594,6 +1645,8 @@ groups and chain/draw dimensions in `posterior.nc`.
 
 - `observation`: the original wavelength, flux, uncertainty, fixed mask and labels.
 - `fit_mask`: the separate final fit mask.
+- `mask_guard`: the resolved trusted-pixel array, or `None` without a guard.
+- `custom_guard`: the original custom selection, or `None` if not supplied.
 - `point`: the native-site point dictionary, or `None` when not saved.
 - `idata`: the posterior and diagnostics, or `None` for point-only results.
 - `samples`: posterior arrays with chain/draw flattened for `predict` and
@@ -1604,7 +1657,8 @@ The same physical and configured models must be prepared explicitly before
 predicting again. For example, with the original `sf.specmodel` and `model`:
 
 ```python
-restored_sf = SpecFit(result.observation, sf.specmodel)
+restored_sf = SpecFit(result.observation, sf.specmodel,
+                      custom_guard=result.mask_guard)
 restored_sf.set_fit_mask(result.fit_mask)
 prediction = restored_sf.predict(point=result.point, model=model)
 plots = restored_sf.plot_models(samples=result.samples, model=model, show_gp=True)
@@ -1616,6 +1670,13 @@ the selected observed pixels. When saving a MCMC object from `SpecFit.run_nuts`,
 the supplied fit/model and effective observation must still match that run;
 changed data or masks raise an error. For externally supplied `idata`, the
 caller associates it with the appropriate fit and model.
+
+Restoring the resolved guard as `custom_guard` reproduces the exact selection
+without rerunning CCF. `metadata["mask_guard"]` records whether the Mg preset
+was used, its fixed RV, air-wavelength bounds and wavelength medium; the raw
+custom selection is also saved. Version-1 bundles without these optional
+records remain readable. A legacy guard saved in the mixture model settings
+is exposed as `result.mask_guard` when available.
 
 `metadata["model"]["settings"]` records resolved settings, including the numeric
 CCF-derived RV bounds and rotation limit. Arrays carry values, shapes and dtypes;

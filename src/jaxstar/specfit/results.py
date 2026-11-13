@@ -20,6 +20,7 @@ from jaxstar._arviz import (
     from_dict as _arviz_from_dict,
 )
 from .observation import Observation
+from ._guards import guard_array, MG_CENTERS_AIR, MG_HALF_WIDTH
 
 __all__ = ["FitResult", "save_fit_result", "load_fit_result"]
 
@@ -224,6 +225,8 @@ class FitResult:
     point: dict | None
     idata: object
     metadata: dict
+    mask_guard: np.ndarray | None = None
+    custom_guard: np.ndarray | None = None
 
     @property
     def samples(self):
@@ -273,6 +276,11 @@ def save_fit_result(directory, *, sf, model, point=None, mcmc=None, idata=None,
     arrays = {name: np.asarray(getattr(sf.observation, name))
               for name in ("wavelength", "flux", "uncertainty", "mask")}
     arrays["fit_mask"] = np.asarray(sf.fit_mask)
+    guard = sf._guard_for_model(model)
+    if guard is not None:
+        arrays["mask_guard"] = np.asarray(guard)
+    if sf.custom_guard is not None:
+        arrays["custom_guard"] = np.asarray(sf.custom_guard)
     point_names = None
     if point is not None:
         if not isinstance(point, Mapping) or not all(isinstance(name, str) for name in point):
@@ -302,6 +310,14 @@ def save_fit_result(directory, *, sf, model, point=None, mcmc=None, idata=None,
         "model": model_record, "grid": _grid_record(sf.specmodel), "sampler": sampler,
         "ccf": None if sf.ccf is None else _describe({
             key: sf.ccf[key] for key in ("rv", "width", "region_rv")}),
+        "mask_guard": {
+            "mg_guard": sf.mg_guard, "guard_rv_km_s": sf.guard_rv,
+            "centers_air_A": list(MG_CENTERS_AIR) if sf.mg_guard else None,
+            "half_width_air_A": MG_HALF_WIDTH if sf.mg_guard else None,
+            "wavelength_medium": sf.specmodel.spectra.wavelength_medium,
+            "source": ("specfit" if sf.mask_guard is not None else
+                       "legacy_model" if guard is not None else None),
+        },
         "user": _describe(metadata),
     }
     manifest = {
@@ -362,6 +378,15 @@ def load_fit_result(directory):
         if fit_mask.dtype.kind != "b" or fit_mask.shape != observation.shape:
             raise ValueError("saved fit mask must be Boolean with the observation shape")
         fit_mask.setflags(write=False)
+        guard = (guard_array(data["mask_guard"], observation.shape, name="saved mask_guard")
+                 if "mask_guard" in data else None)
+        custom_guard = (guard_array(data["custom_guard"], observation.shape, name="saved custom_guard")
+                        if "custom_guard" in data else None)
+        if guard is None:
+            # Version-1 bundles from the original model-only guard API.
+            legacy = manifest["metadata"].get("model", {}).get("settings", {}).get("mask_guard")
+            if isinstance(legacy, dict) and "values" in legacy:
+                guard = guard_array(legacy["values"], observation.shape, name="saved mask_guard")
         point = None
         if names is not None:
             point = {}
@@ -380,4 +405,4 @@ def load_fit_result(directory):
         finally:
             idata.close()
         _validate_posterior(idata)
-    return FitResult(observation, fit_mask, point, idata, manifest["metadata"])
+    return FitResult(observation, fit_mask, point, idata, manifest["metadata"], guard, custom_guard)
