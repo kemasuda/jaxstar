@@ -14,6 +14,7 @@ from .broadening import default_broadening
 from .model import SpecModel
 from .observation import Observation
 from .sampling import _C_KMS
+from ._guards import guard_array, guard_velocity, magnesium_guard
 
 
 def _rows(array):
@@ -197,22 +198,30 @@ class SpecFit:
 
     The constructor accepts matching rows; ``from_grid`` also prepares a model
     from legacy NPZ files. Neither entry point chooses priors. Persistent state
-    is the two inputs, setup-time RV bounds, a replaceable Boolean fit mask,
-    and the last CCF diagnostics. Samples/results are returned
-    to the caller. ``observation.mask`` is never changed. Display labels come
+    is the two inputs, setup-time RV bounds, a fixed trusted-pixel guard,
+    a replaceable Boolean fit mask, and the last CCF diagnostics. Samples/results
+    are returned to the caller. ``observation.mask`` is never changed. Display labels come
     from ``observation.region``, falling back to ``specmodel.spectra.regions``.
 
     Inference requires an explicit ``model(observation, specmodel)`` callable.
     Use make_model_single or bind a custom function and settings. Prediction
     delegates to the configured model's callback. No probability model is chosen
     implicitly, and each run uses the current fit mask.
+
+    mg_guard=True enables ±1 air-Angstrom windows at Mg I b 5167.322, 5172.684
+    and 5183.604 Å. Their bounds are converted for vacuum spectra. The preset
+    requires a known wavelength medium and initial check_ccf RV, or an explicit
+    scalar guard_rv in km/s. custom_guard is an optional observation-shaped
+    boolean array; True means trusted. Both selections are combined by OR and
+    the original data mask takes precedence. Defaults preserve unguarded fits.
     """
 
     @classmethod
     def from_grid(cls, gridpath, observation, *, library=None, pattern="*.npz",
                   wav_margin=3., pixels=None, velocity_step=None, vmax=50.,
                   wavelength_medium="unknown", flux_kind="as_stored",
-                  broadening_operator=None, fixed_ip=None, macro_model="rt"):
+                  broadening_operator=None, fixed_ip=None, macro_model="rt",
+                  mg_guard=False, custom_guard=None, guard_rv=None):
         """Select a common NPZ's regions or legacy files for an Observation.
 
         Delegates to ``SpecModel.from_grid`` using the observation's wavelengths
@@ -221,6 +230,7 @@ class SpecFit:
         a legacy directory requires exactly one of pixels or velocity_step.
         Arrays, fixed masks and labels in the supplied observation are preserved.
         ``macro_model`` selects 'rt' (default) or 'gaussian' in SpecModel.
+        Guard options are forwarded to SpecFit; they do not modify the grid.
         """
         if not isinstance(observation, Observation):
             raise TypeError("SpecFit.from_grid requires an Observation")
@@ -230,9 +240,11 @@ class SpecFit:
             pixels=pixels, velocity_step=velocity_step, vmax=vmax,
             wavelength_medium=wavelength_medium, flux_kind=flux_kind,
             broadening_operator=broadening_operator, fixed_ip=fixed_ip, macro_model=macro_model)
-        return cls(observation, model)
+        return cls(observation, model, mg_guard=mg_guard, custom_guard=custom_guard,
+                   guard_rv=guard_rv)
 
-    def __init__(self, observation, specmodel):
+    def __init__(self, observation, specmodel, *, mg_guard=False, custom_guard=None,
+                 guard_rv=None):
         if not isinstance(observation, Observation) or not isinstance(specmodel, SpecModel):
             raise TypeError("SpecFit requires Observation and SpecModel")
         if observation.n_regions != len(specmodel.spectra.regions):
@@ -268,6 +280,78 @@ class SpecFit:
             self._rv_bounds = bounds
         self.reset_fit_mask()
         self.ccf = None
+        if not isinstance(mg_guard, (bool, np.bool_)):
+            raise TypeError("mg_guard must be a bool")
+        if mg_guard and specmodel.spectra.wavelength_medium not in {"air", "vacuum"}:
+            raise ValueError("mg_guard requires wavelength_medium='air' or 'vacuum'")
+        if guard_rv is not None and not mg_guard:
+            raise ValueError("guard_rv requires mg_guard=True")
+        self._mg_guard = bool(mg_guard)
+        self._custom_guard = guard_array(custom_guard, observation.shape)
+        self._guard_rv = None if guard_rv is None else guard_velocity(guard_rv)
+        self._resolved_guard = None
+        self._guard_resolved = False
+
+    @property
+    def mg_guard(self):
+        """Whether the fixed Mg I b ±1 air-Å preset is enabled."""
+        return self._mg_guard
+
+    @property
+    def custom_guard(self):
+        """Read-only user selection, before union with the Mg preset."""
+        return self._custom_guard
+
+    @property
+    def guard_rv(self):
+        """Explicit/resolved Mg-guard RV in km/s, or None before resolution."""
+        return self._guard_rv
+
+    @property
+    def mask_guard(self):
+        """Fixed read-only union used by mixture inference and mask selection.
+
+        Mg windows are resolved on first access (normally model creation), from
+        explicit guard_rv or the initial median CCF RV. A later check_ccf does
+        not move an already resolved guard. Both presets and custom selections
+        respect the original observation mask. Create a new SpecFit to change
+        guard configuration; reset_fit_mask does not change the guard.
+        """
+        if not self._guard_resolved:
+            guard = (None if self.custom_guard is None else self.custom_guard.copy())
+            if self.mg_guard:
+                rv = self._guard_rv
+                if rv is None:
+                    if self.ccf is None:
+                        raise ValueError("mg_guard requires check_ccf() before model creation, "
+                                         "or an explicit guard_rv in km/s")
+                    rv = guard_velocity(self.ccf["rv"])
+                mg = magnesium_guard(self.observation, self.specmodel.spectra.wavelength_medium, rv)
+                guard = mg if guard is None else guard | mg
+                self._guard_rv = rv
+            if guard is not None:
+                guard &= ~np.asarray(self.observation.mask)
+                guard.setflags(write=False)
+            self._resolved_guard = guard
+            self._guard_resolved = True
+        return self._resolved_guard
+
+    def _guard_for_model(self, model):
+        """Check mixture snapshots; accept legacy model-only guard settings."""
+        from .numpyro_model import model_single
+
+        settings = getattr(model, "settings", {})
+        legacy = guard_array(settings.get("mask_guard"), self.observation.shape,
+                             name="mask_guard")
+        guard = self.mask_guard
+        if (guard is not None and getattr(model, "function", None) is model_single
+                and settings.get("likelihood") == "gaussian_mixture"):
+            actual = (np.zeros(self.observation.shape, bool) if legacy is None else
+                      legacy & ~np.asarray(self.observation.mask))
+            if not np.array_equal(guard, actual):
+                raise ValueError("model mask_guard differs from SpecFit; rebuild the mixture "
+                                 "model with this SpecFit")
+        return guard if guard is not None else legacy
 
     @property
     def rv_bounds(self):
@@ -418,6 +502,7 @@ class SpecFit:
         """
         from numpyro_inferutils import find_map_svi
 
+        self._guard_for_model(model)
         bound = partial(model, self.fit_observation(), self.specmodel)
         return find_map_svi(bound, step_size, num_steps, rng_key=rng_key,
                             p_initial=p_initial, progress_bar=progress_bar)
@@ -523,6 +608,7 @@ class SpecFit:
         if controls.get("jit_model_args", False):
             raise ValueError(
                 "SpecFit binds its observation; use jit_model_args=False, including for GP")
+        self._guard_for_model(model)
         bound = partial(model, self.fit_observation(), self.specmodel)
         mcmc = MCMC(NUTS(bound, **(nuts_kwargs or {})), num_warmup=num_warmup,
                     num_samples=num_samples, num_chains=num_chains,
@@ -571,6 +657,7 @@ class SpecFit:
         if not callable(predict):
             raise TypeError(
                 "prediction requires a configured model with a predict method")
+        self._guard_for_model(model)
         # Explicit mixture coefficients fix the curves independently of the
         # fit mask. Classify excluded pixels too; inference still uses fit_observation.
         observation = (self.observation if (
@@ -610,6 +697,9 @@ class SpecFit:
         from the fitted normal model. Pixels with probability > p_outlier (default .5) are
         flagged, then extended. sigma_threshold and mask_v
         apply only to sigma_clip. The inference likelihood is never changed.
+        SpecFit's mask_guard pixels are protected before and after extension.
+        A legacy model-only guard is used when SpecFit has none. The original
+        observation mask always takes precedence.
         For mixture masking, mask_velocity="auto" (default) uses half the largest
         broadening-kernel FWHM across components and regions with nonzero stellar
         light. Wavelength-dependent IP uses the calibration at each region's
@@ -701,6 +791,7 @@ class SpecFit:
                 raise ValueError(
                     "model prediction must contain model_flux")
             fixed = np.asarray(self.observation.mask)
+            guard = self._guard_for_model(model)
             baseline = self._prediction(prediction["model_flux"], fixed)
             variance = self._prediction(
                 _normal_residual_variance(self.observation, prediction, model, trace), fixed).copy()
@@ -729,11 +820,16 @@ class SpecFit:
                 probability = np.full(self.observation.shape, np.nan)
                 fitted = dict(mismatch_fraction=None,
                               mismatch_scale=None, log_likelihood=0.)
-                if np.any(~fixed):
-                    fitted, probability[~fixed] = _fit_gaussian_mixture(
-                        self.observation.flux[~fixed] - baseline[~fixed], variance[~fixed])
+                candidates = ~fixed if guard is None else ~fixed & ~guard
+                if np.any(candidates):
+                    fitted, probability[candidates] = _fit_gaussian_mixture(
+                        self.observation.flux[candidates] - baseline[candidates], variance[candidates])
                 source = "residual_fit"
+            if guard is not None:
+                probability = np.where(guard & ~fixed, 0., probability)
             flags = probability > float(threshold)
+            if guard is not None:
+                flags &= ~guard
             max_kernel_fwhm = None
             if extend_outlier_mask:
                 if automatic_velocity:
@@ -762,6 +858,8 @@ class SpecFit:
                 flags &= ~fixed
             else:
                 mask_velocity, velocity_source = 0., "disabled"
+            if guard is not None:
+                flags &= ~guard  # Neighbouring outliers must not mask the guard.
             diagnostics = dict(fitted, method=method, probability_source=source,
                                p_outlier=float(threshold),
                                mismatch_probability=probability,
@@ -804,6 +902,8 @@ class SpecFit:
                 "mask_v must be finite nonnegative scalar or one value per region")
         flags = np.zeros((self.observation.n_regions,
                          self.observation.n_pixels), dtype=bool)
+        guard = self._guard_for_model(model)
+        protected = None if guard is None else _rows(guard)
         diagnostics = []
         for i, (wave, flux, clip, model_flux, velocity) in enumerate(zip(
                 _rows(self.observation.wavelength), _rows(
@@ -831,8 +931,12 @@ class SpecFit:
             highpass = residual - trend
             scatter = 1.4826 * median_abs_deviation(highpass[usable])
             flags[i, usable] = np.abs(highpass[usable]) > threshold * scatter
+            if protected is not None:
+                flags[i] &= ~protected[i]
             if extend_outlier_mask:
                 flags[i] = _extend_mask(flags[i], factor) & usable
+            if protected is not None:
+                flags[i] &= ~protected[i]
             if make_plots:
                 diagnostics.append((residual, trend, highpass, scatter))
         self.set_fit_mask(flags.reshape(self.observation.shape))
