@@ -925,7 +925,10 @@ model function's signature when it is created; explicit settings take precedence
 Reconstruction reads these resolved settings without supplying separate defaults.
 CCF defaults are captured when the model is created.
 
-`run_svi` draws its initial values from the model's priors when `p_initial` is
+`run_svi` uses a Laplace point guide and Adam. Its loss includes the model's
+current support transforms and their Jacobians, so Teff-dependent logg uses
+the same transformation during optimization and when returning the point.
+It draws its initial values from the model's priors when `p_initial` is
 omitted. Explicit initial values remain available. Reuse the same model for
 refitting after mask changes and for NUTS/prediction.
 
@@ -979,9 +982,12 @@ sources are documented in `empirical_vmacro_valenti_fischer2005`,
 `empirical_vmacro_doyle2014` and `empirical_vmacro_lubin2026`. Fixed values for active
 empirical vmic/vmacro conflict with those options.
 
-`use_physical_logg_max=True` intersects the chosen Teff bounds with 4500--7000 K
-and checks gravity support against the grid. Fixed Teff must already satisfy
-this interval. Empty support or incompatible gravity ranges raise errors.
+`use_physical_logg_max=True` preserves the chosen Teff bounds (the loaded grid
+range unless explicitly overridden) and fixed Teff. It checks gravity support
+against the grid throughout that temperature range. Empty support or
+incompatible gravity ranges raise errors. The legacy relation's documented
+applicability range is 4500--7000 K; select that range explicitly through
+`atmosphere_bounds` if desired.
 The conditional gravity ceiling replaces the Uniform's upper bound and retains
 its lower bound; it is not clipped. Other empirical relations remain unclipped.
 These setup checks belong to the factory; direct model calls must choose

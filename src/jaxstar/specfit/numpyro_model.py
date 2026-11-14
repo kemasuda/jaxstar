@@ -649,9 +649,9 @@ def make_model_single(sf, *, resolving_power=None, dilution=None, atmosphere_bou
     lower and smallest upper bound across regions. Explicit bounds override
     these defaults; fixed parameters and disabled GP need no derived bounds.
 
-    With physical logg enabled, the selected Teff bounds are intersected with
-    4500--7000 K; fixed Teff must already be in that interval. The resulting
-    gravity prior must fit the loaded grid. The model's temperature-dependent
+    Physical logg leaves the selected Teff bounds and fixed Teff unchanged.
+    The resulting gravity prior must fit the loaded grid throughout that
+    temperature range. The model's temperature-dependent
     ceiling replaces a Uniform logg upper bound, retaining its lower bound.
     Other empirical relations retain their unclipped behavior.
     use_empirical_vmacro accepts False, True/"valenti_fischer2005",
@@ -782,17 +782,10 @@ def make_model_single(sf, *, resolving_power=None, dilution=None, atmosphere_bou
         low, high = bounds["teff"]
         if "teff" in fixed:
             low = high = float(fixed["teff"])
-            if not 4500. <= low <= 7000.:
-                raise ValueError(
-                    "fixed teff is outside the physical_logg_max temperature range")
-        else:
-            singleton = low == high
-            low, high = max(low, 4500.), min(high, 7000.)
-            if low > high or (low == high and not singleton):
-                raise ValueError(
-                    "no grid support in the physical_logg_max temperature range 4500--7000 K")
-            bounds["teff"] = (low, high)
-        ceilings = np.asarray(physical_logg_max(np.array([low, high])))
+        # The quadratic peaks near 3368 K; outside the historical 4500--7000 K
+        # interval, checking only the endpoints can miss the largest ceiling.
+        peak = np.clip(1.58069918e-04 / (2 * 2.34638497e-08), low, high)
+        ceilings = np.asarray(physical_logg_max(np.array([low, high, peak])))
         logg_low, logg_high = bounds["logg"]
         if "logg" in fixed or logg_low == logg_high:
             if fixed.get("logg", logg_low) > np.min(ceilings):

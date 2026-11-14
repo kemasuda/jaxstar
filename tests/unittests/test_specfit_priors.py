@@ -339,26 +339,31 @@ def test_invalid_settings(options, message):
         make_model_single(fit, resolving_power=70000., **options)
 
 
-@pytest.mark.parametrize("teff,expected", [
-    ([3500., 8000.], [4500., 7000.]), ([5000., 8000.], [5000., 7000.]),
-    ([3500., 6500.], [4500., 6500.]), ([5000., 6500.], [5000., 6500.]),
+@pytest.mark.parametrize("teff,override", [
+    ([3500., 8000.], None), ([5000., 8000.], None),
+    ([3500., 6500.], None), ([5000., 6500.], None),
+    ([7500., 8000.], None), ([7000., 8000.], None),
+    ([3500., 8000.], [4000., 7500.]),
 ])
-def test_physical_gravity_restricts_temperature(teff, expected):
+def test_physical_gravity_preserves_temperature(teff, override):
     fit = make_fit(axis_overrides=dict(teff=teff))
-    model = make_model_single(fit, resolving_power=70000., use_gp=False, use_physical_logg_max=True)
+    options = {} if override is None else {"atmosphere_bounds": {"teff": override}}
+    model = make_model_single(fit, resolving_power=70000., use_gp=False,
+                              use_physical_logg_max=True, **options)
+    expected = teff if override is None else override
     np.testing.assert_array_equal(model.settings["atmosphere_bounds"]["teff"], expected)
+    prior = model.prior_trace()["teff"]["fn"]
+    np.testing.assert_array_equal([prior.low, prior.high], expected)
     assert np.isfinite(trace(fit, model)["spectrum"]["fn"].log_factor)
-    unrestricted = make_model_single(fit, resolving_power=70000., use_gp=False)
-    np.testing.assert_array_equal(unrestricted.settings["atmosphere_bounds"]["teff"], teff)
 
 
 @pytest.mark.parametrize("axes,error", [
-    (dict(teff=[7500., 8000.]), "temperature range"),
-    (dict(teff=[7000., 8000.]), "temperature range"),
-    (dict(teff=[4000.]), "temperature range"),
+    (dict(teff=[9000., 12000.]), "outside the loaded logg grid"),
     (dict(logg=[3.5, 4.5]), "outside the loaded logg grid"),
     (dict(logg=[4.8, 5.]), "outside the loaded logg grid"),
     (dict(logg=[4.8]), "fixed logg exceeds"),
+    # Both endpoints fit, but the interior quadratic maximum does not.
+    (dict(teff=[2500., 4500.], logg=[3.5, 4.79]), "outside the loaded logg grid"),
 ])
 def test_physical_gravity_rejects_incompatible_support(axes, error):
     fit = make_fit(axis_overrides=axes)
@@ -366,7 +371,8 @@ def test_physical_gravity_rejects_incompatible_support(axes, error):
         make_model_single(fit, resolving_power=70000., use_physical_logg_max=True)
 
 
-@pytest.mark.parametrize("axes", [dict(teff=[4500.]), dict(teff=[7000.]),
+@pytest.mark.parametrize("axes", [dict(teff=[4000.]), dict(teff=[7500.]),
+                                  dict(teff=[4500.]), dict(teff=[7000.]),
                                   dict(logg=[4.]), dict(teff=[5800.], logg=[4.])])
 def test_physical_gravity_preserves_compatible_fixed_coordinates(axes):
     fit = make_fit(axis_overrides=axes)
@@ -376,6 +382,15 @@ def test_physical_gravity_preserves_compatible_fixed_coordinates(axes):
         assert result[name]["type"] == "deterministic"
         assert result[name]["value"] == values[0]
     assert np.isfinite(result["spectrum"]["fn"].log_factor)
+
+
+@pytest.mark.parametrize("temperature", [4000., 7500.])
+def test_physical_gravity_preserves_explicit_fixed_temperature(temperature):
+    fit = make_fit(axis_overrides={"teff": [3500., 8000.]})
+    model = make_model_single(fit, resolving_power=70000., use_gp=False,
+                              use_physical_logg_max=True, fixed={"teff": temperature})
+    assert model.prior_trace()["teff"]["value"] == temperature
+    np.testing.assert_array_equal(model.settings["atmosphere_bounds"]["teff"], [3500., 8000.])
 
 
 def test_custom_broadening_and_reconstruction_callback_use_current_mask():

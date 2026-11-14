@@ -495,12 +495,12 @@ class SpecFit:
 
     def run_svi(self, *, model, rng_key, step_size=.01, num_steps=1000,
                 p_initial=None, progress_bar=True):
-        """Return numpyro-inferutils.find_map_svi's native guide-median dict.
+        """Return a Laplace-mode estimate in native model-site coordinates.
 
         Supply a configured model or a plain callable of (observation, specmodel).
         With p_initial=None, initialization draws from the model's priors.
         """
-        from numpyro_inferutils import find_map_svi
+        from ._inference import find_map_svi
 
         self._guard_for_model(model)
         bound = partial(model, self.fit_observation(), self.specmodel)
