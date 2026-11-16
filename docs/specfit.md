@@ -925,9 +925,12 @@ model function's signature when it is created; explicit settings take precedence
 Reconstruction reads these resolved settings without supplying separate defaults.
 CCF defaults are captured when the model is created.
 
-`run_svi` uses a Laplace point guide and Adam. Its loss includes the model's
-current support transforms and their Jacobians, so Teff-dependent logg uses
-the same transformation during optimization and when returning the point.
+`run_svi` uses an AutoDelta point guide, Trace_ELBO and Adam to seek a local
+MAP in native sample-site coordinates: log likelihood + log prior. Internal
+unconstrained parameters enforce supports, but their transform Jacobians are
+not added to the optimization objective. Current supports are replayed so
+Teff-dependent logg bounds and returned deterministic sites remain consistent.
+NUTS retains its change-of-variables Jacobians for posterior sampling.
 It draws its initial values from the model's priors when `p_initial` is
 omitted. Explicit initial values remain available. Reuse the same model for
 refitting after mask changes and for NUTS/prediction.
