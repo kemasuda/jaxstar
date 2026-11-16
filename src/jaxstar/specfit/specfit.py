@@ -495,7 +495,7 @@ class SpecFit:
 
     def run_svi(self, *, model, rng_key, step_size=.01, num_steps=1000,
                 p_initial=None, progress_bar=True):
-        """Return a Laplace-mode estimate in native model-site coordinates.
+        """Return a physical-coordinate MAP estimate in native model-site coordinates.
 
         Supply a configured model or a plain callable of (observation, specmodel).
         With p_initial=None, initialization draws from the model's priors.
