@@ -546,6 +546,43 @@ For multiple stars, supply a tuple of `components` plus nonnegative
 [SpecModel tutorial](tutorials/specfit/specmodel.ipynb) includes SB2/SB3
 examples. Use a custom NumPyro model to fit multiple stellar components.
 
+#### Smooth Teff interpolation
+
+Select the interpolation mode when building the physical model:
+
+```python
+specmodel = SpecModel(spectra, teff_interp="cubic")
+sf = SpecFit(obs, specmodel)
+# Also accepted by SpecModel.from_grid and SpecFit.from_grid:
+# sf = SpecFit.from_grid(gridpath, obs, ..., teff_interp="cubic")
+```
+
+`teff_interp="linear"` remains the default and uses the existing multilinear
+kernel unchanged. `"cubic"` first interpolates the other atmosphere axes with
+that kernel at up to four neighbouring native Teff nodes, then applies a
+JAX-native, shape-preserving cubic Hermite interpolant (PCHIP) in Teff. The
+slopes use the actual temperature coordinates, including nonuniform grids;
+one/two Teff nodes reduce to constant/linear interpolation. This applies to
+any prepared spectral library with a named `teff` axis, including additional
+composition and microturbulence axes. The grid files and direct
+`spectra.grid.interpolate(...)` calls retain their existing linear behavior.
+
+At fixed other coordinates, cubic reproduces native Teff slices and has
+continuous first Teff derivatives. Its slope limiter avoids overshoot beyond
+the bracketing spectra pixel by pixel, up to numerical roundoff. Second
+derivatives can jump, and limiting can introduce additional derivative kinks
+with respect to logg or abundances; these axes are still interpolated linearly
+before the Teff step. The implementation supports JIT, autodiff and the
+existing NumPyro model, SVI and NUTS paths. The choice is static for all stellar
+components and recorded in saved result metadata. Rebuild the model and its
+configured inference model to switch modes.
+
+Smoother does not guarantee more accurate. The
+[held-out native-grid validation](../benchmarks/teff_interpolation.md) reports
+improvement over most tested Coelho and TLUSTY cases, with exceptions near the
+cool edge of Coelho and the TLUSTY family transition. Linear therefore remains
+the default; compare both modes for the relevant grid domain.
+
 #### Flat dictionaries and completed fit points
 
 A completed built-in prefit/SVI point can be converted without prediction or

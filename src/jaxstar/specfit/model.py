@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._data import _SpectralLibrary
+from ._interpolation import interpolate_flux
 from ._variable_ip import _VariableIP
 from .broadening import _default_kernels, default_broadening, double_gaussian_fourier
 from .ip_calibration import _IP_PARAMETERS, _fixed_ip_values
@@ -176,6 +177,13 @@ class SpecModel:
     Wavelengths are in the prepared library's Angstrom/medium convention, with
     shape (region, pixel); 1D input/output is allowed for one region only.
 
+    ``teff_interp='linear'`` (default) retains multilinear atmosphere lookup.
+    ``'cubic'`` applies local shape-preserving PCHIP along the named teff axis,
+    after linear interpolation in the other atmosphere coordinates. It is C1
+    in Teff, uses actual node spacing, and needs no additional dependency.
+    One/two Teff nodes reduce to constant/linear interpolation. The mode is
+    static and shared by all components; rebuild the model to change it.
+
     Parameters are nested ordinary dict/PyTree data: each entry in ``components``
     contains scalar ``atmosphere`` coordinates, ``broadening`` with vsini/vmacro/
     u1/u2, and effective ``rv`` in km/s. ``instrument.resolving_power`` specifies
@@ -228,6 +236,7 @@ class SpecModel:
     vmax: float
     broadening_operator: object
     macro_model: str
+    teff_interp: str
     _fixed_ip: object
     _ip_fourier: object
     _ip_response: object
@@ -236,7 +245,8 @@ class SpecModel:
     def from_grid(cls, gridpath, wavelength, *, regions=None, library=None,
                   pattern="*.npz", wav_margin=3., pixels=None, velocity_step=None,
                   vmax=50., wavelength_medium="unknown", flux_kind="as_stored",
-                  broadening_operator=None, fixed_ip=None, macro_model="rt"):
+                  broadening_operator=None, fixed_ip=None, macro_model="rt",
+                  teff_interp="linear"):
         """Select spectral regions from a common NPZ or legacy NPZ directory.
 
         ``wavelength`` (Angstrom; 1D or region-by-pixel) is used only to select
@@ -263,6 +273,8 @@ class SpecModel:
         Setup happens once, outside JIT; no raw files or downloads are used.
         ``fixed_ip`` is passed to SpecModel in the selected region row order.
         ``macro_model`` selects 'rt' (default) or 'gaussian' macroturbulence.
+        ``teff_interp`` selects 'linear' (default) or shape-preserving 'cubic'
+        temperature interpolation; all other atmosphere axes remain linear.
         """
         from .libraries import select_grid_paths, load_coelho, load_bosz, load_tlusty
         from .observation import _identifiers
@@ -304,12 +316,16 @@ class SpecModel:
             spectra = resample_spectral_grid(spectra, sampling="log", pixels=pixels,
                                              velocity_step=velocity_step)
         return cls(spectra, vmax=vmax, broadening_operator=broadening_operator,
-                   fixed_ip=fixed_ip, macro_model=macro_model)
+                   fixed_ip=fixed_ip, macro_model=macro_model, teff_interp=teff_interp)
 
     def __init__(self, spectra, *, vmax=50., broadening_operator=None, fixed_ip=None,
-                 macro_model="rt"):
+                 macro_model="rt", teff_interp="linear"):
         if not isinstance(spectra, _SpectralLibrary):
             raise TypeError("spectra must be a spectral-library loader/preparer result")
+        if not isinstance(teff_interp, str) or teff_interp not in ("linear", "cubic"):
+            raise ValueError("teff_interp must be 'linear' or 'cubic'")
+        if teff_interp == "cubic" and "teff" not in spectra.grid.axis_names:
+            raise ValueError("teff_interp='cubic' requires a 'teff' grid axis")
         if not is_log_uniform(spectra):
             raise ValueError("SpecModel requires log-uniform fitting wavelengths; use "
                              "prepare_*(sampling='log', velocity_step=...) or "
@@ -358,6 +374,7 @@ class SpecModel:
         for name, value in (("spectra", spectra), ("velocity_grid", velocity),
                             ("vmax", float(vmax)), ("broadening_operator", operator),
                             ("macro_model", macro_model),
+                            ("teff_interp", teff_interp),
                             ("_fixed_ip", ip_values), ("_ip_fourier", ip_fourier),
                             ("_ip_response", ip_response)):
             object.__setattr__(self, name, value)
@@ -500,7 +517,7 @@ class SpecModel:
             valid &= jnp.isfinite(value) & (value >= axis[0]) & (value <= axis[-1])
             coordinates[name] = value
         _require(valid, "atmosphere coordinates must be finite and inside the prepared grid")
-        flux = self.spectra.grid.interpolate(coordinates)["flux"]
+        flux = interpolate_flux(self.spectra.grid, coordinates, teff_interp=self.teff_interp)
         _require(jnp.all(jnp.isfinite(flux)), "atmosphere interpolation produced nonfinite flux")
         return flux
 
@@ -721,12 +738,13 @@ class SpecModel:
 
     def tree_flatten(self):
         return ((self.spectra, self.velocity_grid, self._fixed_ip, self._ip_fourier, self._ip_response),
-                (self.vmax, self.broadening_operator, self.macro_model))
+                (self.vmax, self.broadening_operator, self.macro_model, self.teff_interp))
 
     @classmethod
     def tree_unflatten(cls, metadata, children):
         result = object.__new__(cls)
         for name, value in zip(("spectra", "velocity_grid", "_fixed_ip", "_ip_fourier", "_ip_response",
-                                "vmax", "broadening_operator", "macro_model"), (*children, *metadata)):
+                                "vmax", "broadening_operator", "macro_model", "teff_interp"),
+                               (*children, *metadata)):
             object.__setattr__(result, name, value)
         return result
