@@ -87,7 +87,8 @@ def reconstruct_single(obs, specmodel, params, trace, settings):
         return {"params": params, "physical_flux": physical, "continuum": continuum,
                 "continuum_coefficients": coefficients, "model_flux": baseline,
                 "mean_flux": baseline, **noise,
-                "mismatch_probability": gaussian_mixture_responsibility(obs, baseline, **noise)}
+                "mismatch_probability": gaussian_mixture_responsibility(
+                    obs, baseline, **noise, mask_guard=settings.get("mask_guard"))}
     noise = {name: trace[name]["value"] for name in names}
     gp_names = ("gp_amplitude", "gp_scale")
     gp = {name: trace[name]["value"] for name in gp_names if name in trace}

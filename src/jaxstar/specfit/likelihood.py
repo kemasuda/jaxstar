@@ -36,14 +36,25 @@ def _mixture_parameters(mismatch_fraction, mismatch_scale):
     return fraction, scale
 
 
+def _mask_guard(mask_guard, shape):
+    """Validate a fixed boolean selection; True forces the narrow component."""
+    if mask_guard is None:
+        return None
+    guard = jnp.asarray(mask_guard)
+    if guard.dtype != jnp.bool_ or guard.shape != shape:
+        raise ValueError(f"mask_guard must be a boolean array with shape {shape}")
+    return guard
+
+
 def _gaussian_mixture_log_terms(observation, model_flux, mismatch_fraction,
-                                mismatch_scale, jitter):
+                                mismatch_scale, jitter, mask_guard=None):
     """Shared normalized pixel terms for the density and responsibilities."""
     if not isinstance(observation, Observation):
         raise TypeError("observation must be an Observation")
     flux = _real_array(model_flux, "model_flux")
     if flux.shape != observation.shape:
         raise ValueError("model_flux shape must match Observation.shape")
+    guard = _mask_guard(mask_guard, observation.shape)
     fraction, mismatch = _mixture_parameters(mismatch_fraction, mismatch_scale)
     jitter = _region_jitter(jitter, observation.n_regions)
     dtype = jnp.result_type(flux, observation.flux, observation.uncertainty,
@@ -59,15 +70,20 @@ def _gaussian_mixture_log_terms(observation, model_flux, mismatch_fraction,
     narrow_scale = jnp.hypot(error, jnp.where(usable, per_pixel_jitter, 0))
     broad_scale = jnp.hypot(narrow_scale, mismatch.astype(dtype))
     fraction = fraction.astype(dtype)
-    narrow = jnp.log1p(-fraction) + norm.logpdf(y, loc=flux, scale=narrow_scale)
+    normal = norm.logpdf(y, loc=flux, scale=narrow_scale)
+    narrow = jnp.log1p(-fraction) + normal
     broad = jnp.log(fraction) + norm.logpdf(y, loc=flux, scale=broad_scale)
     # Sum the two components separately for every pixel, then sum pixels.
     logp = logsumexp(jnp.stack((narrow, broad)), axis=0)
+    if guard is not None:
+        # Condition on the narrow component, without a mixture-weight penalty.
+        logp = jnp.where(guard, normal, logp)
+        broad = jnp.where(guard, -jnp.inf, broad)
     return logp, broad, usable
 
 
 def gaussian_mixture_log_likelihood(observation, model_flux, *, mismatch_fraction,
-                                    mismatch_scale, jitter=0.0):
+                                    mismatch_scale, jitter=0.0, mask_guard=None):
     """Independent two-Gaussian pixel mixture with indicators summed out.
 
     ``model_flux`` already includes the explicit continuum. With
@@ -76,27 +92,30 @@ def gaussian_mixture_log_likelihood(observation, model_flux, *, mismatch_fractio
     Both mixture parameters are global scalars; mismatch_scale is an absolute
     flux amplitude. Jitter is scalar or per region. No continuum or GP is
     marginalized here. Masked pixels contribute zero.
+    Optional boolean mask_guard has Observation.shape; True uses only the
+    normalized narrow Gaussian. It never restores originally masked pixels.
 
     Fractions 0/1 are supported as fixed pure-component limits. When sampling
     the fraction, use a prior supported inside (0, 1). A zero mismatch scale
     recovers the conditional Gaussian density for any fraction.
     """
     logp, _, usable = _gaussian_mixture_log_terms(
-        observation, model_flux, mismatch_fraction, mismatch_scale, jitter)
+        observation, model_flux, mismatch_fraction, mismatch_scale, jitter, mask_guard)
     return jnp.sum(jnp.where(usable, logp, 0))
 
 
 def gaussian_mixture_responsibility(observation, model_flux, *, mismatch_fraction,
-                                    mismatch_scale, jitter=0.0):
+                                    mismatch_scale, jitter=0.0, mask_guard=None):
     """Return P(mismatch | pixel, supplied parameters), with Observation.shape.
 
     Uses exactly the likelihood's normalized log terms and fixed mask. Masked
     pixels return NaN (no data-based classification). This creates no sample
     sites. Average these probabilities over posterior draws to include
     parameter uncertainty; do not evaluate only at an averaged spectrum.
+    Guarded valid pixels have exactly zero mismatch probability.
     """
     logp, broad, usable = _gaussian_mixture_log_terms(
-        observation, model_flux, mismatch_fraction, mismatch_scale, jitter)
+        observation, model_flux, mismatch_fraction, mismatch_scale, jitter, mask_guard)
     return jnp.where(usable, jnp.exp(broad - logp), jnp.nan)
 
 
