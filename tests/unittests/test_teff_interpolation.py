@@ -60,7 +60,10 @@ def test_native_nodes_linear_parity_and_scipy_reference(schema, dtype):
     np.testing.assert_array_equal(interpolate_flux(grid, locations, teff_interp="cubic"), expected)
     query = np.linspace(native[0], native[-1], 81)
     locations = point(grid, query)
-    np.testing.assert_array_equal(interpolate_flux(grid, locations), grid.interpolate(locations)["flux"])
+    np.testing.assert_array_equal(interpolate_flux(grid, locations, teff_interp="linear"),
+                                   grid.interpolate(locations)["flux"])
+    np.testing.assert_array_equal(interpolate_flux(grid, locations),
+                                   interpolate_flux(grid, locations, teff_interp="cubic"))
     fn = jax.jit(lambda g, p: interpolate_flux(g, p, teff_interp="cubic"))
     actual = fn(grid, locations)
     assert actual.shape == (81, 2, 5) and actual.dtype == dtype
@@ -165,18 +168,21 @@ def model_library():
     return _SpectralLibrary(grid, wave, (0,), "test", "vacuum", "normalized")
 
 
-@pytest.mark.parametrize("mode", ["linear", "cubic"])
+@pytest.mark.parametrize("mode", [None, "linear", "cubic"])
 def test_model_factories_metadata_and_full_gradient(tmp_path, mode):
     lib = model_library()
-    model = SpecModel(lib, vmax=30., teff_interp=mode)
+    options = {} if mode is None else {"teff_interp": mode}
+    expected_mode = "cubic" if mode is None else mode
+    model = SpecModel(lib, vmax=30., **options)
     wave = lib.wavelength[:, 100:201:5]
     obs = Observation(wave, jnp.ones_like(wave), jnp.full_like(wave, .01))
     path = save_spectral_grid(tmp_path / "grid.npz", lib)
-    fit = SpecFit.from_grid(path, obs, vmax=30., wav_margin=1., teff_interp=mode)
-    assert fit.specmodel.teff_interp == mode
-    assert _grid_record(model)["teff_interp"] == mode
+    fit = SpecFit.from_grid(path, obs, vmax=30., wav_margin=1., **options)
+    loaded = SpecModel.from_grid(path, wave, vmax=30., wav_margin=1., **options)
+    assert model.teff_interp == fit.specmodel.teff_interp == loaded.teff_interp == expected_mode
+    assert _grid_record(model)["teff_interp"] == expected_mode
     leaves, tree = jax.tree_util.tree_flatten(model)
-    assert jax.tree_util.tree_unflatten(tree, leaves).teff_interp == mode
+    assert jax.tree_util.tree_unflatten(tree, leaves).teff_interp == expected_mode
 
     def evaluate(m, t):
         p = m.make_params(dict(teff=t, vsini=6., vmacro=3., u1=.4, u2=.2,
@@ -184,10 +190,17 @@ def test_model_factories_metadata_and_full_gradient(tmp_path, mode):
         return m(p, wave)
 
     np.testing.assert_allclose(jax.jit(evaluate)(fit.specmodel, 5200.), evaluate(model, 5200.), atol=1e-13)
+    np.testing.assert_array_equal(evaluate(loaded, 5200.), evaluate(model, 5200.))
     value, grad = jax.jit(jax.value_and_grad(lambda t, m: evaluate(m, t).sum()))(5200., model)
     assert np.isfinite(value) and np.isfinite(grad)
     if mode == "linear":
-        np.testing.assert_array_equal(evaluate(model, 5200.), evaluate(SpecModel(lib, vmax=30.), 5200.))
+        np.testing.assert_array_equal(model._atmosphere({"atmosphere": {"teff": 5200.}}),
+                                       lib.grid.interpolate({"teff": 5200.})["flux"])
+    if mode is None:
+        np.testing.assert_array_equal(evaluate(model, 5200.),
+                                       evaluate(SpecModel(lib, vmax=30., teff_interp="cubic"), 5200.))
+        linear = evaluate(SpecModel(lib, vmax=30., teff_interp="linear"), 5200.)
+        assert np.max(np.abs(evaluate(model, 5200.) - linear)) > 1e-5
 
 
 @pytest.mark.parametrize("invalid", [None, "pchip", 1])
@@ -196,13 +209,15 @@ def test_invalid_mode(invalid):
         SpecModel(model_library(), teff_interp=invalid)
 
 
-def test_cubic_requires_named_teff():
+def test_grid_without_teff_retains_linear_interpolation():
     lib = model_library()
     grid = RectilinearGrid(axes={"custom_temperature": lib.grid.axis("teff")}, fields={
         "flux": Field(lib.grid.field("flux").values, ("custom_temperature",),
                       payload_dims=("region", "pixel"))})
-    with pytest.raises(ValueError, match="'teff' grid axis"):
-        SpecModel(replace(lib, grid=grid), teff_interp="cubic")
+    model = SpecModel(replace(lib, grid=grid))
+    coordinates = {"custom_temperature": 5200.}
+    np.testing.assert_array_equal(model._atmosphere({"atmosphere": coordinates}),
+                                   grid.interpolate(coordinates)["flux"])
 
 
 @pytest.mark.slow

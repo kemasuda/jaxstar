@@ -31,12 +31,13 @@ def _edge_slope(h0, h1, d0, d1):
     return jnp.where(limit, 3 * d0, slope)
 
 
-def interpolate_flux(grid, coordinates, *, teff_interp="linear"):
+def interpolate_flux(grid, coordinates, *, teff_interp="cubic"):
     """Return flux with shape broadcast(query) + (region, pixel).
 
-    ``linear`` delegates unchanged to RectilinearGrid. ``cubic`` uses actual
-    Teff coordinates and at most four native slices, retains the grid's fill
-    policy, and reduces to linear/constant for two/one Teff nodes. The mode is
+    ``linear`` delegates unchanged to RectilinearGrid. ``cubic`` (default) uses
+    actual Teff coordinates and at most four native slices, retains the grid's
+    fill policy, and reduces to linear/constant for two/one Teff nodes. Grids
+    without a named teff axis retain multilinear interpolation. The mode is
     static under JIT. All numerical evaluation, including slopes, is JAX-native.
     PCHIP is C1 in Teff at fixed other coordinates, not generally C2; slope
     limiting can introduce kinks with respect to other atmosphere coordinates.
@@ -46,7 +47,7 @@ def interpolate_flux(grid, coordinates, *, teff_interp="linear"):
     if teff_interp != "cubic":
         raise ValueError("teff_interp must be 'linear' or 'cubic'")
     if "teff" not in grid.axis_names:
-        raise ValueError("teff_interp='cubic' requires a 'teff' grid axis")
+        return grid.interpolate(coordinates)["flux"]
     if set(coordinates) != set(grid.axis_names):
         raise ValueError("coordinates must supply exactly the named grid axes")
     temperatures = grid.axis("teff")

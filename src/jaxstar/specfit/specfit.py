@@ -221,7 +221,7 @@ class SpecFit:
                   wav_margin=3., pixels=None, velocity_step=None, vmax=50.,
                   wavelength_medium="unknown", flux_kind="as_stored",
                   broadening_operator=None, fixed_ip=None, macro_model="rt",
-                  teff_interp="linear",
+                  teff_interp="cubic",
                   mg_guard=False, custom_guard=None, guard_rv=None):
         """Select a common NPZ's regions or legacy files for an Observation.
 
@@ -231,7 +231,7 @@ class SpecFit:
         a legacy directory requires exactly one of pixels or velocity_step.
         Arrays, fixed masks and labels in the supplied observation are preserved.
         ``macro_model`` selects 'rt' (default) or 'gaussian' in SpecModel.
-        ``teff_interp`` selects 'linear' (default) or 'cubic' in SpecModel.
+        ``teff_interp`` selects 'cubic' (default) or 'linear' in SpecModel.
         Guard options are forwarded to SpecFit; they do not modify the grid.
         """
         if not isinstance(observation, Observation):

@@ -177,12 +177,14 @@ class SpecModel:
     Wavelengths are in the prepared library's Angstrom/medium convention, with
     shape (region, pixel); 1D input/output is allowed for one region only.
 
-    ``teff_interp='linear'`` (default) retains multilinear atmosphere lookup.
-    ``'cubic'`` applies local shape-preserving PCHIP along the named teff axis,
-    after linear interpolation in the other atmosphere coordinates. It is C1
-    in Teff, uses actual node spacing, and needs no additional dependency.
-    One/two Teff nodes reduce to constant/linear interpolation. The mode is
-    static and shared by all components; rebuild the model to change it.
+    ``teff_interp='cubic'`` (default) applies local shape-preserving PCHIP along
+    the named teff axis, after linear interpolation in the other atmosphere
+    coordinates. It is C1 in Teff, uses actual node spacing, and needs no
+    additional dependency.
+    ``'linear'`` retains the previous multilinear atmosphere lookup. Grids
+    without a named teff axis remain multilinear; one/two Teff nodes reduce
+    to constant/linear interpolation. The mode is static and shared by all
+    components; rebuild the model to change it.
 
     Parameters are nested ordinary dict/PyTree data: each entry in ``components``
     contains scalar ``atmosphere`` coordinates, ``broadening`` with vsini/vmacro/
@@ -246,7 +248,7 @@ class SpecModel:
                   pattern="*.npz", wav_margin=3., pixels=None, velocity_step=None,
                   vmax=50., wavelength_medium="unknown", flux_kind="as_stored",
                   broadening_operator=None, fixed_ip=None, macro_model="rt",
-                  teff_interp="linear"):
+                  teff_interp="cubic"):
         """Select spectral regions from a common NPZ or legacy NPZ directory.
 
         ``wavelength`` (Angstrom; 1D or region-by-pixel) is used only to select
@@ -273,7 +275,7 @@ class SpecModel:
         Setup happens once, outside JIT; no raw files or downloads are used.
         ``fixed_ip`` is passed to SpecModel in the selected region row order.
         ``macro_model`` selects 'rt' (default) or 'gaussian' macroturbulence.
-        ``teff_interp`` selects 'linear' (default) or shape-preserving 'cubic'
+        ``teff_interp`` selects shape-preserving 'cubic' (default) or 'linear'
         temperature interpolation; all other atmosphere axes remain linear.
         """
         from .libraries import select_grid_paths, load_coelho, load_bosz, load_tlusty
@@ -319,13 +321,11 @@ class SpecModel:
                    fixed_ip=fixed_ip, macro_model=macro_model, teff_interp=teff_interp)
 
     def __init__(self, spectra, *, vmax=50., broadening_operator=None, fixed_ip=None,
-                 macro_model="rt", teff_interp="linear"):
+                 macro_model="rt", teff_interp="cubic"):
         if not isinstance(spectra, _SpectralLibrary):
             raise TypeError("spectra must be a spectral-library loader/preparer result")
         if not isinstance(teff_interp, str) or teff_interp not in ("linear", "cubic"):
             raise ValueError("teff_interp must be 'linear' or 'cubic'")
-        if teff_interp == "cubic" and "teff" not in spectra.grid.axis_names:
-            raise ValueError("teff_interp='cubic' requires a 'teff' grid axis")
         if not is_log_uniform(spectra):
             raise ValueError("SpecModel requires log-uniform fitting wavelengths; use "
                              "prepare_*(sampling='log', velocity_step=...) or "

@@ -22,8 +22,10 @@ uses weighted harmonic-mean slopes internally and limited one-sided endpoint
 slopes. Its first Teff derivative is continuous; its second derivative and
 derivatives with respect to other coordinates need not be. Finite-input
 branches avoid reciprocal singularities at flat pixels or extrema. The mode
-is static PyTree metadata on SpecModel, defaults to `linear`, and is included
-in saved fit metadata. No interpolation dependency is added.
+is static PyTree metadata on SpecModel, defaults to `cubic`, and is included
+in saved fit metadata. Explicit `linear` preserves the previous interpolation
+behavior; grids without a named teff axis remain multilinear. No interpolation
+dependency is added.
 
 ## Reproduce
 
@@ -135,8 +137,9 @@ statistical confidence levels.
 
 Cubic gives broad improvement in these two samples, but is not uniformly
 better, particularly near boundaries or changes in the native physics.
-`linear` remains the default. This test omits a node and thus widens its local
-interval; it does not establish errors at arbitrary sub-grid temperatures,
+Following this comparison, `cubic` is the default; `linear` remains available
+explicitly for comparisons and reproducing previous fits. This test omits a
+node and thus widens its local interval; it does not establish errors at arbitrary sub-grid temperatures,
 posterior calibration, performance on every library or inference speed.
 No real-star inference settings or fits were changed. BOSZ/Coelho/TLUSTY
 schemas and off-node other-coordinate interpolation are also checked against

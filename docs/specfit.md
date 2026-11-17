@@ -560,20 +560,22 @@ retain it. Here `dist` is `numpyro.distributions`.
 Select the interpolation mode when building the physical model:
 
 ```python
-specmodel = SpecModel(spectra, teff_interp="cubic")
+specmodel = SpecModel(spectra)  # teff_interp="cubic" by default
 sf = SpecFit(obs, specmodel)
 # Also accepted by SpecModel.from_grid and SpecFit.from_grid:
 # sf = SpecFit.from_grid(gridpath, obs, ..., teff_interp="cubic")
+# Use teff_interp="linear" to reproduce the previous interpolation behavior.
 ```
 
-`teff_interp="linear"` remains the default and uses the existing multilinear
+`teff_interp="cubic"` is the default. `"linear"` uses the previous multilinear
 kernel unchanged. `"cubic"` first interpolates the other atmosphere axes with
 that kernel at up to four neighbouring native Teff nodes, then applies a
 JAX-native, shape-preserving cubic Hermite interpolant (PCHIP) in Teff. The
 slopes use the actual temperature coordinates, including nonuniform grids;
 one/two Teff nodes reduce to constant/linear interpolation. This applies to
 any prepared spectral library with a named `teff` axis, including additional
-composition and microturbulence axes. The grid files and direct
+composition and microturbulence axes. Grids without a named `teff` axis retain
+multilinear interpolation. The grid files and direct
 `spectra.grid.interpolate(...)` calls retain their existing linear behavior.
 
 At fixed other coordinates, cubic reproduces native Teff slices and has
@@ -589,8 +591,9 @@ configured inference model to switch modes.
 Smoother does not guarantee more accurate. The
 [held-out native-grid validation](../benchmarks/teff_interpolation.md) reports
 improvement over most tested Coelho and TLUSTY cases, with exceptions near the
-cool edge of Coelho and the TLUSTY family transition. Linear therefore remains
-the default; compare both modes for the relevant grid domain.
+cool edge of Coelho and the TLUSTY family transition. Compare both modes for
+the relevant grid domain. To reproduce fits made with the previous default,
+set `teff_interp="linear"` explicitly when rebuilding the physical model.
 
 #### Flat dictionaries and completed fit points
 
