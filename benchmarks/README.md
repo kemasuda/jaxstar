@@ -1,5 +1,9 @@
 # Spectral CPU/GPU benchmark comparison
 
+Teff interpolation accuracy is covered separately by the
+[held-out native-grid validation](teff_interpolation.md), with reproducible
+Coelho/TLUSTY comparisons of `teff_interp="linear"` and `"cubic"`.
+
 ## Experimental k=1 Vecchia likelihood
 
 `benchmark_vecchia1.py` compares the exact Matérn-3/2 tinygp parallel solver,

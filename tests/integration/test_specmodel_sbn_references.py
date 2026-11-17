@@ -1,4 +1,7 @@
-"""SB2 parity against immutable TLUSTY artifacts and read-only legacy source."""
+"""SB2 parity against immutable TLUSTY artifacts and read-only legacy source.
+
+Explicit linear interpolation retains the frozen reference's temperature rule.
+"""
 
 import os
 from pathlib import Path
@@ -42,7 +45,7 @@ def case(tmp_path_factory):
 @pytest.mark.parametrize("dilution", [0., .2])
 def test_saved_sb2_ratio_mapping_full_components_and_dilution(case, dilution):
     params = {**case.params, "dilution": dilution}
-    model = SpecModel(case.spectra, vmax=case.vmax)
+    model = SpecModel(case.spectra, vmax=case.vmax, teff_interp="linear")
     physical = case.oracle["flux"] / HELPER["continuum_for_oracle"](case.wave)
     expected = dilution + (1 - dilution) * physical
     for evaluate in (lambda m, p, w: m(p, w), jax.jit(lambda m, p, w: m(p, w))):
@@ -66,7 +69,7 @@ def test_saved_sb2_physical_and_ratio_gradients(case):
         residual = (base * model(params, case.wave) - flux) / error
         return jnp.sum(jnp.where(valid, residual**2, 0.)) / valid.sum()
     value, gradient = jax.jit(jax.value_and_grad(objective, argnums=1))(
-        SpecModel(case.spectra, vmax=case.vmax), case.params)
+        SpecModel(case.spectra, vmax=case.vmax, teff_interp="linear"), case.params)
     np.testing.assert_allclose(value, case.oracle["objective"], rtol=2e-5, atol=2e-6)
     mapped = {"f2_f1": gradient["flux_weights"][1], "wavres": gradient["instrument"]["resolving_power"]}
     for i, component in enumerate(gradient["components"], 1):

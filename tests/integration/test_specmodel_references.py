@@ -3,6 +3,7 @@
 The full spectra and gradients use frozen_main.npz, with its fixed continuum
 removed externally. Intermediate stages and per-region generalizations use
 read-only frozen numerical source; no reference generator is run.
+Explicit linear interpolation retains the frozen reference's temperature rule.
 """
 
 import os
@@ -38,7 +39,7 @@ def case(request, tmp_path_factory):
 
 
 def test_intrinsic_broadened_full_match_frozen_source_and_saved_full(case):
-    model = SpecModel(case.spectra, vmax=case.vmax)
+    model = SpecModel(case.spectra, vmax=case.vmax, teff_interp="linear")
     expected = HELPER["frozen_stages"](case)
     for stage in ("intrinsic", "broadened", "full"):
         evaluate = lambda m, p, w: getattr(m, stage)(p, w)
@@ -58,7 +59,7 @@ def test_region_parameters_match_equivalent_frozen_low_level_mapping(case):
                                for key, value in case.params["components"][0]["broadening"].items()}},),
               "instrument": case.params["instrument"]}
     expected = HELPER["frozen_stages"](case, params)
-    model = SpecModel(case.spectra, vmax=case.vmax)
+    model = SpecModel(case.spectra, vmax=case.vmax, teff_interp="linear")
     for stage in ("broadened", "full"):
         actual = jax.jit(lambda m, p, w: getattr(m, stage)(p, w))(model, params, case.wave)
         np.testing.assert_allclose(actual, expected[stage], rtol=5e-6, atol=1e-6)
@@ -73,7 +74,7 @@ def test_single_star_dilution_matches_frozen_model(case):
                   "wavres": params["instrument"]["resolving_power"], "dilution": .23,
                   "norm": jnp.ones(len(case.wave)), "slope": jnp.zeros(len(case.wave))}
     expected = case.old.fluxmodel_multiorder(old_params)
-    actual = SpecModel(case.spectra, vmax=case.vmax)(params, case.wave)
+    actual = SpecModel(case.spectra, vmax=case.vmax, teff_interp="linear")(params, case.wave)
     np.testing.assert_allclose(actual, expected, rtol=5e-6, atol=1e-6)
 
 
@@ -85,7 +86,8 @@ def test_saved_objective_physical_gradients(case):
         old = lambda p: jnp.sum(HELPER["frozen_stages"](case, p)["full"] * weights)
         new = lambda m, p: jnp.sum(m(p, case.wave) * weights)
         expected = jax.jit(jax.grad(old))(case.params)
-        _, actual = jax.jit(jax.value_and_grad(new, argnums=1))(SpecModel(case.spectra, vmax=case.vmax), case.params)
+        _, actual = jax.jit(jax.value_and_grad(new, argnums=1))(
+            SpecModel(case.spectra, vmax=case.vmax, teff_interp="linear"), case.params)
         for got, want in zip(jax.tree_util.tree_leaves(actual), jax.tree_util.tree_leaves(expected)):
             scale = max(float(np.max(np.abs(want))), 1e-9)
             np.testing.assert_allclose(got / scale, want / scale, rtol=3e-4, atol=3e-4)
@@ -98,7 +100,7 @@ def test_saved_objective_physical_gradients(case):
         residual = (base * model(params, case.wave) - flux) / error
         return jnp.sum(jnp.where(valid, residual**2, 0.)) / valid.sum()
     value, gradient = jax.jit(jax.value_and_grad(objective, argnums=1))(
-        SpecModel(case.spectra, vmax=case.vmax), case.params)
+        SpecModel(case.spectra, vmax=case.vmax, teff_interp="linear"), case.params)
     np.testing.assert_allclose(value, case.oracle["objective"], rtol=2e-5, atol=2e-6)
     component = gradient["components"][0]
     mapped = {**component["atmosphere"], **component["broadening"], "rv": component["rv"],
