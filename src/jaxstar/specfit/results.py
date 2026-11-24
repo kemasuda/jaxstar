@@ -163,12 +163,14 @@ def _mcmc_to_inference_data(mcmc, *, regions=None):
              for name, value in mcmc.get_extra_fields(group_by_chain=True).items()
              if not isinstance(value, (Mapping, tuple))}
     coords, dims = {}, {}
-    if (regions is not None and "rv" in samples
-            and samples["rv"].shape[2:] == (len(regions),)):
+    region_sites = [] if regions is None else [
+        name for name in ("rv", "depth_scale")
+        if name in samples and samples[name].shape[2:] == (len(regions),)]
+    if region_sites:
         coords["region"] = list(regions)
         if len({type(label) for label in regions}) > 1:
             coords["region"] = [str(label) for label in regions]
-        dims["rv"] = ["region"]
+        dims.update({name: ["region"] for name in region_sites})
     groups = {"posterior": samples}
     if stats:
         groups["sample_stats"] = stats

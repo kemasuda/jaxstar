@@ -342,10 +342,12 @@ Angstrom on **each** side. It selects and reorders regions to match the observed
 rows. One saved region may serve several rows. Zero or multiple covering regions
 fail before flux loading, with the candidate labels and coverages in the error.
 Observation labels name the output rows; they do not select saved identifiers or
-resolve overlapping candidates. If observation labels are omitted, selected
-saved labels are retained.
+resolve overlapping candidates. Pass `source_regions` with one saved label
+per output row to select the source explicitly, including repeated orders.
+Coverage is still checked. If observation labels are omitted, selected saved
+labels are retained.
 
-Selected regions retain their complete saved wavelength spans and samples.
+By default, selected regions retain their complete saved wavelength spans and samples.
 The full flux array is read into host memory and selected in NumPy; only the
 selected subset enters the JAX grid. All atmosphere axes and their ordering,
 flux dtype (subject to JAX precision settings), and saved interpretation metadata
@@ -375,6 +377,82 @@ spectra = load_spectral_grid(
 
 Omitting `wavelength` retains the original `load_spectral_grid(path)` behavior:
 all saved regions are restored. The NPZ schema and spectral carrier are unchanged.
+
+#### Fit individual line regions
+
+A region can be one line window. Extract observed windows without resampling,
+then optionally crop the model grid before its atmosphere payload enters JAX:
+
+```python
+import numpy as np
+import numpyro.distributions as dist
+from jaxstar.specfit import extract_regions, SpecFit, make_model_single
+
+# Supply fit_ranges in the SAME wavelength frame/medium as observation.
+# line_ids label the output; source_orders select original observation rows.
+line_obs, mapping = extract_regions(
+    observation, wavelength_ranges=fit_ranges,
+    regions=line_ids, source_regions=source_orders,
+)
+sf = SpecFit.from_grid(
+    grid_path, line_obs,
+    source_regions=mapping.source_regions,  # if saved grid uses the same order IDs
+    crop=True, wav_margin=3., vmax=50.,
+    # velocity_step=0.5,  # optional explicit model resampling in km/s
+)
+n = line_obs.n_regions
+model = make_model_single(
+    sf, resolving_power=70000., degree=1, use_gp=False,
+    rv_bounds=(np.full(n, rv_center - 5.), np.full(n, rv_center + 5.)),
+    vsini_max=20., vmacro_bounds=(0., 15.),
+    depth_scale=dist.LogNormal(0., .3).expand([n]),
+    fixed={},  # atmosphere axes stay free; fix any subset here if desired
+)
+```
+
+The example uses Gaussian instrumental broadening; supply your calibration
+instead with `fixed_ip=` on `SpecFit.from_grid` and omit `resolving_power`.
+Per-order calibration arrays can be indexed with `mapping.source_indices`.
+A wavelength-dependent callable receives the new model rows in line order.
+If grid labels differ from observation order IDs, supply the corresponding
+saved grid labels explicitly in `source_regions`.
+
+Both extracted observations and model grids are rectangular. Extraction keeps
+all measured samples and original masks inside each requested interval.
+Shorter rows receive masked padding with adjacent native wavelengths, NaN
+flux/error and `mapping.pixel_indices == -1`. Selected samples retain their
+original pixel indices; `mapping.source_indices` and `mapping.source_regions`
+retain the source order. Use `sf.set_fit_mask(mapping.take(old_sf.fit_mask,
+fill_value=True))` to transfer an existing adjustable fit mask separately.
+No data interpolation, RV correction or wavelength-medium conversion occurs.
+An unlabeled source observation uses zero-based source row indices.
+
+`crop=True` affects only wavelengths: every atmosphere node/axis remains
+available for inference. Native log-uniform samples are retained by default;
+shorter model slices are extended with real source samples to a common length.
+With `pixels`, each requested interval is sampled at that count. With
+`velocity_step`, windows are extended to a common count at that exact spacing.
+The loader rejects requests that cannot fit inside the saved source coverage.
+It reads the full NPZ flux once on the host, crops each selected source slice,
+and transfers only the small payload to JAX; it does not first duplicate full
+orders for every candidate. This is supported for common prepared NPZ files;
+convert legacy grids with `save_spectral_grid` first.
+
+Choose `wav_margin` to cover the entire RV prior, finite rotational/macro/IP
+kernel support and interpolation. It is an Angstrom margin on each side,
+including masked observation padding, not an automatic estimate from priors.
+Check `sf.rv_bounds` against the intended per-region RV ranges. A margin that is
+too small raises a coverage error rather than extrapolating. `vmax` separately
+sets finite convolution support and must be adequate for the broadening prior.
+
+The example has shared atmosphere, rotation and macroturbulence, with independent
+RV, depth and continuum for each line region. The factory broadcasts scalar
+RV bounds to independent per-region priors too; the low-level model_single's
+explicit scalar `rv` prior can instead share a single RV. Use existing
+`run_svi`, `run_nuts`, `predict` and
+`plot_models` with this configured model; no CCF is needed when RV bounds and
+rotation bounds are supplied. This uses the existing likelihood choices and
+performs no automatic whole-line classification.
 
 #### Select legacy grids for an observation
 
@@ -555,6 +633,22 @@ undiluted model without creating a dilution site. Values must satisfy
 dilution before the fitted continuum; prediction and saved model settings
 retain it. Here `dist` is `numpyro.distributions`.
 
+#### Region depth correction
+
+`depth_scale=a` applies `1 + a * (F - 1)` to the normalized physical spectrum
+before the fitted multiplicative continuum. Positive values below/above one
+make absorption shallower/deeper while preserving the unit continuum. A scalar
+is shared; an array or a region-shaped NumPyro prior gives one value per region.
+`None` omits the parameter and keeps the original physical path (`a=1`).
+`SpecModel.make_params`, `single_star_params`, `model_single` and
+`make_model_single` all accept it. The correction applies consistently to
+intrinsic, broadened and full spectra, likelihoods and saved-point prediction.
+`decompose` returns depth-scaled components and retains its light-sum identity.
+
+For this line-fitting use, leave dilution at zero. If both are free, only the
+product `a * (1 - dilution)` is constrained. Depth scales do not freeze the
+atmosphere; fixed/free coordinates retain their usual configuration.
+
 #### Smooth Teff interpolation
 
 Select the interpolation mode when building the physical model:
@@ -634,7 +728,7 @@ parts = specmodel.decompose(params, wav_obs)
 ```
 
 With `components` present, stellar parameters belong only in each component;
-`resolving_power`, `flux_weights` and `dilution` belong only in the outer dict.
+`resolving_power`, `flux_weights`, `dilution` and `depth_scale` belong only in the outer dict.
 Existing nested dictionaries from the tutorial or `single_star_params` go
 directly to the physical methods and do not need `make_params`.
 
@@ -646,6 +740,7 @@ directly to the physical methods and do not need `make_params`.
 | `resolving_power` | Scalar or `(n_region,)`; omit with fixed IP |
 | `flux_weights` | `(N,)` or `(N, n_region)`; a tuple/list may mix scalar and region entries |
 | `dilution` | Scalar or `(n_region,)` |
+| `depth_scale` | Positive scalar or `(n_region,)`; omitted means 1 |
 
 Scalars are shared across regions; arrays follow the prepared row order.
 No component, epoch or posterior-draw axis is inferred from a stellar value.
@@ -1963,3 +2058,95 @@ integral, and can fit both densities to a spectrum drawn from the exact model.
   sibling `jaxspec` checkout; see the notebook's setup instructions.
 - [Continuum](tutorials/specfit/continuum.ipynb) is a self-contained synthetic
   demonstration of marginalization, shrinkage and jitter.
+
+### Data-only line selection and region mixture prefit
+
+`SpecFit.select_lines` screens an already normalized observation using a supplied
+stellar-rest line list. It does not evaluate a synthetic spectrum or divide by
+a model continuum. Wavelengths must use the observation's units and medium;
+RV is a scalar or one value per original order. The returned table preserves
+line-list metadata and reports every rejection reason, source order, and
+`wavelength_min` / `wavelength_max` in the observed frame.
+
+```python
+from jaxstar.specfit import LineSelectionCriteria
+
+line_sf, selection = sf.select_lines(
+    line_list,                       # DataFrame: line_id, wavelength, ...
+    rv=previous_rv,                   # scalar or original-order array, km/s
+    criteria=LineSelectionCriteria(
+        nearest_line_min_kms=20., center_prominence_min=.1,
+        center_depth_max=None, wing_min_flux=.9),
+    fit_half_width_kms=10., wav_margin=3.,
+)
+# line_sf is None if no candidates pass; the table is still returned.
+```
+
+The defaults require an observed minimum within ±3 km/s, prominence >0.1,
+no secondary minimum with prominence >=0.05 at 5<|v|<=10 km/s, and median flux
+>=0.9 in each of [-20,-15] and [15,20] km/s. Profiles are smoothed with sigma=1.2
+native pixels. Input masks are excluded; large gaps split peak finding, while
+NaN storage padding does not. `max_gap_pixels=2.5` controls the gap threshold.
+`nearest_line_min_kms=20` uses the full input list, including unobserved lines.
+All thresholds are fields of `LineSelectionCriteria`; unknown fields fail.
+`select_lines(observation, line_list, rv=...)` is also available as a standalone
+function returning just the table, without a SpecModel.
+
+The small-window SpecFit preserves input pixels/masks, all atmosphere nodes,
+`macro_model`, `teff_interp`, `vmax` and the broadening operator. A callable IP
+is retained and re-evaluated in the original source-order row convention, even
+when one order supplies several lines. Constant per-order IP values are mapped
+to their lines. Callable broadening operators must support the new region axis.
+The parent is unchanged. Previous fit-derived masks are **not** inherited by
+default (`inherit_fit_mask=True` opts in). The new fit exposes `region_mapping`,
+`initial_rv` and `line_selection`. `crop=False` retains whole source model rows;
+`wav_margin` must cover the RV prior and stellar/IP convolution support.
+Overlapping windows raise by default. Set `overlap="nearest"` in
+`sf.select_lines` to retain all candidates and assign each shared source pixel
+to its nearest line center in log wavelength. Other copies are fit-masked;
+`region_overlap_mask` records that assignment and the input mask is preserved.
+
+```python
+import numpyro.distributions as dist
+
+model, point = line_sf.run_region_mixture_prefit(
+    rng_key=key,
+    model_kwargs=dict(
+        fixed=atmosphere_values,      # omit to fit atmosphere jointly
+        rv_bounds=(line_sf.initial_rv-3., line_sf.initial_rv+3.),
+        vsini_max=12., degree=1,
+        # resolving_power=... is required if sf has no fixed_ip
+        depth_scale=dist.LogNormal(0., .3).expand([line_sf.observation.n_regions]),
+        mismatch_fraction=dist.Beta(1., 9.),
+        mismatch_scale=dist.LogNormal(-3.5065578973, .7),
+    ),
+    p_initial=initial_values,
+)
+prediction = line_sf.predict(point=point, model=model)
+p_bad = prediction['region_mismatch_probability']
+```
+
+`make_model_region_mixture` is separate from the pixel mixture. Good and bad
+both use independent Gaussian residuals: variances are uncertainty²+jitter²
+and uncertainty²+jitter²+mismatch_scale². They share one physical spectrum and
+the same Gaussian prior on a multiplicative baseline. The baseline is integrated
+in each component; the fully normalized densities are then mixed **once per
+region**. Default degree is 1, depth priors are independent LogNormal(0,.3),
+and global mixture defaults are Beta(1,9) and HalfNormal(.1). Override these as
+above or use fixed values. This implementation does not use a GP or pixel guard.
+
+SVI returns a physical-coordinate MAP point, not posterior samples. The returned
+model can also be used with `run_nuts`. Prediction contains the label-averaged
+baseline, its coefficient covariance (including between-label variance),
+`good_model_flux`, `bad_model_flux`, `component_log_likelihood`, and one
+`region_mismatch_probability` per region. `predict(samples=...)` averages the
+probabilities after computing them for each draw. Fully masked regions have no
+evidence: zero likelihood contribution and probability equal to the prior
+fraction. No observations are automatically rejected or remasked. A threshold
+on `p_bad` is a separate downstream choice.
+
+`make_model_region_mixture(..., vsini=...)` accepts a fixed scalar or a
+scalar NumPyro rotation prior shared by every region. `vsini=None` uses the
+usual Uniform(0, vsini_max). Do not also supply fixed['vsini']; a fixed rotation
+is omitted from p_initial. For a custom prior, choose support within the
+physical kernel coverage and an initial value strictly inside that support.

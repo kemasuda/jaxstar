@@ -18,7 +18,11 @@ from .plotting import plot_mcmc_diagnostics
 from .sampling import is_log_uniform, resample_spectral_grid
 from .model import SpecModel, SpectralDecomposition
 from .observation import Observation
+from .regions import RegionMapping, extract_regions
+from .line_selection import LineSelectionCriteria, select_lines
 from .specfit import SpecFit
+from .region_mixture import (make_model_region_mixture, model_region_mixture,
+                             region_mixture_statistics, reconstruct_region_mixture)
 from .configured_model import ConfiguredModel
 from .reconstruction import reconstruct_single
 from .numpyro_model import (
@@ -62,7 +66,10 @@ __all__ = [
     "plot_mcmc_diagnostics",
     "is_log_uniform", "resample_spectral_grid",
     "SpecModel", "SpectralDecomposition",
-    "Observation", "SpecFit",
+    "LineSelectionCriteria", "select_lines",
+    "Observation", "SpecFit", "RegionMapping", "extract_regions",
+    "make_model_region_mixture", "model_region_mixture",
+    "region_mixture_statistics", "reconstruct_region_mixture",
     "ConfiguredModel", "make_model_single", "reconstruct_single",
     "model_single", "single_star_params",
     "physical_logg_max", "empirical_vmic", "empirical_vmacro_valenti_fischer2005",

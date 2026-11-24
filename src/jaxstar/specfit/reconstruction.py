@@ -32,7 +32,8 @@ def _mean_prediction(predict, samples, *, max_draws):
     """Average curves and summarize continuum/GP means across draws on the host."""
     samples, indices = _posterior_draws(samples, max_draws=max_draws)
     curve_names = ("physical_flux", "continuum", "model_flux", "mean_flux", "gp_mean",
-                   "mismatch_probability")
+                   "mismatch_probability", "region_mismatch_probability",
+                   "good_model_flux", "bad_model_flux")
     means = {}
     model_draws = []
     gp_draws = []

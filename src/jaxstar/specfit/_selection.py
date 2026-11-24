@@ -24,13 +24,16 @@ def _wavelength_request(wavelength, regions, wav_margin):
     return wave, labels, float(margin)
 
 
-def _covering_indices(wave, labels, margin, candidates):
+def _covering_indices(wave, labels, margin, candidates, *, source_regions=None,
+                      candidate_regions=None):
     """Choose one (description, lower, upper) candidate per observation row."""
+    sources = _identifiers(source_regions, "source_regions", len(wave))
     selected = []
-    for label, row in zip(labels, wave):
+    for r, (label, row) in enumerate(zip(labels, wave)):
         low, high = float(row[0]) - margin, float(row[-1]) + margin
         matches = [i for i, (_, left, right) in enumerate(candidates)
-                   if left <= low and right >= high]
+                   if left <= low and right >= high
+                   and (sources is None or candidate_regions[i] == sources[r])]
         if len(matches) != 1:
             raise ValueError(
                 f"Region {label!r}: expected one covering grid, found {len(matches)} "

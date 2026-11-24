@@ -219,6 +219,7 @@ class SpecFit:
     @classmethod
     def from_grid(cls, gridpath, observation, *, library=None, pattern="*.npz",
                   wav_margin=3., pixels=None, velocity_step=None, vmax=50.,
+                  source_regions=None, crop=False,
                   wavelength_medium="unknown", flux_kind="as_stored",
                   broadening_operator=None, fixed_ip=None, macro_model="rt",
                   teff_interp="cubic",
@@ -230,6 +231,8 @@ class SpecFit:
         meanings here. A common NPZ retains its saved sampling by default;
         a legacy directory requires exactly one of pixels or velocity_step.
         Arrays, fixed masks and labels in the supplied observation are preserved.
+        For common NPZs, source_regions selects saved order labels and crop=True
+        cuts only the model wavelength payload, retaining all atmosphere nodes.
         ``macro_model`` selects 'rt' (default) or 'gaussian' in SpecModel.
         ``teff_interp`` selects 'cubic' (default) or 'linear' in SpecModel.
         Guard options are forwarded to SpecFit; they do not modify the grid.
@@ -239,6 +242,7 @@ class SpecFit:
         model = SpecModel.from_grid(
             gridpath, observation.wavelength, regions=observation.region,
             library=library, pattern=pattern, wav_margin=wav_margin,
+            source_regions=source_regions, crop=crop,
             pixels=pixels, velocity_step=velocity_step, vmax=vmax,
             wavelength_medium=wavelength_medium, flux_kind=flux_kind,
             broadening_operator=broadening_operator, fixed_ip=fixed_ip,
@@ -496,6 +500,15 @@ class SpecFit:
                                   keep_open=plot)
         return rv, width
 
+    def select_lines(self, line_list, **kwargs):
+        """Data-only line selection -> (small-window SpecFit, selection table).
+
+        See line_selection.select_line_specfit for criteria, RV, crop, and mask
+        controls. IP, macro_model, interpolation and kernel support are inherited.
+        """
+        from .line_selection import select_line_specfit
+        return select_line_specfit(self, line_list, **kwargs)
+
     def run_svi(self, *, model, rng_key, step_size=.01, num_steps=1000,
                 p_initial=None, progress_bar=True):
         """Return a physical-coordinate MAP estimate in native model-site coordinates.
@@ -509,6 +522,18 @@ class SpecFit:
         bound = partial(model, self.fit_observation(), self.specmodel)
         return find_map_svi(bound, step_size, num_steps, rng_key=rng_key,
                             p_initial=p_initial, progress_bar=progress_bar)
+
+    def run_region_mixture_prefit(self, *, rng_key, model_kwargs=None, p_initial=None,
+                                  step_size=.01, num_steps=2000, progress_bar=True):
+        """Fit one white/white mixture label per region; return (model, point).
+
+        Baselines are marginalized. See make_model_region_mixture for priors.
+        Current fit masks are respected and never changed by this operation.
+        """
+        from .region_mixture import run_region_mixture_prefit
+        return run_region_mixture_prefit(self, rng_key=rng_key, model_kwargs=model_kwargs,
+            p_initial=p_initial, step_size=step_size, num_steps=num_steps,
+            progress_bar=progress_bar)
 
     def run_mixture_prefit(self, *, rng_key, model_kwargs=None, p_initial=None,
                            step_size=.01, num_steps=2000, progress_bar=True):

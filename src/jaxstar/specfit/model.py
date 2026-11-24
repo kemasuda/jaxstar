@@ -18,7 +18,7 @@ from .sampling import _C_KMS, is_log_uniform
 
 
 _STELLAR_KEYS = frozenset(("vsini", "vmacro", "q1", "q2", "u1", "u2", "rv"))
-_SHARED_KEYS = frozenset(("resolving_power", "flux_weights", "dilution"))
+_SHARED_KEYS = frozenset(("resolving_power", "flux_weights", "dilution", "depth_scale"))
 # Native sites from the built-in single-star model that do not enter the
 # physical spectrum. Keep this explicit so misspelled physical keys fail.
 _INFERENCE_KEYS = frozenset((
@@ -152,7 +152,9 @@ class SpectralDecomposition(NamedTuple):
     """JAX PyTree of component spectra and continuum-light accounting.
 
     Spectra always retain the region axis, including for 1D wavelength input.
-    ``components`` and ``weighted_components`` have shape (N, region, pixel);
+    ``components`` includes any depth_scale correction; weighted components
+    still obey the same continuum-light accounting. ``components`` and
+    ``weighted_components`` have shape (N, region, pixel);
     ``total`` has shape (region, pixel). Weights/fractions have shape (N, region)
     and dilution has shape (region,). No observational or fitted-continuum state.
     """
@@ -164,6 +166,15 @@ class SpectralDecomposition(NamedTuple):
     light_fractions: object
     dilution: object
     weighted_components: object
+
+
+class _IPCallable:
+    """Identity-hashable setup callback; numerical IP arrays remain JAX leaves."""
+    def __init__(self, function):
+        self.function = function
+
+    def __call__(self, wavelength):
+        return self.function(wavelength)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -223,7 +234,13 @@ class SpecModel:
     and is the featureless fraction of TOTAL continuum light. Each stage returns
     ``d + (1-d) * sum(a_i*f_i) / sum(a_i)`` for normalized component spectra.
     One component defaults to weight 1; multiple components require weights.
-    Dilution defaults to zero. ``decompose`` exposes the individual spectra and
+    Dilution defaults to zero. Optional positive ``depth_scale`` (scalar or
+    per region, default 1) applies 1 + a*(F-1) to each sampled component, before
+    light composition and any external fitted continuum. The shared a commutes
+    with normalized light composition; decompose exposes depth-scaled component
+    spectra and preserves its light-accounting identity. This is a phenomenological
+    correction relative to a unit continuum. Fitting both depth_scale and dilution
+    freely is degenerate through a*(1-d). ``decompose`` exposes the spectra and
     fractions. Component count is static under JIT; numerical values are dynamic.
 
     ``vmax`` controls finite kernel support, as in frozen jaxspec. Prepared
@@ -240,12 +257,14 @@ class SpecModel:
     macro_model: str
     teff_interp: str
     _fixed_ip: object
+    _ip_callable: object
     _ip_fourier: object
     _ip_response: object
 
     @classmethod
     def from_grid(cls, gridpath, wavelength, *, regions=None, library=None,
                   pattern="*.npz", wav_margin=3., pixels=None, velocity_step=None,
+                  source_regions=None, crop=False,
                   vmax=50., wavelength_medium="unknown", flux_kind="as_stored",
                   broadening_operator=None, fixed_ip=None, macro_model="rt",
                   teff_interp="cubic"):
@@ -255,6 +274,14 @@ class SpecModel:
         regions covering each full row plus ``wav_margin`` on both sides.
         ``regions`` labels the output rows; it does not select stored labels.
         Zero or multiple covering candidates fail before loading flux.
+        For common NPZs, ``source_regions`` selects saved labels independently
+        of output labels, and ``crop=True`` cuts to each requested interval plus
+        margin before building the JAX grid. All atmosphere nodes are retained.
+        Shorter rows receive extra real model samples to keep a rectangular
+        array. Cropped velocity_step resampling extends windows to a common
+        pixel count at the requested spacing; it never extrapolates.
+        Margin must cover allowed RVs, finite convolution/IP support and
+        interpolation. Existing runtime coverage checks still apply.
 
         For a common-format NPZ file, metadata identifies the library, wavelength
         medium and flux kind. Saved samples are retained unless ``pixels`` or
@@ -269,8 +296,10 @@ class SpecModel:
         kind are declarations passed to the legacy loader. Its shared-axis,
         dtype and pixel-count requirements still apply.
 
-        Selection/resampling uses each selected region's full wavelength span,
-        independently of detector pixel counts. The observation is not stored.
+        By default selection/resampling uses each selected region's full span,
+        independently of detector pixel counts. crop/source_regions requires a
+        common NPZ; convert legacy grids with save_spectral_grid first.
+        The observation is not stored.
         Neither wavelength conversion nor flux normalization is performed.
         Setup happens once, outside JIT; no raw files or downloads are used.
         ``fixed_ip`` is passed to SpecModel in the selected region row order.
@@ -292,7 +321,9 @@ class SpecModel:
             if resample:
                 _sampling_mode("log", pixels, velocity_step)
             spectra = load_spectral_grid(path, wavelength=wavelength,
-                                         wav_margin=wav_margin, regions=regions)
+                                         wav_margin=wav_margin, regions=regions,
+                                         source_regions=source_regions, crop=crop,
+                                         pixels=pixels, velocity_step=velocity_step)
             for name, value, unspecified in (
                 ("library", library, None),
                 ("wavelength_medium", wavelength_medium, "unknown"),
@@ -302,6 +333,9 @@ class SpecModel:
                 if value != unspecified and value != stored:
                     raise ValueError(f"{name}={value!r} conflicts with saved {name}={stored!r}")
         elif path.is_dir():
+            if crop or source_regions is not None:
+                raise ValueError("crop/source_regions requires a common saved grid NPZ; "
+                                 "load and save legacy grids with save_spectral_grid first")
             loaders = {"coelho": load_coelho, "bosz": load_bosz, "tlusty": load_tlusty}
             library = "coelho" if library is None else library
             if library not in loaders:
@@ -314,7 +348,7 @@ class SpecModel:
                                        wavelength_medium=wavelength_medium, flux_kind=flux_kind)
         else:
             raise FileNotFoundError(f"Spectral grid path does not exist: {path}")
-        if resample:
+        if resample and path.is_dir():
             spectra = resample_spectral_grid(spectra, sampling="log", pixels=pixels,
                                              velocity_step=velocity_step)
         return cls(spectra, vmax=vmax, broadening_operator=broadening_operator,
@@ -375,7 +409,8 @@ class SpecModel:
                             ("vmax", float(vmax)), ("broadening_operator", operator),
                             ("macro_model", macro_model),
                             ("teff_interp", teff_interp),
-                            ("_fixed_ip", ip_values), ("_ip_fourier", ip_fourier),
+                            ("_fixed_ip", ip_values), ("_ip_callable", _IPCallable(fixed_ip) if callable(fixed_ip) else None),
+                            ("_ip_fourier", ip_fourier),
                             ("_ip_response", ip_response)):
             object.__setattr__(self, name, value)
 
@@ -396,12 +431,12 @@ class SpecModel:
         For one star, pass a flat mapping of the grid's atmosphere coordinates,
         vsini/vmacro, q1/q2 or u1/u2, rv, and resolving_power. For SB-N, pass
         {"components": (star1, star2, ...), ...} with flat stellar mappings;
-        resolving_power, flux_weights and dilution belong only in the outer
+        resolving_power, flux_weights, dilution and depth_scale belong in the outer
         mapping. All stars use this model's atmosphere grid. The result is the
         existing component/instrument dict accepted by every physical method.
 
         Atmosphere coordinates are scalar per star. Broadening, RV, resolving
-        power and dilution are scalar or (n_region,). Weights are (N,) or
+        power, dilution and depth_scale are scalar or (n_region,). Weights are (N,) or
         (N, n_region); a tuple/list may mix scalar and per-region entries.
         Omit resolving_power with fixed_ip. A single star defaults to weight
         one and dilution zero at evaluation; composing multiple stars requires
@@ -451,8 +486,9 @@ class SpecModel:
             instrument["resolving_power"] = _parameter_array(
                 values["resolving_power"], "resolving_power", shapes)
         params = {"components": components, "instrument": instrument}
-        if "dilution" in values:
-            params["dilution"] = _parameter_array(values["dilution"], "dilution", shapes)
+        for name in ("dilution", "depth_scale"):
+            if name in values:
+                params[name] = _parameter_array(values[name], name, shapes)
         if "flux_weights" in values:
             weights, count = values["flux_weights"], len(components)
             if isinstance(weights, (tuple, list)):
@@ -578,6 +614,15 @@ class SpecModel:
         return wave, values
 
     def _component_spectrum(self, component, params, wavelength, stage):
+        flux = self._physical_component(component, params, wavelength, stage)
+        if "depth_scale" not in params:
+            return flux
+        scale = _region_parameter(params["depth_scale"], "depth_scale", flux.shape[0])
+        _require(jnp.all(jnp.isfinite(scale) & (scale > 0)),
+                 "depth_scale must be finite and positive")
+        return 1 + scale[:, None] * (flux - 1)
+
+    def _physical_component(self, component, params, wavelength, stage):
         """The common physical path, evaluated once per component."""
         flux = self._atmosphere(component)
         wave = self.spectra.wavelength
@@ -738,13 +783,13 @@ class SpecModel:
 
     def tree_flatten(self):
         return ((self.spectra, self.velocity_grid, self._fixed_ip, self._ip_fourier, self._ip_response),
-                (self.vmax, self.broadening_operator, self.macro_model, self.teff_interp))
+                (self.vmax, self.broadening_operator, self.macro_model, self.teff_interp, self._ip_callable))
 
     @classmethod
     def tree_unflatten(cls, metadata, children):
         result = object.__new__(cls)
         for name, value in zip(("spectra", "velocity_grid", "_fixed_ip", "_ip_fourier", "_ip_response",
-                                "vmax", "broadening_operator", "macro_model", "teff_interp"),
+                                "vmax", "broadening_operator", "macro_model", "teff_interp", "_ip_callable"),
                                (*children, *metadata)):
             object.__setattr__(result, name, value)
         return result

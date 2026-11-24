@@ -66,7 +66,8 @@ def save_spectral_grid(path, spectra, *, overwrite=False):
     return path
 
 
-def load_spectral_grid(path, *, wavelength=None, wav_margin=3., regions=None):
+def load_spectral_grid(path, *, wavelength=None, wav_margin=3., regions=None,
+                       source_regions=None, crop=False, pixels=None, velocity_step=None):
     """Load a common prepared artifact, without consulting any source library.
 
     Only the versioned format written by ``save_spectral_grid`` is accepted.
@@ -80,7 +81,18 @@ def load_spectral_grid(path, *, wavelength=None, wav_margin=3., regions=None):
     multiple covering regions fail before flux is read. Selected regions keep
     their full wavelength spans and samples; a saved region may be repeated.
     ``regions`` optionally labels the output rows, rather than selecting saved
-    identifiers. Omit it to retain selected saved labels.
+    identifiers. Omit it to retain selected saved labels. ``source_regions``
+    instead selects saved labels, one per requested row, resolving overlapping
+    orders. Coverage is still required; duplicate covering labels remain ambiguous.
+
+    ``crop=True`` retains only the requested span plus ``wav_margin``. Native
+    slices include bracketing samples and are extended with real saved samples
+    to a common pixel count. All atmosphere nodes/axes are retained. Cropping
+    occurs on the host before duplicating flux rows or creating JAX arrays.
+    Optional ``pixels`` or ``velocity_step`` requests log resampling. With crop,
+    pixels spans each requested interval; velocity_step extends shorter windows
+    to a common count at that exact spacing, within saved coverage. Without
+    crop, resampling uses full selected spans as in resample_spectral_grid.
 
     The full flux array is read into host memory, then selected in NumPy before
     creating JAX arrays. Only selected regions enter the returned grid. Source
@@ -91,6 +103,14 @@ def load_spectral_grid(path, *, wavelength=None, wav_margin=3., regions=None):
     continuum division occurs. Normal JAX dtype canonicalization applies; use
     the same x64 setting to retain saved float64 precision across processes.
     """
+    if not isinstance(crop, bool):
+        raise TypeError("crop must be a bool")
+    if (crop or source_regions is not None) and wavelength is None:
+        raise ValueError("crop/source_regions requires wavelength")
+    resample = pixels is not None or velocity_step is not None
+    if resample:
+        from .sampling import _sampling_mode, resample_spectral_grid
+        _sampling_mode("log", pixels, velocity_step)
     path = Path(path).expanduser()
     request = None
     if wavelength is not None:
@@ -125,15 +145,21 @@ def load_spectral_grid(path, *, wavelength=None, wav_margin=3., regions=None):
                 raise ValueError("region identifiers must be strings or integers")
             candidates = [(f"{path}: row {i} (region {label!r})", float(row[0]), float(row[-1]))
                           for i, (label, row) in enumerate(zip(selected_regions, saved_wave))]
-            indices = _covering_indices(*request, candidates)
+            indices = _covering_indices(*request, candidates, source_regions=source_regions,
+                                        candidate_regions=selected_regions)
             selected_regions = (request[1] if regions is not None else
                                 tuple(selected_regions[i] for i in indices))
         flux = data["flux"]
         if indices is not None:
             if flux.shape[len(metadata["flux_dims"]):] != saved_wave.shape:
                 raise ValueError("wavelength shape must match the flux (region, pixel) payload")
-            flux = flux[..., indices, :]
-            saved_wave = saved_wave[indices, :]
+            if crop:
+                from ._crop import _crop_payload
+                saved_wave, flux = _crop_payload(saved_wave, flux, indices, request,
+                                                pixels=pixels, velocity_step=velocity_step)
+            else:
+                flux = flux[..., indices, :]
+                saved_wave = saved_wave[indices, :]
         grid = RectilinearGrid(
             axes={name: Axis(data[f"axis_{i}"], kind)
                   for i, (name, kind) in enumerate(zip(names, metadata["axis_kinds"]))},
@@ -141,13 +167,16 @@ def load_spectral_grid(path, *, wavelength=None, wav_margin=3., regions=None):
                                   payload_dims=metadata["payload_dims"])},
             boundary=metadata["boundary"], fill_value=data["fill_value"],
         )
-        return _SpectralLibrary(
+        spectra = _SpectralLibrary(
             grid=grid, wavelength=saved_wave, regions=selected_regions,
             library=metadata["library"], wavelength_medium=metadata["wavelength_medium"],
             flux_kind=metadata["flux_kind"], sources=metadata["sources"],
             wavelength_unit=metadata["wavelength_unit"],
             provenance_json=json.dumps(metadata.get("provenance", {}), allow_nan=False),
         )
+        if resample and not crop:
+            spectra = resample_spectral_grid(spectra, pixels=pixels, velocity_step=velocity_step)
+        return spectra
 
 
 def _read_metadata(data):
