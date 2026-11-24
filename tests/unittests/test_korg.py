@@ -88,6 +88,8 @@ def test_normalization_medium_empirical_vmic_and_common_storage(runtime, setting
     with x64_context():
         spectra, report = prepare_korg(**settings, return_report=True)
         assert spectra.library == "korg"
+        assert spectra.grid.field("flux").values.dtype == np.float64
+        assert report["flux_dtype"] == "float64"
         assert spectra.grid.axis_names == ("teff", "logg", "feh", "alpha")
         assert spectra.regions == (9, 3) and spectra.flux_kind == "normalized"
         np.testing.assert_allclose(spectra.wavelength[:, [0, -1]], settings["wavelength_ranges"])
@@ -102,6 +104,42 @@ def test_normalization_medium_empirical_vmic_and_common_storage(runtime, setting
         save_spectral_grid(tmp_path / "grid.npz", spectra)
         restored = load_spectral_grid(tmp_path / "grid.npz")
         np.testing.assert_array_equal(restored.grid.field("flux").values, spectra.grid.field("flux").values)
+
+
+def test_float32_flux_preserves_float64_cache_wavelengths_and_axes(runtime, settings, tmp_path,
+                                                                 x64_context):
+    with x64_context():
+        cache = tmp_path / "cache"
+        compact, compact_report = prepare_korg(**settings, flux_dtype="float32",
+                                               cache_dir=cache, return_report=True)
+        full, full_report = prepare_korg(**settings, cache_dir=cache, return_report=True)
+        assert compact_report["signature"] == full_report["signature"]
+        assert all(node["cached"] for node in full_report["nodes"])
+        assert len(runtime.calls) == 2
+        assert compact_report["flux_dtype"] == "float32"
+        assert full_report["flux_dtype"] == "float64"
+        compact_flux = np.asarray(compact.grid.field("flux").values)
+        full_flux = np.asarray(full.grid.field("flux").values)
+        assert compact_flux.dtype == np.float32 and full_flux.dtype == np.float64
+        np.testing.assert_array_equal(compact_flux, full_flux.astype(np.float32))
+        assert np.any(compact_flux.astype(np.float64) != full_flux)
+        assert compact_flux.nbytes * 2 == full_flux.nbytes
+        for item in Path(compact_report["cache_path"]).glob("node_*.npz"):
+            with np.load(item, allow_pickle=False) as data:
+                assert data["flux"].dtype == np.float64
+        assert compact.wavelength.dtype == np.float64
+        np.testing.assert_array_equal(compact.wavelength, full.wavelength)
+        assert all(compact.grid.axis(name).dtype == np.float64
+                   for name in compact.grid.axis_names)
+        path = tmp_path / "compact.npz"
+        save_spectral_grid(path, compact)
+        with np.load(path, allow_pickle=False) as data:
+            assert data["flux"].dtype == np.float32
+            assert data["wavelength"].dtype == np.float64
+        restored = load_spectral_grid(path)
+        assert restored.grid.field("flux").values.dtype == np.float32
+        assert restored.wavelength.dtype == np.float64
+        np.testing.assert_array_equal(restored.grid.field("flux").values, compact_flux)
 
 
 def test_preflight_rejects_before_any_synthesis(runtime, settings, tmp_path, x64_context):
@@ -151,6 +189,8 @@ def test_corrupt_cache_is_an_error(runtime, settings, tmp_path, x64_context):
 
 @pytest.mark.parametrize("change,match", [
     ({"normalized": False}, "normalized=true"),
+    ({"flux_dtype": "float16"}, "flux_dtype"),
+    ({"flux_dtype": None}, "flux_dtype"),
     ({"synthesis_step": 0.}, "synthesis_step"),
     ({"line_buffer": float("nan")}, "line_buffer"),
     ({"wavelength_medium": "unknown"}, "explicitly"),
@@ -241,11 +281,16 @@ def recipe_file(tmp_path):
     return path, recipe
 
 
-def test_script_dry_run_build_and_resume(runtime, tmp_path, capsys, cli_builder):
+@pytest.mark.parametrize("flux_dtype", ["float32", "float64"])
+def test_script_dry_run_build_and_resume(runtime, tmp_path, capsys, cli_builder, flux_dtype):
     path, recipe = recipe_file(tmp_path)
+    recipe["korg"] = {"flux_dtype": flux_dtype}
+    path.write_text(json.dumps(recipe))
     output = tmp_path / "bundle"
     cli_builder.main([str(path), "--dry-run"])
-    assert json.loads(capsys.readouterr().out)["preparation"]["synthesis_step"] == .0025
+    resolved = json.loads(capsys.readouterr().out)["preparation"]
+    assert resolved["synthesis_step"] == .0025
+    assert resolved["flux_dtype"] == flux_dtype
     assert not runtime.calls
     runtime.fail_at = 2
     with pytest.raises(ValueError, match="interrupted synthesis"):
@@ -255,6 +300,10 @@ def test_script_dry_run_build_and_resume(runtime, tmp_path, capsys, cli_builder)
     cli_builder.build(path, None, output)
     manifest = json.loads((output / "manifest.json").read_text())
     assert [n["cached"] for n in manifest["korg"]["nodes"]] == [True, False]
+    assert manifest["korg"]["flux_dtype"] == flux_dtype
+    with np.load(output / "grid.npz", allow_pickle=False) as data:
+        assert data["flux"].dtype == np.dtype(flux_dtype)
+        assert data["wavelength"].dtype == np.float64
     assert cli_builder.read_recipe(output / "recipe.json")[2] == manifest["resolved_preparation"]
     for name, record in manifest["outputs"].items():
         assert korg._digest_file(output / name) == record["sha256"]
@@ -263,7 +312,8 @@ def test_script_dry_run_build_and_resume(runtime, tmp_path, capsys, cli_builder)
 
 
 @pytest.mark.parametrize("changes", [{"normalized": False}, {"korg": {"linelist": "GALAH"}},
-                                     {"korg": {"synthesis_step": -1}}, {"missing_nodes": "logg"}])
+                                     {"korg": {"synthesis_step": -1}},
+                                     {"korg": {"flux_dtype": "float16"}}, {"missing_nodes": "logg"}])
 def test_recipe_rejects_unsupported_physics(tmp_path, changes):
     path, recipe = recipe_file(tmp_path)
     path.write_text(json.dumps({**recipe, **changes}))

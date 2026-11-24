@@ -71,10 +71,13 @@ def validate_korg_axes(axes):
     return result
 
 
-def validate_korg_options(*, normalized=True, synthesis_step=.0025, line_buffer=10.):
+def validate_korg_options(*, normalized=True, synthesis_step=.0025, line_buffer=10.,
+                          flux_dtype="float64"):
     """Cheap validation, also used by the recipe's Julia-free dry run."""
     if normalized is not True:
         raise ValueError("Korg currently supports only normalized=true")
+    if not isinstance(flux_dtype, str) or flux_dtype not in ("float32", "float64"):
+        raise ValueError("flux_dtype must be 'float32' or 'float64'")
     for name, value in (("synthesis_step", synthesis_step), ("line_buffer", line_buffer)):
         if (isinstance(value, (bool, np.bool_)) or not np.isscalar(value)
                 or not isinstance(value, (int, float, np.number))
@@ -247,7 +250,7 @@ def _cached_node(path, signature, coordinates, shape, vmic):
 
 def prepare_korg(*, axes, wavelength_ranges, pixels=None, regions=None,
                  wavelength_medium, normalized=True, sampling="log", velocity_step=None,
-                 synthesis_step=.0025, line_buffer=10., cache_dir=None,
+                 synthesis_step=.0025, line_buffer=10., flux_dtype="float64", cache_dir=None,
                  progress=None, return_report=False):
     """Synthesize an intrinsic normalized optical grid through Python/JuliaCall.
 
@@ -262,6 +265,10 @@ def prepare_korg(*, axes, wavelength_ranges, pixels=None, regions=None,
     then linear interpolation onto the output grid; no convolution is applied.
     sampling is 'log' or 'linear'; specify pixels or log velocity_step (km/s).
     JAX x64 must be enabled before calling, as for other float64 spectral work.
+    flux_dtype selects the assembled flux array: "float64" (default) or "float32".
+    Synthesis, resampling, wavelength/axis arrays and node caches remain float64.
+    Changing only flux_dtype reuses the same synthesis cache; conversion occurs
+    when each completed node is copied into the output array.
 
     Requires optional juliacall and Korg 1.3.1 with GES (molecules included),
     MARCS, Bergemann 2025 solar abundances and Korg's standard alpha elements.
@@ -276,7 +283,8 @@ def prepare_korg(*, axes, wavelength_ranges, pixels=None, regions=None,
     a JSON-serializable provenance/timing report as a second return value.
     """
     axes = validate_korg_axes(axes)
-    validate_korg_options(normalized=normalized, synthesis_step=synthesis_step, line_buffer=line_buffer)
+    validate_korg_options(normalized=normalized, synthesis_step=synthesis_step,
+                          line_buffer=line_buffer, flux_dtype=flux_dtype)
     bounds = _region_bounds(wavelength_ranges)
     if wavelength_medium not in {"air", "vacuum"}:
         raise ValueError("Korg wavelength_medium must be explicitly 'air' or 'vacuum'")
@@ -335,8 +343,8 @@ def prepare_korg(*, axes, wavelength_ranges, pixels=None, regions=None,
     cache = None if cache_dir is None else Path(cache_dir).expanduser().resolve() / signature
     if cache is not None:
         _atomic_write(cache / "contract.json", lambda stream: stream.write(_json(contract).encode()))
-    flux = np.empty(tuple(len(a) for a in axes.values()) + wavelength.shape, dtype=np.float64)
-    report = {"signature": signature, "contract": contract,
+    flux = np.empty(tuple(len(a) for a in axes.values()) + wavelength.shape, dtype=flux_dtype)
+    report = {"signature": signature, "contract": contract, "flux_dtype": flux.dtype.name,
               "cache_path": None if cache is None else str(cache), "nodes": [],
               "vmic_outside_documented_range": [p for p in points if not (
                   4000 < p["teff"] < 7000 and 0 < p["logg"] < 5 and -4.5 < p["feh"] < 1)]}
@@ -355,7 +363,8 @@ def prepare_korg(*, axes, wavelength_ranges, pixels=None, regions=None,
                     _atomic_write(path, lambda stream: np.savez(
                         stream, flux=current, coordinates=list(point.values()), vmic=vmic,
                         signature=signature, sha256=_node_digest(current)))
-            flat[index] = current
+            with np.errstate(over="raise", invalid="raise"):
+                flat[index] = current
         except Exception as exc:
             raise ValueError(f"Korg node failed at {point}: {exc}") from exc
         record = dict(point=point, vmic_km_s=vmic, cached=cached, seconds=perf_counter() - start)

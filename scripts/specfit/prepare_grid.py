@@ -75,9 +75,11 @@ def read_recipe(path):
     korg_options = recipe.get("korg", {})
     if library == "korg":
         from jaxstar.specfit.korg import validate_korg_axes, validate_korg_options
-        if not isinstance(korg_options, dict) or korg_options.keys() - {"synthesis_step", "line_buffer"}:
-            raise ValueError("korg options support only synthesis_step and line_buffer")
-        korg_options = {"synthesis_step": .0025, "line_buffer": 10., **korg_options}
+        if (not isinstance(korg_options, dict)
+                or korg_options.keys() - {"synthesis_step", "line_buffer", "flux_dtype"}):
+            raise ValueError("korg options support only synthesis_step, line_buffer and flux_dtype")
+        korg_options = {"synthesis_step": .0025, "line_buffer": 10.,
+                        "flux_dtype": "float64", **korg_options}
         validate_korg_axes(axes)
         validate_korg_options(normalized=recipe["normalized"], **korg_options)
     elif "korg" in recipe:

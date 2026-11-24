@@ -556,6 +556,15 @@ These are distinct from `sampling.pixels` or `sampling.velocity_step`, which
 control the saved wavelength grid. Native spacing cannot exceed the smallest
 output spacing in vacuum. No resolving power is imposed during generation.
 
+The same `korg` block accepts `"flux_dtype": "float32"` to halve the assembled
+flux array and its saved payload; the default remains `"float64"`. The public
+`prepare_korg` API accepts the same keyword. Synthesis, normalization, resampling,
+wavelengths, atmosphere axes and node caches retain float64 precision, and JAX
+x64 must remain enabled. Each completed node is converted into the requested
+output dtype. Changing only `flux_dtype` reuses the same float64 node cache.
+The manifest records the selected dtype in `resolved_preparation.flux_dtype`
+and `korg.flux_dtype`; existing recipes retain their previous precision.
+
 GES has line wavelengths spanning approximately 4748.793–8949.973 Å **in air**.
 A request, including synthesis padding and the line buffer, must fit inside
 that span after conversion to vacuum. The full GAOES CSV is covered. GES is not
