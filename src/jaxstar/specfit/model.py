@@ -618,8 +618,6 @@ class SpecModel:
         if "depth_scale" not in params:
             return flux
         scale = _region_parameter(params["depth_scale"], "depth_scale", flux.shape[0])
-        _require(jnp.all(jnp.isfinite(scale) & (scale > 0)),
-                 "depth_scale must be finite and positive")
         return 1 + scale[:, None] * (flux - 1)
 
     def _physical_component(self, component, params, wavelength, stage):
@@ -676,8 +674,6 @@ class SpecModel:
                  & jnp.all(jnp.isfinite(sums) & (sums > 0)),
                  "flux_weights must be finite nonnegative with positive finite sum in every region")
         dilution = _region_parameter(params.get("dilution", jnp.asarray(0, dtype=dtype)), "dilution", regions)
-        _require(jnp.all(jnp.isfinite(dilution) & (dilution >= 0) & (dilution < 1)),
-                 "dilution must be finite with 0 <= dilution < 1")
         fractions = weights / sums[None, :]
         return weights, fractions, (1 - dilution)[None, :] * fractions, dilution
 

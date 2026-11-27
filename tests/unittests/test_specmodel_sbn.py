@@ -145,12 +145,17 @@ def test_invalid_weight_domain(bad):
         SpecModel(library)(params, observations(library))
 
 
-@pytest.mark.parametrize("bad", [-.1, 1., 1.1, np.nan, np.inf, np.array([0., -.1])])
-def test_invalid_dilution_domain(bad):
+@pytest.mark.parametrize("value", [-.1, 0., 1., 1.1, np.array([0., 1.])])
+def test_dilution_forward_model_does_not_impose_prior_bounds(value):
     library, params = make_library(), sbn_parameters(2)
-    params["dilution"] = bad
-    with pytest.raises(ValueError, match="0 <= dilution < 1"):
-        SpecModel(library)(params, observations(library))
+    model, wave = SpecModel(library), observations(library)
+    params["dilution"] = 0.
+    original = model(params, wave)
+    params["dilution"] = value
+    d = np.asarray(value)
+    if d.ndim:
+        d = d[:, None]
+    np.testing.assert_allclose(model(params, wave), d + (1-d)*original, atol=1e-14)
 
 
 @pytest.mark.parametrize("key,bad", [
@@ -232,8 +237,7 @@ def test_autodiff_all_parameters_weight_dilution_finite_difference_and_scale_nul
 
 
 @pytest.mark.parametrize("key,value,message", [
-    ("flux_weights", jnp.zeros(2), "flux_weights must be finite nonnegative"),
-    ("dilution", jnp.array(1.), "0 <= dilution < 1")])
+    ("flux_weights", jnp.zeros(2), "flux_weights must be finite nonnegative")])
 def test_compiled_invalid_composition_fails(key, value, message):
     library, params = make_library(), sbn_parameters(2)
     model, wave = SpecModel(library), observations(library)

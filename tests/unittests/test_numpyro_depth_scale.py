@@ -51,7 +51,7 @@ def test_depth_scale_reconstruction_and_joint_atmosphere_gradient(mode, x64_cont
 def test_factory_fixed_shared_and_per_region_scales_save_predict(tmp_path, x64_context):
     with x64_context():
         fit, _, _ = case()
-        for depth in (None, 1.2, np.array([.8, 1.3]), dist.LogNormal(0., .2),
+        for depth in (None, 0., 1.2, np.array([0., 1.3]), dist.LogNormal(0., .2),
                       dist.LogNormal(jnp.zeros(2), .2)):
             model = make_model_single(fit, resolving_power=70000., use_gp=False,
                 rv_bounds=(np.full(2, 10.), np.full(2, 14.)), vsini_max=20.,
@@ -89,8 +89,8 @@ def test_depth_applies_to_all_stages_and_component_decomposition(x64_context):
         assert flat['depth_scale'] == 1.3
 
 
-@pytest.mark.parametrize('bad', [0., -.1, np.inf, np.nan, [1., 1., 1.], [[1.], [1.]]])
-def test_invalid_depth_scale_is_rejected(bad):
+@pytest.mark.parametrize('bad', [[1., 1., 1.], [[1.], [1.]]])
+def test_invalid_depth_scale_shape_is_rejected(bad):
     fit, _, _ = case()
     with pytest.raises(ValueError, match='depth_scale'):
         make_model_single(fit, resolving_power=70000., use_gp=False,
@@ -133,3 +133,80 @@ def test_cropped_regions_svi_nuts_and_posterior_reconstruction(tmp_path, x64_con
         prediction = fit.predict(samples=saved.samples, model=model, max_draws=3)
         assert np.isfinite(prediction['model_flux']).all()
         np.testing.assert_array_equal(saved.observation.mask, obs.mask)
+
+
+@pytest.mark.parametrize("per_region", [False, True])
+def test_zero_depth_and_unit_dilution_are_the_same_flat_spectrum(per_region, x64_context):
+    with x64_context():
+        fit, settings, point = case()
+        zero = jnp.zeros(2) if per_region else jnp.array(0.)
+        one = jnp.ones_like(zero)
+        depth_model = configured(fit, dict(settings, depth_scale=zero))
+        dilution_model = configured(fit, dict(settings, dilution=one))
+        params = fit.predict(point=point, model=depth_model)['params']
+        for stage in ('intrinsic', 'broadened', 'full'):
+            evaluate = getattr(fit.specmodel, stage)
+            depth_flux = jax.jit(lambda a: evaluate(dict(params, depth_scale=a), fit.observation.wavelength))(zero)
+            dilution_flux = jax.jit(lambda d: evaluate(dict(params, depth_scale=one, dilution=d), fit.observation.wavelength))(one)
+            np.testing.assert_allclose(depth_flux, 1., atol=0.)
+            np.testing.assert_allclose(dilution_flux, depth_flux, atol=1e-14)
+        for model in (depth_model, dilution_model):
+            value = jax.jit(lambda: log_density(model, (fit.fit_observation(), fit.specmodel), {}, point)[0])()
+            assert np.isfinite(value)
+
+
+def test_positive_depth_prior_still_excludes_zero():
+    fit, settings, point = case()
+    model = configured(fit, dict(settings, depth_scale=dist.LogNormal(0., .3)))
+    with pytest.raises(ValueError, match='outside its prior support'):
+        model.prior_trace(condition=dict(point, depth_scale=0.))
+
+
+@pytest.mark.parametrize("name,value", [("depth_scale", -.4), ("dilution", -.2), ("dilution", 1.2)])
+def test_scale_ranges_are_chosen_by_the_prior(name, value, x64_context):
+    with x64_context():
+        fit, settings, point = case()
+        plain = configured(fit, settings)
+        physical = fit.predict(point=point, model=plain)['physical_flux']
+        model = configured(fit, dict(settings, **{name: dist.Normal(0., 2.)}))
+        point = dict(point, **{name: value})
+        prediction = fit.predict(point=point, model=model)
+        expected = 1 + value * (physical - 1) if name == 'depth_scale' else value + (1-value)*physical
+        np.testing.assert_allclose(prediction['physical_flux'], expected, atol=1e-13)
+        density = jax.jit(lambda x: log_density(model, (fit.fit_observation(), fit.specmodel), {}, dict(point, **{name:x}))[0])
+        assert np.isfinite(density(jnp.asarray(value)))
+
+
+@pytest.mark.parametrize("name", ['depth_scale', 'dilution'])
+@pytest.mark.parametrize("gp", [False, True])
+def test_nonfinite_trial_scales_have_zero_likelihood_without_callback_failure(name, gp, x64_context):
+    with x64_context():
+        fit, settings, point = case()
+        if gp:
+            settings.update(use_gp=True, gp_solver='direct', gp_amplitude=.015, gp_scale=.3)
+        model = configured(fit, dict(settings, **{name:dist.Normal(0., 1.)}))
+        def likelihood(value):
+            _, trace = log_density(model, (fit.fit_observation(), fit.specmodel), {}, dict(point, **{name:value}))
+            return trace['spectrum']['fn'].log_factor
+        values = jax.jit(jax.vmap(likelihood))(jnp.array([.5, 0., -1., jnp.inf, -jnp.inf, jnp.nan]))
+        jax.effects_barrier()
+        assert np.isfinite(values[:3]).all()
+        assert np.isneginf(values[3:]).all()
+
+
+def test_vectorized_nuts_rejects_extreme_log_depth_steps(x64_context):
+    from numpyro.infer import init_to_value
+    with x64_context():
+        fit, settings, _ = case()
+        settings.update(atmosphere={'teff':5800.}, depth_scale=dist.LogNormal(0., .3))
+        model = configured(fit, settings)
+        mcmc = fit.run_nuts(model=model, rng_key=jax.random.PRNGKey(44),
+            num_warmup=0, num_samples=2, num_chains=2, progress_bar=False,
+            nuts_kwargs=dict(init_strategy=init_to_value(values={'depth_scale':1.}),
+                step_size=1e6, adapt_step_size=False, adapt_mass_matrix=False, max_tree_depth=1),
+            mcmc_kwargs={'chain_method':'vectorized'})
+        samples = mcmc.get_samples()['depth_scale']
+        jax.block_until_ready(samples)
+        jax.effects_barrier()
+        assert np.isfinite(samples).all() and np.all(samples > 0)
+        assert np.asarray(mcmc.get_extra_fields()['diverging']).any()

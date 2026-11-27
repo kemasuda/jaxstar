@@ -628,8 +628,9 @@ For single-star inference, `make_model_single(sf, dilution=dist.Uniform(0., 1.),
 fits a featureless continuum fraction with the same definition. A scalar prior
 shares one fraction across regions; a region-shaped prior fits one per region.
 A numeric value fixes the fraction, and the default `None` preserves the
-undiluted model without creating a dilution site. Values must satisfy
-`0 <= dilution < 1`. Both Gaussian and Gaussian-mixture likelihoods apply
+undiluted model without creating a dilution site. Use the prior to select the
+physical range, usually `0 <= dilution <= 1`; the forward model also evaluates
+values outside that range. At one the spectrum is flat. Both Gaussian and Gaussian-mixture likelihoods apply
 dilution before the fitted continuum; prediction and saved model settings
 retain it. Here `dist` is `numpyro.distributions`.
 
@@ -637,13 +638,18 @@ retain it. Here `dist` is `numpyro.distributions`.
 
 `depth_scale=a` applies `1 + a * (F - 1)` to the normalized physical spectrum
 before the fitted multiplicative continuum. Positive values below/above one
-make absorption shallower/deeper while preserving the unit continuum. A scalar
+make absorption shallower/deeper while preserving the unit continuum. Zero
+gives a flat spectrum; negative values reverse the lines. Its allowed physical
+range belongs to the supplied prior, not a forward-model exception. A scalar
 is shared; an array or a region-shaped NumPyro prior gives one value per region.
 `None` omits the parameter and keeps the original physical path (`a=1`).
 `SpecModel.make_params`, `single_star_params`, `model_single` and
 `make_model_single` all accept it. The correction applies consistently to
 intrinsic, broadened and full spectra, likelihoods and saved-point prediction.
 `decompose` returns depth-scaled components and retains its light-sum identity.
+Nonfinite depth/dilution proposals receive zero likelihood in `model_single`,
+allowing inference to reject them without a callback exception. Finite values
+are evaluated without clipping, and the priors are unchanged.
 
 For this line-fitting use, leave dilution at zero. If both are free, only the
 product `a * (1 - dilution)` is constrained. Depth scales do not freeze the
@@ -740,7 +746,7 @@ directly to the physical methods and do not need `make_params`.
 | `resolving_power` | Scalar or `(n_region,)`; omit with fixed IP |
 | `flux_weights` | `(N,)` or `(N, n_region)`; a tuple/list may mix scalar and region entries |
 | `dilution` | Scalar or `(n_region,)` |
-| `depth_scale` | Positive scalar or `(n_region,)`; omitted means 1 |
+| `depth_scale` | Scalar or `(n_region,)`; prior controls range; omitted means 1 |
 
 Scalars are shared across regions; arrays follow the prepared row order.
 No component, epoch or posterior-draw axis is inferred from a stellar value.

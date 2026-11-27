@@ -81,7 +81,7 @@ def test_omitted_and_zero_dilution_preserve_old_flux_and_density(x64_context):
             log_density(zero, (fit.observation, fit.specmodel), {}, point)[0])
 
 
-@pytest.mark.parametrize("dilution", [0., .2, np.array([.1, .3]), dist.Uniform(0., 1.)])
+@pytest.mark.parametrize("dilution", [0., 1., .2, np.array([.1, 1.]), dist.Uniform(0., 1.)])
 def test_factory_prior_and_returned_physical_params(dilution, x64_context):
     with x64_context():
         fit, _, _ = case()
@@ -95,8 +95,8 @@ def test_factory_prior_and_returned_physical_params(dilution, x64_context):
         np.testing.assert_array_equal(prediction["params"]["dilution"], trace["dilution"]["value"])
 
 
-@pytest.mark.parametrize("bad", [-.01, 1., np.nan, np.inf, np.zeros(3), np.zeros((2, 1))])
-def test_invalid_dilution_rejected_during_prior_inspection(bad):
+@pytest.mark.parametrize("bad", [np.zeros(3), np.zeros((2, 1))])
+def test_invalid_dilution_shape_rejected_during_prior_inspection(bad):
     fit, _, _ = case()
     with pytest.raises(ValueError, match="dilution"):
         make_model_single(fit, resolving_power=70000., use_gp=False,

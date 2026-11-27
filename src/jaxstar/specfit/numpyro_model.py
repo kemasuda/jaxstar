@@ -175,7 +175,7 @@ def single_star_params(atmosphere, *, vsini, vmacro, q1, q2, rv, resolving_power
     Atmosphere coordinates are scalar; other values may be scalar or per region.
     Omit resolving_power when the SpecModel has a fixed_ip calibration.
     Optional dilution is the featureless fraction of total continuum light.
-    Optional depth_scale is a positive scalar or per-region depth multiplier.
+    Optional depth_scale is a scalar or per-region depth multiplier.
     """
     u1, u2 = _limb_darkening_from_q(q1, q2)
     params = {"components": ({"atmosphere": dict(atmosphere),
@@ -325,11 +325,11 @@ def model_single(observation, specmodel, *, resolving_power=None, dilution=None,
     numeric values or NumPyro distributions. With SpecModel(fixed_ip=...), omit
     resolving_power; no instrumental parameter sites are created.
 
-    Optional dilution is a fixed value or a prior supported on 0 <= d < 1,
+    Optional dilution is a fixed value or prior, conventionally on 0 <= d <= 1,
     shared across regions or per region. It changes the physical spectrum to
     d + (1 - d) * stellar_flux before the continuum and likelihood. None
     preserves the undiluted path without adding a parameter site.
-    Optional depth_scale is a positive fixed value or prior, scalar/shared or
+    Optional depth_scale is a fixed value or prior, scalar/shared or
     per region, applying 1 + a*(F-1) before the continuum. None means a=1 and
     creates no site. Use this for line-depth corrections, keeping dilution fixed.
 
@@ -516,13 +516,9 @@ def model_single(observation, specmodel, *, resolving_power=None, dilution=None,
 
     if dilution is not None:
         dilution = _draw("dilution", dilution, regions=n_regions)
-        _require(jnp.all(jnp.isfinite(dilution) & (dilution >= 0) & (dilution < 1)),
-                 "dilution must be finite with 0 <= dilution < 1")
 
     if depth_scale is not None:
         depth_scale = _draw("depth_scale", depth_scale, regions=n_regions)
-        _require(jnp.all(jnp.isfinite(depth_scale) & (depth_scale > 0)),
-                 "depth_scale must be finite and positive")
 
     # Continuum prior scales and additive noise.
     sigma_constant = _draw("sigma_constant", sigma_constant, regions=n_regions)
@@ -557,7 +553,17 @@ def model_single(observation, specmodel, *, resolving_power=None, dilution=None,
             name, params["components"][0]["broadening"][name])
     if prior_only:
         return params
-    flux = specmodel(params, observation.wavelength)
+    # Physical ranges belong to the supplied priors, not runtime exceptions.
+    # Nonfinite trial scales have zero likelihood. Evaluate a finite placeholder
+    # only for those rejected trials so downstream linear algebra remains safe.
+    flux_params = dict(params)
+    finite_scales = jnp.asarray(True)
+    for name in ("depth_scale", "dilution"):
+        if name in params:
+            finite = jnp.isfinite(params[name])
+            finite_scales = finite_scales & jnp.all(finite)
+            flux_params[name] = jnp.where(finite, params[name], 0.)
+    flux = specmodel(flux_params, observation.wavelength)
     if save_model_flux:
         numpyro.deterministic("model_flux", flux)
 
@@ -585,7 +591,7 @@ def model_single(observation, specmodel, *, resolving_power=None, dilution=None,
             gp_data, flux, degree=degree, basis=basis,
             sigma_constant=sigma_constant, sigma_continuum=sigma_continuum, jitter=jitter,
             gp_amplitude=gp_amplitude, gp_scale=gp_scale, gp_solver=gp_solver)
-    numpyro.factor("spectrum", log_likelihood)
+    numpyro.factor("spectrum", jnp.where(finite_scales, log_likelihood, -jnp.inf))
     return params
 
 
@@ -633,10 +639,12 @@ def make_model_single(sf, *, resolving_power=None, dilution=None, depth_scale=No
     distribution. Infinity disables the Gaussian instrumental profile. With a
     fixed_ip SpecModel, omit resolving_power; its fixed mixture is used instead.
 
-    dilution accepts a fixed fraction or a NumPyro prior on 0 <= d < 1,
+    dilution accepts a fixed fraction or a NumPyro prior, usually on 0 <= d <= 1,
     scalar (shared) or per region. For example, dilution=dist.Uniform(0., 1.)
     fits one featureless continuum fraction. None adds no dilution site.
-    depth_scale accepts positive fixed values or priors with the same shapes.
+    depth_scale accepts fixed values or priors with the same shapes.
+    Their physical ranges are set by the priors; model evaluation does not
+    enforce them. Nonfinite trial scales receive zero likelihood.
     For independent line depths, use dist.LogNormal(0., sigma).expand([n_regions]).
     None preserves a=1 with no site; a>1 deepens absorption. Atmosphere parameters
     remain free unless explicitly fixed. Free dilution and depth_scale are
